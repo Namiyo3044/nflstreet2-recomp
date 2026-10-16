@@ -1,0 +1,14 @@
+# Never commit game data or anything derived from it
+*.dol
+*.iso
+*.gcm
+*.rvz
+/generated/
+/recomp/
+/disc/
+
+# Build output
+/build/
+/out/
+.vs/
+*.user
