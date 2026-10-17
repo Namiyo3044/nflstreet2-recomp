@@ -1,5 +1,6 @@
 #include "gx/raster.h"
 #include "gx/state.h"
+#include "gx/texture.h"
 #include "runtime/interrupts.h"
 
 #include <math.h>
@@ -27,6 +28,7 @@ static u32 g_every;
 static u32 g_frames;        /* frames copied to the display so far */
 static u32 g_dumped;
 static unsigned long long g_tris_drawn, g_tris_skipped;
+static CPUState* g_cpu;     /* for texture fetches during rasterisation */
 
 void gx_raster_config(const char* dir, u32 every) {
     if (dir) {
@@ -44,10 +46,13 @@ bool gx_raster_active(void) {
 
 /* ------------------------------------------------------ vertex decode --- */
 typedef struct {
-    float x, y, z;          /* position, model space */
-    u32 pos_mtx;            /* row index into transform memory */
-    u32 color0;             /* 0xRRGGBBAA */
-    bool has_color0;
+    float pos[3];
+    u32 pos_mtx;                 /* row index into transform memory */
+    u32 tex_mtx[8];
+    u32 color[2];                /* 0xRRGGBBAA */
+    bool has_color[2];
+    float tc[8][2];              /* texture coordinates as given */
+    bool has_tc[8];
 } Vtx;
 
 static u32 rd16(const u8* p) { return ((u32)p[0] << 8) | p[1]; }
@@ -86,7 +91,6 @@ static u32 read_color(const u8* p, u32 fmt) {
     return (r << 24) | (g << 16) | (b << 8) | a;
 }
 
-/* Pointer to element `index` of attribute array `array` in guest RAM. */
 static const u8* array_elem(CPUState* cpu, u32 array, u32 index, u32 size) {
     u32 addr = (gx_cp[0xA0 + array] & 0x03FFFFFFu) + index * gx_cp[0xB0 + array];
     addr &= 0x01FFFFFFu;
@@ -95,135 +99,435 @@ static const u8* array_elem(CPUState* cpu, u32 array, u32 index, u32 size) {
     return cpu->ram + addr;
 }
 
-/* Decodes one vertex at p for vertex format vat; returns bytes consumed.
-   Mirrors vertex_size() in fifo.c, which must agree with it exactly. */
+/* Reads one attribute that is either inline (type 1) or an 8/16-bit index
+   into an array (types 2/3). Returns a pointer to its data, advancing p. */
+static const u8* attr_data(CPUState* cpu, const u8** p, u32 type, u32 array, u32 size) {
+    if (type == 1) {
+        const u8* d = *p;
+        *p += size;
+        return d;
+    }
+    u32 idx = type == 2 ? **p : rd16(*p);
+    *p += type == 2 ? 1 : 2;
+    return array_elem(cpu, array, idx, size);
+}
+
+/* Decodes one vertex; returns bytes consumed. Must agree with vertex_size()
+   in fifo.c. */
 static u32 decode_vertex(CPUState* cpu, u32 vat, const u8* p, Vtx* v) {
     u32 lo = gx_cp[0x50], hi = gx_cp[0x60];
     u32 a = gx_cp[0x70 + vat], b = gx_cp[0x80 + vat], c = gx_cp[0x90 + vat];
     const u8* start = p;
-    (void)b; (void)c;
+    u32 mia = gx_xf_reg[0x18], mib = gx_xf_reg[0x19];
 
-    v->pos_mtx = gx_xf_reg[0x18] & 0x3Fu;
-    v->has_color0 = false;
-    v->color0 = 0xFFFFFFFFu;
+    memset(v, 0, sizeof(*v));
+    v->pos_mtx = mia & 0x3Fu;
+    for (u32 i = 0; i < 4; i++) v->tex_mtx[i] = (mia >> (6 + 6 * i)) & 0x3Fu;
+    for (u32 i = 0; i < 4; i++) v->tex_mtx[4 + i] = (mib >> (6 * i)) & 0x3Fu;
 
-    if (lo & 1u) v->pos_mtx = *p++ & 0x3Fu;     /* position/normal matrix index */
-    for (u32 i = 1; i < 9; i++)                 /* texture matrix indices: skipped for now */
-        if ((lo >> i) & 1u) p++;
+    if (lo & 1u) v->pos_mtx = *p++ & 0x3Fu;
+    for (u32 i = 0; i < 8; i++)
+        if ((lo >> (1 + i)) & 1u) v->tex_mtx[i] = *p++ & 0x3Fu;
 
-    /* Position */
     u32 pos = (lo >> 9) & 3u;
-    u32 pcount = (a & 1u) ? 3u : 2u, pfmt = (a >> 1) & 7u, pshift = (a >> 4) & 31u;
     if (pos) {
-        const u8* src = p;
-        if (pos == 1) {
-            p += pcount * comp_size(pfmt);
-        } else {
-            u32 idx = pos == 2 ? *p : rd16(p);
-            p += pos == 2 ? 1 : 2;
-            src = array_elem(cpu, 0, idx, pcount * comp_size(pfmt));
-        }
-        if (src) {
-            u32 cs = comp_size(pfmt);
-            v->x = read_comp(src, pfmt, pshift);
-            v->y = read_comp(src + cs, pfmt, pshift);
-            v->z = pcount == 3 ? read_comp(src + 2 * cs, pfmt, pshift) : 0.0f;
-        } else {
-            v->x = v->y = v->z = 0.0f;
-        }
+        u32 n = (a & 1u) ? 3u : 2u, fmt = (a >> 1) & 7u, shift = (a >> 4) & 31u, cs = comp_size(fmt);
+        const u8* d = attr_data(cpu, &p, pos, 0, n * cs);
+        if (d)
+            for (u32 k = 0; k < n; k++)
+                v->pos[k] = read_comp(d + k * cs, fmt, shift);
     }
 
-    /* Normal: stepped over */
     u32 nrm = (lo >> 11) & 3u;
-    if (nrm) {
-        bool nbt = (a >> 9) & 1u;
-        bool index3 = (a >> 31) & 1u;
+    if (nrm) {   /* normals: stepped over (lighting is approximated) */
+        bool nbt = (a >> 9) & 1u, index3 = (a >> 31) & 1u;
         if (nrm == 1)
             p += (nbt ? 9u : 3u) * comp_size((a >> 10) & 7u);
         else
             p += ((nbt && index3) ? 3u : 1u) * (nrm == 2 ? 1u : 2u);
     }
 
-    /* Colour 0 and 1 */
     for (u32 ch = 0; ch < 2; ch++) {
         u32 t = (lo >> (13 + ch * 2)) & 3u;
         u32 fmt = (a >> (14 + ch * 4)) & 7u;
         if (!t)
             continue;
-        const u8* src = p;
-        if (t == 1) {
-            p += color_size(fmt);
-        } else {
-            u32 idx = t == 2 ? *p : rd16(p);
-            p += t == 2 ? 1 : 2;
-            src = array_elem(cpu, 2 + ch, idx, color_size(fmt));
-        }
-        if (ch == 0 && src) {
-            v->color0 = read_color(src, fmt);
-            v->has_color0 = true;
+        const u8* d = attr_data(cpu, &p, t, 2 + ch, color_size(fmt));
+        if (d) {
+            v->color[ch] = read_color(d, fmt);
+            v->has_color[ch] = true;
         }
     }
 
-    /* Texture coordinates: stepped over (stage 2) */
     const u32 tc_cnt[8] = {(a >> 21) & 1u, b & 1u, (b >> 9) & 1u, (b >> 18) & 1u,
                            (b >> 27) & 1u, (c >> 5) & 1u, (c >> 14) & 1u, (c >> 23) & 1u};
     const u32 tc_fmt[8] = {(a >> 22) & 7u, (b >> 1) & 7u, (b >> 10) & 7u, (b >> 19) & 7u,
                            (b >> 28) & 7u, (c >> 6) & 7u, (c >> 15) & 7u, (c >> 24) & 7u};
+    const u32 tc_shift[8] = {(a >> 25) & 31u, (b >> 4) & 31u, (b >> 13) & 31u, (b >> 22) & 31u,
+                             c & 31u, (c >> 9) & 31u, (c >> 18) & 31u, (c >> 27) & 31u};
     for (u32 i = 0; i < 8; i++) {
         u32 t = (hi >> (i * 2)) & 3u;
-        if (t == 1) p += (tc_cnt[i] ? 2u : 1u) * comp_size(tc_fmt[i]);
-        else if (t == 2) p += 1;
-        else if (t == 3) p += 2;
+        if (!t)
+            continue;
+        u32 n = tc_cnt[i] ? 2u : 1u, cs = comp_size(tc_fmt[i]);
+        const u8* d = attr_data(cpu, &p, t, 4 + i, n * cs);
+        if (d) {
+            v->tc[i][0] = read_comp(d, tc_fmt[i], tc_shift[i]);
+            v->tc[i][1] = n == 2 ? read_comp(d + cs, tc_fmt[i], tc_shift[i]) : 0.0f;
+            v->has_tc[i] = true;
+        }
     }
     return (u32)(p - start);
 }
 
 /* ---------------------------------------------------------- transform --- */
+#define MAX_TC 8
+
 typedef struct {
-    float x, y, z;          /* screen x, y; depth 0..16777215 */
-    float r, g, b, a;       /* 0..255 */
+    float x, y, z;              /* screen x, y; depth 0..16777215 */
+    float inv_w;                /* 1/w, for perspective-correct interpolation */
+    float col[2][4];            /* colour channels 0/1, RGBA 0..1 */
+    float tc[MAX_TC][3];        /* s, t, q (q = 1 unless projected) */
     bool valid;
 } SVtx;
 
+static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+static void unpack(u32 rgba, float out[4]) {
+    out[0] = (float)(rgba >> 24) / 255.0f;
+    out[1] = (float)((rgba >> 16) & 255) / 255.0f;
+    out[2] = (float)((rgba >> 8) & 255) / 255.0f;
+    out[3] = (float)(rgba & 255) / 255.0f;
+}
+
+/* Lighting channel: material colour (register or vertex), optionally lit.
+   Lights aren't computed yet: a lit channel gets ambient plus a fixed
+   diffuse term, so lit models are visible without being exactly shaded. */
+static void channel(const Vtx* v, u32 ch, float out[4]) {
+    u32 cctrl = gx_xf_reg[0x0E + ch], actrl = gx_xf_reg[0x10 + ch];
+    float mat_c[4], mat_a[4], amb[4], vc[4];
+    unpack(gx_xf_reg[0x0C + ch], mat_c);
+    unpack(gx_xf_reg[0x0C + ch], mat_a);
+    unpack(gx_xf_reg[0x0A + ch], amb);
+    unpack(v->has_color[ch] ? v->color[ch] : 0xFFFFFFFFu, vc);
+    if (cctrl & 1u) memcpy(mat_c, vc, sizeof(vc));
+    if (actrl & 1u) mat_a[3] = vc[3];
+
+    for (u32 k = 0; k < 3; k++) {
+        float m = mat_c[k];
+        if (cctrl & 2u) {
+            float am = (cctrl & 0x40u) ? vc[k] : amb[k];
+            float lit = (cctrl & 0x783Cu) ? 0.75f : 0.0f;   /* any of lights 0-7 enabled */
+            m *= clamp01(am + lit);
+        }
+        out[k] = m;
+    }
+    float am = mat_a[3];
+    if (actrl & 2u) {
+        float aa = (actrl & 0x40u) ? vc[3] : amb[3];
+        am *= clamp01(aa + 0.75f);
+    }
+    out[3] = am;
+}
+
+/* Texture coordinate generation (XF 0x1040+i): regular texgens multiply the
+   chosen input (position or a texture coordinate) by a texture matrix. */
+static void texgen(const Vtx* v, u32 i, float out[3]) {
+    u32 ctl = gx_xf_reg[0x40 + i];
+    bool proj = (ctl >> 1) & 1u;
+    u32 type = (ctl >> 4) & 7u;
+    u32 src = (ctl >> 7) & 31u;
+    float in[4] = {0, 0, 1, 1};
+
+    out[0] = out[1] = 0.0f;
+    out[2] = 1.0f;
+    if (type != 0) {             /* emboss / colour texgens: not used for menus */
+        if (type >= 2) { out[0] = 0.5f; out[1] = 0.5f; }
+        return;
+    }
+    if (src == 0) {              /* position */
+        in[0] = v->pos[0]; in[1] = v->pos[1]; in[2] = v->pos[2];
+    } else if (src >= 5 && src <= 12) {
+        u32 k = src - 5;
+        in[0] = v->tc[k][0]; in[1] = v->tc[k][1];
+        in[2] = 1.0f;            /* AB11 */
+    }
+
+    const u32* m = &gx_xf_mem[(v->tex_mtx[i] * 4u) & 0x3FFu];
+    float s = gx_f32(m[0]) * in[0] + gx_f32(m[1]) * in[1] + gx_f32(m[2]) * in[2] + gx_f32(m[3]) * in[3];
+    float t = gx_f32(m[4]) * in[0] + gx_f32(m[5]) * in[1] + gx_f32(m[6]) * in[2] + gx_f32(m[7]) * in[3];
+    float q = proj ? gx_f32(m[8]) * in[0] + gx_f32(m[9]) * in[1] + gx_f32(m[10]) * in[2] + gx_f32(m[11]) * in[3]
+                   : 1.0f;
+
+    /* Optional second ("dual") texture transform. */
+    if (gx_xf_reg[0x12] & 1u) {
+        u32 post = gx_xf_reg[0x50 + i];
+        float vin[3] = {s, t, q};
+        if ((post >> 8) & 1u) {
+            float len = sqrtf(vin[0] * vin[0] + vin[1] * vin[1] + vin[2] * vin[2]);
+            if (len > 1e-9f) { vin[0] /= len; vin[1] /= len; vin[2] /= len; }
+        }
+        const u32* pm = &gx_xf_mem[0x500u + ((post & 0x3Fu) * 4u)];
+        s = gx_f32(pm[0]) * vin[0] + gx_f32(pm[1]) * vin[1] + gx_f32(pm[2]) * vin[2] + gx_f32(pm[3]);
+        t = gx_f32(pm[4]) * vin[0] + gx_f32(pm[5]) * vin[1] + gx_f32(pm[6]) * vin[2] + gx_f32(pm[7]);
+        q = gx_f32(pm[8]) * vin[0] + gx_f32(pm[9]) * vin[1] + gx_f32(pm[10]) * vin[2] + gx_f32(pm[11]);
+    }
+    out[0] = s; out[1] = t; out[2] = q;
+}
+
 static void transform(const Vtx* in, SVtx* out) {
     const u32* m = &gx_xf_mem[(in->pos_mtx * 4u) & 0x3FFu];
-    float ex = gx_f32(m[0]) * in->x + gx_f32(m[1]) * in->y + gx_f32(m[2]) * in->z + gx_f32(m[3]);
-    float ey = gx_f32(m[4]) * in->x + gx_f32(m[5]) * in->y + gx_f32(m[6]) * in->z + gx_f32(m[7]);
-    float ez = gx_f32(m[8]) * in->x + gx_f32(m[9]) * in->y + gx_f32(m[10]) * in->z + gx_f32(m[11]);
+    float ex = gx_f32(m[0]) * in->pos[0] + gx_f32(m[1]) * in->pos[1] + gx_f32(m[2]) * in->pos[2] + gx_f32(m[3]);
+    float ey = gx_f32(m[4]) * in->pos[0] + gx_f32(m[5]) * in->pos[1] + gx_f32(m[6]) * in->pos[2] + gx_f32(m[7]);
+    float ez = gx_f32(m[8]) * in->pos[0] + gx_f32(m[9]) * in->pos[1] + gx_f32(m[10]) * in->pos[2] + gx_f32(m[11]);
 
     const u32* pr = &gx_xf_reg[0x20];
     float cx, cy, cz, cw;
-    if (gx_xf_reg[0x26] == 0) {             /* perspective */
+    if (gx_xf_reg[0x26] == 0) {
         cx = gx_f32(pr[0]) * ex + gx_f32(pr[1]) * ez;
         cy = gx_f32(pr[2]) * ey + gx_f32(pr[3]) * ez;
         cz = gx_f32(pr[4]) * ez + gx_f32(pr[5]);
         cw = -ez;
-    } else {                                /* orthographic */
+    } else {
         cx = gx_f32(pr[0]) * ex + gx_f32(pr[1]);
         cy = gx_f32(pr[2]) * ey + gx_f32(pr[3]);
         cz = gx_f32(pr[4]) * ez + gx_f32(pr[5]);
         cw = 1.0f;
     }
-
     out->valid = cw > 1e-6f;
     if (!out->valid)
         return;
-    float nx = cx / cw, ny = cy / cw, nz = cz / cw;
-    const u32* vp = &gx_xf_reg[0x1A];       /* wd, ht, zRange, xOrig, yOrig, farZ */
-    out->x = nx * gx_f32(vp[0]) + gx_f32(vp[3]) - 342.0f;
-    out->y = ny * gx_f32(vp[1]) + gx_f32(vp[4]) - 342.0f;
-    out->z = nz * gx_f32(vp[2]) + gx_f32(vp[5]);
+    out->inv_w = 1.0f / cw;
+    const u32* vp = &gx_xf_reg[0x1A];
+    out->x = cx * out->inv_w * gx_f32(vp[0]) + gx_f32(vp[3]) - 342.0f;
+    out->y = cy * out->inv_w * gx_f32(vp[1]) + gx_f32(vp[4]) - 342.0f;
+    out->z = cz * out->inv_w * gx_f32(vp[2]) + gx_f32(vp[5]);
 
-    /* Colour channel 0: vertex colour or the material colour register. */
-    u32 mat = gx_xf_reg[0x0C];
-    u32 col = (gx_xf_reg[0x0E] & 1u) && in->has_color0 ? in->color0 : mat;
-    u32 alp = (gx_xf_reg[0x10] & 1u) && in->has_color0 ? in->color0 : mat;
-    if (!(gx_xf_reg[0x0E] & 1u) && !mat && in->has_color0)
-        col = alp = in->color0;   /* channel not configured yet: show the vertex colour */
-    out->r = (float)(col >> 24);
-    out->g = (float)((col >> 16) & 255);
-    out->b = (float)((col >> 8) & 255);
-    out->a = (float)(alp & 255);
+    channel(in, 0, out->col[0]);
+    channel(in, 1, out->col[1]);
+    u32 ntex = gx_xf_reg[0x3F] & 15u;
+    for (u32 i = 0; i < MAX_TC; i++) {
+        if (i < ntex)
+            texgen(in, i, out->tc[i]);
+        else
+            out->tc[i][0] = out->tc[i][1] = 0.0f, out->tc[i][2] = 1.0f;
+    }
+}
+
+/* ---------------------------------------------------------------- TEV --- */
+typedef struct {
+    u32 stages;
+    u32 color_op[16], alpha_op[16];
+    u32 texmap[16], texcoord[16], chan[16];
+    bool tex_on[16];
+    u32 kcsel[16], kasel[16];
+    u32 swap[4][4];              /* swap tables: source channel for R, G, B, A */
+    const GxTexture* tex[16];
+    u32 alpha_test;
+} TevSetup;
+
+static TevSetup g_tev;
+
+static void tev_prepare(void) {
+    g_tev.stages = ((gx_bp[0x00] >> 10) & 15u) + 1;
+    for (u32 i = 0; i < g_tev.stages; i++) {
+        g_tev.color_op[i] = gx_bp[0xC0 + i * 2];
+        g_tev.alpha_op[i] = gx_bp[0xC1 + i * 2];
+        u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
+        g_tev.texmap[i] = order & 7u;
+        g_tev.texcoord[i] = (order >> 3) & 7u;
+        g_tev.tex_on[i] = (order >> 6) & 1u;
+        g_tev.chan[i] = (order >> 7) & 7u;
+        u32 ksel = gx_bp[0xF6 + i / 2];
+        g_tev.kcsel[i] = (ksel >> ((i & 1) ? 14 : 4)) & 31u;
+        g_tev.kasel[i] = (ksel >> ((i & 1) ? 19 : 9)) & 31u;
+        g_tev.tex[i] = g_tev.tex_on[i] ? gx_tex_get(g_cpu, g_tev.texmap[i]) : NULL;
+    }
+    for (u32 t = 0; t < 4; t++) {
+        u32 k0 = gx_bp[0xF6 + t * 2], k1 = gx_bp[0xF7 + t * 2];
+        g_tev.swap[t][0] = k0 & 3u;
+        g_tev.swap[t][1] = (k0 >> 2) & 3u;
+        g_tev.swap[t][2] = k1 & 3u;
+        g_tev.swap[t][3] = (k1 >> 2) & 3u;
+    }
+    g_tev.alpha_test = gx_bp[0xF3];
+}
+
+static float wrap_coord(float c, u32 size, u32 mode) {
+    float f = c * (float)size;
+    int i = (int)floorf(f);
+    int n = (int)size;
+    switch (mode) {
+    case 0:  /* clamp */
+        if (i < 0) i = 0;
+        if (i >= n) i = n - 1;
+        break;
+    case 2: { /* mirror */
+        int period = 2 * n;
+        int m = ((i % period) + period) % period;
+        i = m < n ? m : period - 1 - m;
+        break;
+    }
+    default: /* repeat */
+        i = ((i % n) + n) % n;
+        break;
+    }
+    return (float)i;
+}
+
+static void sample(u32 stage, float s, float t, float out[4]) {
+    const GxTexture* tex = g_tev.tex[stage];
+    if (!tex) {
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        return;
+    }
+    u32 map = g_tev.texmap[stage];
+    u32 mode0 = gx_bp[(map < 4 ? 0x80u : 0xA0u) + (map & 3u)];
+    u32 x = (u32)wrap_coord(s, tex->width, mode0 & 3u);
+    u32 y = (u32)wrap_coord(t, tex->height, (mode0 >> 2) & 3u);
+    u32 c = tex->texels[y * tex->width + x];
+    out[0] = (float)((c >> 16) & 255) / 255.0f;
+    out[1] = (float)((c >> 8) & 255) / 255.0f;
+    out[2] = (float)(c & 255) / 255.0f;
+    out[3] = (float)(c >> 24) / 255.0f;
+}
+
+static void konst(u32 sel, bool alpha, float out[4]) {
+    static const float frac[8] = {1.0f, 0.875f, 0.75f, 0.625f, 0.5f, 0.375f, 0.25f, 0.125f};
+    if (sel < 8) {
+        out[0] = out[1] = out[2] = out[3] = frac[sel];
+        return;
+    }
+    u32 k = sel & 3u;
+    const u8* kc = gx_tev_konst[k];
+    float rgba[4] = {kc[0] / 255.0f, kc[1] / 255.0f, kc[2] / 255.0f, kc[3] / 255.0f};
+    if (sel >= 0x0C && sel <= 0x0F && !alpha) {
+        memcpy(out, rgba, sizeof(rgba));
+        return;
+    }
+    u32 comp = sel >= 0x1C ? 3 : sel >= 0x18 ? 2 : sel >= 0x14 ? 1 : 0;
+    if (sel >= 0x0C && sel <= 0x0F) comp = 3;
+    out[0] = out[1] = out[2] = out[3] = rgba[comp];
+}
+
+static float tev_math(float a, float b, float c, float d, u32 op) {
+    u32 bias = (op >> 16) & 3u, sub = (op >> 18) & 1u, clamp = (op >> 19) & 1u, scale = (op >> 20) & 3u;
+    if (bias == 3)               /* comparison modes: not modelled, pass d through */
+        return d;
+    a = clamp01(a); b = clamp01(b); c = clamp01(c);
+    float lerp = a * (1.0f - c) + b * c;
+    float r = sub ? d - lerp : d + lerp;
+    r += bias == 1 ? 0.5f : bias == 2 ? -0.5f : 0.0f;
+    r *= scale == 1 ? 2.0f : scale == 2 ? 4.0f : scale == 3 ? 0.5f : 1.0f;
+    if (clamp)
+        return clamp01(r);
+    return r < -4.0f ? -4.0f : r > 4.0f ? 4.0f : r;
+}
+
+static bool alpha_compare(u32 func, float a, u32 ref) {
+    u32 v = (u32)(clamp01(a) * 255.0f + 0.5f);
+    switch (func) {
+    case 0: return false;
+    case 1: return v < ref;
+    case 2: return v == ref;
+    case 3: return v <= ref;
+    case 4: return v > ref;
+    case 5: return v != ref;
+    case 6: return v >= ref;
+    default: return true;
+    }
+}
+
+/* Runs the TEV stages for one pixel. Returns false if the alpha test
+   discards it. */
+static bool tev_pixel(float col[2][4], float tc[MAX_TC][2], float out[4]) {
+    float reg[4][4];
+    for (u32 r = 0; r < 4; r++)
+        for (u32 k = 0; k < 4; k++)
+            reg[r][k] = (float)gx_tev_reg[r][k] / 255.0f;
+
+    for (u32 st = 0; st < g_tev.stages; st++) {
+        float tex[4] = {0, 0, 0, 0}, ras[4] = {0, 0, 0, 0}, kc[4], ka[4];
+        if (g_tev.tex_on[st]) {
+            float raw[4];
+            u32 tci = g_tev.texcoord[st];
+            sample(st, tc[tci][0], tc[tci][1], raw);
+            u32 tsw = (g_tev.alpha_op[st] >> 2) & 3u;
+            for (u32 k = 0; k < 4; k++) tex[k] = raw[g_tev.swap[tsw][k]];
+        }
+        u32 ch = g_tev.chan[st];
+        if (ch <= 1) {
+            u32 rsw = g_tev.alpha_op[st] & 3u;
+            for (u32 k = 0; k < 4; k++) ras[k] = col[ch][g_tev.swap[rsw][k]];
+        }
+        konst(g_tev.kcsel[st], false, kc);
+        konst(g_tev.kasel[st], true, ka);
+
+        u32 cop = g_tev.color_op[st];
+        u32 csel[4] = {(cop >> 12) & 15u, (cop >> 8) & 15u, (cop >> 4) & 15u, cop & 15u}; /* a b c d */
+        float cin[4][3];
+        for (u32 j = 0; j < 4; j++) {
+            for (u32 k = 0; k < 3; k++) {
+                float vsrc;
+                switch (csel[j]) {
+                case 0: vsrc = reg[0][k]; break;
+                case 1: vsrc = reg[0][3]; break;
+                case 2: vsrc = reg[1][k]; break;
+                case 3: vsrc = reg[1][3]; break;
+                case 4: vsrc = reg[2][k]; break;
+                case 5: vsrc = reg[2][3]; break;
+                case 6: vsrc = reg[3][k]; break;
+                case 7: vsrc = reg[3][3]; break;
+                case 8: vsrc = tex[k]; break;
+                case 9: vsrc = tex[3]; break;
+                case 10: vsrc = ras[k]; break;
+                case 11: vsrc = ras[3]; break;
+                case 12: vsrc = 1.0f; break;
+                case 13: vsrc = 0.5f; break;
+                case 14: vsrc = kc[k]; break;
+                default: vsrc = 0.0f; break;
+                }
+                cin[j][k] = vsrc;
+            }
+        }
+        u32 aop = g_tev.alpha_op[st];
+        u32 asel[4] = {(aop >> 13) & 7u, (aop >> 10) & 7u, (aop >> 7) & 7u, (aop >> 4) & 7u};
+        float ain[4];
+        for (u32 j = 0; j < 4; j++) {
+            switch (asel[j]) {
+            case 0: ain[j] = reg[0][3]; break;
+            case 1: ain[j] = reg[1][3]; break;
+            case 2: ain[j] = reg[2][3]; break;
+            case 3: ain[j] = reg[3][3]; break;
+            case 4: ain[j] = tex[3]; break;
+            case 5: ain[j] = ras[3]; break;
+            case 6: ain[j] = ka[3]; break;
+            default: ain[j] = 0.0f; break;
+            }
+        }
+        u32 cdst = (cop >> 22) & 3u, adst = (aop >> 22) & 3u;
+        float res[3];
+        for (u32 k = 0; k < 3; k++)
+            res[k] = tev_math(cin[0][k], cin[1][k], cin[2][k], cin[3][k], cop);
+        float ares = tev_math(ain[0], ain[1], ain[2], ain[3], aop);
+        for (u32 k = 0; k < 3; k++) reg[cdst][k] = res[k];
+        reg[adst][3] = ares;
+    }
+
+    /* Output is the PREV register after the last stage. */
+    for (u32 k = 0; k < 4; k++) out[k] = clamp01(reg[0][k]);
+
+    u32 at = g_tev.alpha_test;
+    u32 ref0 = at & 255u, ref1 = (at >> 8) & 255u, f0 = (at >> 16) & 7u, f1 = (at >> 19) & 7u, logic = (at >> 22) & 3u;
+    if (at == 0)
+        return true;   /* not configured yet */
+    bool r0 = alpha_compare(f0, out[3], ref0), r1 = alpha_compare(f1, out[3], ref1);
+    switch (logic) {
+    case 0: return r0 && r1;
+    case 1: return r0 || r1;
+    case 2: return r0 != r1;
+    default: return r0 == r1;
+    }
 }
 
 /* --------------------------------------------------------- rasteriser --- */
@@ -244,7 +548,7 @@ static float blend_factor(u32 f, bool is_src, float sa, float da, float sc, floa
     switch (f) {
     case 0: return 0.0f;
     case 1: return 1.0f;
-    case 2: return is_src ? dc : sc;          /* dst colour for src, src colour for dst */
+    case 2: return is_src ? dc : sc;
     case 3: return 1.0f - (is_src ? dc : sc);
     case 4: return sa;
     case 5: return 1.0f - sa;
@@ -268,7 +572,7 @@ static void scissor(int* x0, int* y0, int* x1, int* y1) {
 
 static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
     if (!a->valid || !b->valid || !c->valid) { g_tris_skipped++; return; }
-    if ((gx_bp[0x00] >> 14 & 3u) == 3u) return;   /* cull all */
+    if ((gx_bp[0x00] >> 14 & 3u) == 3u) return;
 
     float area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
     if (fabsf(area) < 1e-6f || !isfinite(area)) return;
@@ -289,10 +593,13 @@ static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
     u32 dfac = (cmode >> 5) & 7u, sfac = (cmode >> 8) & 7u;
     bool subtract = (cmode >> 11) & 1u;
     if (!(cmode & 0x18u))
-        color_update = true;   /* blend mode not set up yet: still show the geometry */
+        color_update = true;
 
+    u32 ntex = gx_xf_reg[0x3F] & 15u;
+    if (ntex > MAX_TC) ntex = MAX_TC;
     float inv = 1.0f / area;
     g_tris_drawn++;
+
     for (int y = y0; y <= y1; y++) {
         float py = (float)y + 0.5f;
         for (int x = x0; x <= x1; x++) {
@@ -309,10 +616,30 @@ static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
             if (ztest && !depth_pass(zfunc, z, g_depth[i]))
                 continue;
 
-            float r = w0 * a->r + w1 * b->r + w2 * c->r;
-            float g = w0 * a->g + w1 * b->g + w2 * c->g;
-            float bl = w0 * a->b + w1 * b->b + w2 * c->b;
-            float al = w0 * a->a + w1 * b->a + w2 * c->a;
+            /* Perspective-correct weights for colours and texture coordinates. */
+            float p0 = w0 * a->inv_w, p1 = w1 * b->inv_w, p2 = w2 * c->inv_w;
+            float ps = p0 + p1 + p2;
+            if (ps <= 0) continue;
+            p0 /= ps; p1 /= ps; p2 /= ps;
+
+            float col[2][4];
+            for (u32 ch = 0; ch < 2; ch++)
+                for (u32 k = 0; k < 4; k++)
+                    col[ch][k] = p0 * a->col[ch][k] + p1 * b->col[ch][k] + p2 * c->col[ch][k];
+            float tc[MAX_TC][2];
+            for (u32 t = 0; t < ntex; t++) {
+                float s = p0 * a->tc[t][0] + p1 * b->tc[t][0] + p2 * c->tc[t][0];
+                float tt = p0 * a->tc[t][1] + p1 * b->tc[t][1] + p2 * c->tc[t][1];
+                float q = p0 * a->tc[t][2] + p1 * b->tc[t][2] + p2 * c->tc[t][2];
+                if (fabsf(q) > 1e-9f) { s /= q; tt /= q; }
+                tc[t][0] = s; tc[t][1] = tt;
+            }
+            for (u32 t = ntex; t < MAX_TC; t++) tc[t][0] = tc[t][1] = 0.0f;
+
+            float out[4];
+            if (!tev_pixel(col, tc, out))
+                continue;
+            float r = out[0] * 255.0f, g = out[1] * 255.0f, bl = out[2] * 255.0f, al = out[3] * 255.0f;
 
             u32 dst = g_color[i];
             if (blend) {
@@ -327,12 +654,12 @@ static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
                 }
                 r = s[0]; g = s[1]; bl = s[2];
             }
-            u32 out = dst;
+            u32 o = dst;
             if (color_update)
-                out = (out & 0xFF000000u) | ((u32)r << 16) | ((u32)g << 8) | (u32)bl;
+                o = (o & 0xFF000000u) | ((u32)r << 16) | ((u32)g << 8) | (u32)bl;
             if (alpha_update)
-                out = (out & 0x00FFFFFFu) | ((u32)(al < 0 ? 0 : al > 255 ? 255 : al) << 24);
-            g_color[i] = out;
+                o = (o & 0x00FFFFFFu) | ((u32)(al < 0 ? 0 : al > 255 ? 255 : al) << 24);
+            g_color[i] = o;
             if (ztest && zupdate)
                 g_depth[i] = z;
         }
@@ -342,6 +669,8 @@ static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
 void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) {
     if (!gx_raster_active() || count == 0)
         return;
+    g_cpu = cpu;
+    tev_prepare();
 
     SVtx* sv = (SVtx*)malloc(sizeof(SVtx) * count);
     if (!sv)
@@ -354,26 +683,26 @@ void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) 
     }
 
     switch (prim & 0xF8) {
-    case 0x80:   /* quads */
+    case 0x80:
     case 0x88:
         for (u32 i = 0; i + 3 < count; i += 4) {
             draw_triangle(&sv[i], &sv[i + 1], &sv[i + 2]);
             draw_triangle(&sv[i], &sv[i + 2], &sv[i + 3]);
         }
         break;
-    case 0x90:   /* triangles */
+    case 0x90:
         for (u32 i = 0; i + 2 < count; i += 3)
             draw_triangle(&sv[i], &sv[i + 1], &sv[i + 2]);
         break;
-    case 0x98:   /* triangle strip */
+    case 0x98:
         for (u32 i = 0; i + 2 < count; i++)
             draw_triangle(&sv[i], &sv[i + 1], &sv[i + 2]);
         break;
-    case 0xA0:   /* triangle fan */
+    case 0xA0:
         for (u32 i = 1; i + 1 < count; i++)
             draw_triangle(&sv[0], &sv[i], &sv[i + 1]);
         break;
-    default:     /* lines and points: not drawn yet */
+    default:
         break;
     }
     free(sv);
@@ -395,7 +724,7 @@ static void write_bmp(const char* path, u32 sx, u32 sy, u32 w, u32 h) {
     fwrite(hdr, 1, 54, f);
     u8* line = (u8*)calloc(1, row);
     for (u32 y = 0; y < h; y++) {
-        u32 srcy = sy + (h - 1 - y);                    /* BMP rows go bottom-up */
+        u32 srcy = sy + (h - 1 - y);
         for (u32 x = 0; x < w; x++) {
             u32 c = (srcy < EFB_H && sx + x < EFB_W) ? g_color[srcy * EFB_W + sx + x] : 0;
             line[x * 3 + 0] = (u8)c;
@@ -423,6 +752,7 @@ void gx_raster_copy(u32 cmd) {
             g_dumped++;
         }
         g_frames++;
+        gx_tex_flush_cache();   /* texture data in RAM may change between frames */
     }
 
     if (clear) {

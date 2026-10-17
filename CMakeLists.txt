@@ -55,6 +55,7 @@ add_executable(nfls2
     src/audio/ax_hle.c
     src/gx/fifo.c
     src/gx/raster.c
+    src/gx/texture.c
     src/runtime/disc.c
     src/runtime/dol.c
     src/runtime/hle_cpu.c

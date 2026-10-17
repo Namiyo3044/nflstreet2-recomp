@@ -18,6 +18,12 @@ extern u32 gx_bp[256];
 extern u32 gx_xf_mem[0x800];
 extern u32 gx_xf_reg[0x100];
 
+/* TEV colour registers PREV, REG0-2 (signed 11-bit per component, RGBA) and
+   konstant colours K0-K3 (8-bit RGBA). Both are written through BP 0xE0-0xE7;
+   bit 23 of the value says which. */
+extern s16 gx_tev_reg[4][4];
+extern u8 gx_tev_konst[4][4];
+
 static inline float gx_f32(u32 bits) {
     union { u32 u; float f; } v;
     v.u = bits;

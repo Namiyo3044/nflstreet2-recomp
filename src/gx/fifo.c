@@ -1,6 +1,7 @@
 #include "gx/fifo.h"
 #include "gx/raster.h"
 #include "gx/state.h"
+#include "gx/texture.h"
 #include "runtime/mmio.h"
 
 #include <stdio.h>
@@ -11,6 +12,8 @@ u32 gx_cp[256];
 u32 gx_bp[256] = {[0xFE] = 0x00FFFFFFu};  /* 0xFE: write mask, all bits by default */
 u32 gx_xf_mem[0x800];
 u32 gx_xf_reg[0x100];
+s16 gx_tev_reg[4][4];
+u8 gx_tev_konst[4][4];
 
 /* Bytes received from the write-gather pipe that don't yet form a command. */
 static u8* g_buf;
@@ -95,7 +98,7 @@ static u32 be32(const u8* p) {
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
 }
 
-static void write_bp(u32 value) {
+static void write_bp(CPUState* cpu, u32 value) {
     u32 reg = value >> 24;
     u32 data = value & 0x00FFFFFFu;
 
@@ -108,7 +111,27 @@ static void write_bp(u32 value) {
     gx_bp[reg] = data;
     g_stats.bp++;
 
+    if (reg >= 0xE0 && reg <= 0xE7) {
+        /* TEV colour registers: RA = red/alpha, BG = blue/green, 11 bits each. */
+        u32 idx = (reg - 0xE0) / 2;
+        bool ra = ((reg - 0xE0) & 1) == 0;
+        bool konst = (data >> 23) & 1u;
+        s32 lo = (s32)(data & 0x7FFu), hi = (s32)((data >> 12) & 0x7FFu);
+        if (lo & 0x400) lo -= 0x800;
+        if (hi & 0x400) hi -= 0x800;
+        if (konst) {
+            if (ra) { gx_tev_konst[idx][0] = (u8)lo; gx_tev_konst[idx][3] = (u8)hi; }
+            else    { gx_tev_konst[idx][2] = (u8)lo; gx_tev_konst[idx][1] = (u8)hi; }
+        } else {
+            if (ra) { gx_tev_reg[idx][0] = (s16)lo; gx_tev_reg[idx][3] = (s16)hi; }
+            else    { gx_tev_reg[idx][2] = (s16)lo; gx_tev_reg[idx][1] = (s16)hi; }
+        }
+    }
+
     switch (reg) {
+    case 0x65: /* load a colour table (address in BP 0x64) into texture memory */
+        gx_tex_load_tlut(cpu, gx_bp[0x64], data);
+        break;
     case 0x45: /* PE_DONE: everything before this has been drawn */
         g_stats.draw_done++;
         mmio_pe_finish();
@@ -205,7 +228,7 @@ static size_t parse_one(CPUState* cpu, const u8* p, size_t avail, bool in_dl) {
     }
     if (op == 0x61) {                          /* LOAD_BP_REG */
         if (avail < 5) return 0;
-        write_bp(be32(p + 1));
+        write_bp(cpu, be32(p + 1));
         return 5;
     }
     if (op & 0x80) {                           /* draw: quads, triangles, strips, fans, lines, points */
