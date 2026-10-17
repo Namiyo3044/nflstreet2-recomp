@@ -55,6 +55,7 @@ add_executable(nfls2
     src/runtime/dol.c
     src/runtime/hle_cpu.c
     src/runtime/hle_exceptions.c
+    src/runtime/interrupts.c
     src/runtime/mmio.c
     src/runtime/sha1.c
     src/runtime/symbols.c)

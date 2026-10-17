@@ -12,6 +12,7 @@ static u8 g_regs[MMIO_SIZE];
 static u8 g_logged_read[MMIO_SIZE / 2];
 static u8 g_logged_write[MMIO_SIZE / 2];
 static bool g_log = true;
+static u32 g_last_read_addr, g_last_read_value;
 
 /* ARAM: the GameCube's 16 MB auxiliary RAM, reached only by DMA. */
 #define ARAM_SIZE (16u * 1024u * 1024u)
@@ -20,7 +21,7 @@ static u8* g_aram;
 typedef struct {
     u32 base, size;
     const char* name;
-    u32 reads, writes;
+    unsigned long long reads, writes;
 } Device;
 
 static Device g_devices[] = {
@@ -76,11 +77,15 @@ static u16 g_dsp_csr = DSP_CSR_HALT;
 
 static void aram_dma(CPUState* cpu) {
     u32 mm = reg_get(DSP + 0x20, 4) & 0x01FFFFFFu;
-    u32 ar = reg_get(DSP + 0x24, 4) & (ARAM_SIZE - 1);
+    u32 ar = reg_get(DSP + 0x24, 4) & 0x03FFFFFFu;
     u32 cnt = reg_get(DSP + 0x28, 4);
     bool to_ram = (cnt & 0x80000000u) != 0;
     u32 len = cnt & 0x03FFFFE0u;
-    if (mm + len > cpu->ram_size || ar + len > ARAM_SIZE) {
+    if (ar + len > ARAM_SIZE) {
+        /* Beyond the internal 16 MB is where expansion ARAM would sit. There
+           is none, so the transfer does nothing; ARInit's size probe relies on
+           this to conclude that no expansion is fitted. */
+    } else if (mm + len > cpu->ram_size) {
         fprintf(stderr, "mmio: ARAM DMA out of range (mm 0x%08X ar 0x%08X len 0x%X)\n", mm, ar, len);
     } else if (to_ram) {
         memcpy(cpu->ram + mm, g_aram + ar, len);
@@ -110,6 +115,9 @@ static bool dsp_read(u32 off, u8 size, u32* out) {
         return true;
     case 0x0A: /* CSR: reset completes instantly, no DMA ever in progress */
         *out = g_dsp_csr & ~(DSP_CSR_RES | 0x0200u | 0x0400u);
+        return true;
+    case 0x16: /* ARAM refresh/ready: bit 0 set means ARAM is usable */
+        *out = reg16(off) | 1u;
         return true;
     default:
         return false;
@@ -176,8 +184,12 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         d->reads++;
 
     u32 value;
-    if (!(off >= DSP && off < DSP + 0x200 && dsp_read(off, size, &value)))
+    if (off == 0x3000u && size == 4)
+        value = mmio_pi_cause();
+    else if (!(off >= DSP && off < DSP + 0x200 && dsp_read(off, size, &value)))
         value = reg_get(off, size);
+    g_last_read_addr = ea;
+    g_last_read_value = value;
     if (!(d && strcmp(d->name, "WGPIPE") == 0))
         log_access(false, ea, value, size);
     return value;
@@ -207,6 +219,43 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
     reg_set(off, value, size);
 }
 
+/* ---------------------------------------------------------- interrupts --- */
+/* PI interrupt cause (0xCC003000) is computed from the devices' own status
+   bits rather than stored, as on hardware. */
+#define PI_INT_DSP   0x00000040u
+#define PI_INT_VI    0x00000100u
+#define PI_INT_RSW   0x00010000u /* set = reset button NOT pressed */
+
+static bool dsp_interrupt_pending(void) {
+    u16 c = g_dsp_csr;
+    return ((c & 0x0008u) && (c & 0x0010u)) ||  /* AI DMA */
+           ((c & 0x0020u) && (c & 0x0040u)) ||  /* ARAM DMA */
+           ((c & 0x0080u) && (c & 0x0100u));    /* DSP */
+}
+
+u32 mmio_pi_cause(void) {
+    u32 cause = PI_INT_RSW;
+    for (u32 i = 0; i < 4; i++) {
+        u16 hi = reg16(0x2030u + i * 4u);
+        if ((hi & 0x8000u) && (hi & 0x1000u))
+            cause |= PI_INT_VI;
+    }
+    if (dsp_interrupt_pending())
+        cause |= PI_INT_DSP;
+    return cause;
+}
+
+u32 mmio_pi_mask(void) {
+    return reg_get(0x3004u, 4);
+}
+
+void mmio_vi_raise(u32 which) {
+    u32 off = 0x2030u + (which & 3u) * 4u;
+    u16 hi = reg16(off);
+    if (hi & 0x1000u)              /* only if that display interrupt is enabled */
+        set16(off, (u16)(hi | 0x8000u));
+}
+
 void mmio_install(CPUState* cpu) {
     memset(g_regs, 0, sizeof(g_regs));
     if (!g_aram)
@@ -220,6 +269,11 @@ void mmio_report(void) {
     printf("hardware register accesses:");
     for (size_t i = 0; i < sizeof(g_devices) / sizeof(g_devices[0]); i++)
         if (g_devices[i].reads || g_devices[i].writes)
-            printf(" %s(r%u/w%u)", g_devices[i].name, g_devices[i].reads, g_devices[i].writes);
+            printf(" %s(r%llu/w%llu)", g_devices[i].name, g_devices[i].reads, g_devices[i].writes);
     printf("\n");
+    if (g_last_read_addr) {
+        Device* d = device_for(g_last_read_addr);
+        printf("last hardware register read: %s 0x%08X = 0x%X\n", d ? d->name : "?",
+               g_last_read_addr, g_last_read_value);
+    }
 }

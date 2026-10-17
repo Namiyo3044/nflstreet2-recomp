@@ -8,6 +8,7 @@
 #include "runtime/dol.h"
 #include "runtime/hle_cpu.h"
 #include "runtime/hle_exceptions.h"
+#include "runtime/interrupts.h"
 #include "runtime/mmio.h"
 #include "runtime/symbols.h"
 
@@ -134,6 +135,7 @@ int main(int argc, char** argv) {
             reason = "CPU exception";
             break;
         }
+        interrupts_poll(&cpu);
     }
 
     printf("\n=== stopped after %llu steps: %s ===\n", steps, reason);
@@ -152,6 +154,7 @@ int main(int argc, char** argv) {
 
     printf("\n");
     hle_exceptions_report();
+    interrupts_report();
     hle_cpu_report();
     mmio_report();
     cpu_free(&cpu);

@@ -11,4 +11,9 @@ void mmio_install(CPUState* cpu);
 
 void mmio_report(void);
 
+/* Interrupt plumbing used by interrupts.c. */
+u32 mmio_pi_cause(void);         /* PI interrupt cause register, from device state */
+u32 mmio_pi_mask(void);          /* PI interrupt mask register */
+void mmio_vi_raise(u32 which);   /* assert VI display interrupt DI0-DI3 */
+
 #endif
