@@ -78,6 +78,12 @@ static void take_external_interrupt(CPUState* cpu) {
     g_taken++;
 }
 
+static void (*g_field_cb)(CPUState*);
+
+void interrupts_set_field_callback(void (*cb)(CPUState* cpu)) {
+    g_field_cb = cb;
+}
+
 void interrupts_poll(CPUState* cpu) {
     /* Video: one display interrupt per field, alternating the two that VIInit
        enables (DI1 at the top of the frame, DI0 at the field boundary). */
@@ -88,7 +94,9 @@ void interrupts_poll(CPUState* cpu) {
         mmio_pe_field();
         g_field ^= 1u;
         g_fields++;
-        gx_raster_xfb_field(cpu, g_fields, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2));
+        gx_raster_xfb_field(cpu, g_fields, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2), mmio_reg(0x2000, 2));
+        if (g_field_cb)
+            g_field_cb(cpu);
     }
 
     mmio_ai_dma_tick(cpu);

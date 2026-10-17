@@ -1208,29 +1208,72 @@ void gx_raster_config_xfb(u32 every_fields) {
 
 static u8 clamp8(int v) { return (u8)(v < 0 ? 0 : v > 255 ? 255 : v); }
 
-void gx_raster_xfb_field(CPUState* cpu, u64 field, u32 tfbl, u32 picture_cfg) {
+/* Where the frame buffer the TV shows lives and how it is laid out, from the
+   VI registers: top-field base (0x201C), picture configuration (0x2048) and
+   vertical timing (0x2000, active lines per field). */
+static bool xfb_geometry(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, u32* addr, u32* width, u32* height,
+                         u32* stride) {
+    u32 a = (tfbl & 0x10000000u) ? (tfbl & 0x00FFFFFFu) << 5 : (tfbl & 0x00FFFFFFu);
+    u32 w = ((picture_cfg >> 8) & 0x7Fu) * 16u;       /* WPL: width in 16-pixel units */
+    u32 st = (picture_cfg & 0xFFu) * 32u;             /* STD is per field line */
+    if (w == 0 || w > 720)
+        w = 640;
+    u32 line_bytes = w * 2u;
+    /* Interlaced: a field's stride skips every other line, so a frame line is stride / 2. */
+    if (st >= line_bytes * 2u)
+        st /= 2u;
+    if (st < line_bytes)
+        st = line_bytes;
+    u32 acv = (vtr >> 4) & 0x3FFu;                    /* active lines per field */
+    u32 h = (acv >= 100 && acv <= 288) ? acv * 2u : 480u;
+    if (a == 0 || a + st * h > cpu->ram_size)
+        return false;
+    *addr = a; *width = w; *height = h; *stride = st;
+    return true;
+}
+
+bool gx_raster_xfb_rgb(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, u32* out, u32 max_w, u32 max_h,
+                       u32* out_w, u32* out_h) {
+    u32 addr, width, height, stride;
+    wait_idle();                       /* the frame being drawn may be the one shown */
+    if (!xfb_geometry(cpu, tfbl, picture_cfg, vtr, &addr, &width, &height, &stride))
+        return false;
+    if (width > max_w) width = max_w;
+    if (height > max_h) height = max_h;
+    for (u32 y = 0; y < height; y++) {
+        const u8* src = cpu->ram + addr + y * stride;
+        u32* d = out + y * width;
+        for (u32 x = 0; x + 1 < width; x += 2) {
+            int y0 = src[x * 2], u = src[x * 2 + 1] - 128, y1 = src[x * 2 + 2], v = src[x * 2 + 3] - 128;
+            int r = (int)(1.371f * v), g = (int)(-0.698f * v - 0.336f * u), b = (int)(1.732f * u);
+            d[x] = 0xFF000000u | ((u32)clamp8(y0 + r) << 16) | ((u32)clamp8(y0 + g) << 8) | clamp8(y0 + b);
+            d[x + 1] = 0xFF000000u | ((u32)clamp8(y1 + r) << 16) | ((u32)clamp8(y1 + g) << 8) | clamp8(y1 + b);
+        }
+    }
+    *out_w = width;
+    *out_h = height;
+    return true;
+}
+
+void gx_raster_render_all(void) {
+    if (!g_every)
+        g_every = 1;
+}
+
+void gx_raster_xfb_field(CPUState* cpu, u64 field, u32 tfbl, u32 picture_cfg, u32 vtr) {
     if (!g_xfb_every || g_xfb_dumped >= MAX_DUMPS || field % g_xfb_every)
         return;
-    wait_idle();                       /* the frame being drawn may be the one shown */
-    u32 addr = (tfbl & 0x10000000u) ? (tfbl & 0x00FFFFFFu) << 5 : (tfbl & 0x00FFFFFFu);
-    u32 width = ((picture_cfg >> 8) & 0x7Fu) * 16u;   /* WPL: width in 16-pixel units */
-    u32 stride = (picture_cfg & 0xFFu) * 32u;          /* STD is per field line; a frame line is half */
-    if (width == 0 || width > 720)
-        width = 640;
-    u32 line_bytes = width * 2u;
-    /* Interlaced: a field's stride skips every other line, so a frame line is stride / 2. */
-    if (stride >= line_bytes * 2u)
-        stride /= 2u;
-    if (stride < line_bytes)
-        stride = line_bytes;
-    u32 height = 480;
-    if (addr == 0 || addr + stride * height > cpu->ram_size)
+    static u32 pixels[720 * 576];
+    u32 width, height;
+    u32 addr, w0, h0, st0;
+    if (!xfb_geometry(cpu, tfbl, picture_cfg, vtr, &addr, &w0, &h0, &st0))
+        return;
+    if (!gx_raster_xfb_rgb(cpu, tfbl, picture_cfg, vtr, pixels, 720, 576, &width, &height))
         return;
 
-    FILE* f;
     char path[600];
     snprintf(path, sizeof(path), "%s/xfb_%06llu.bmp", g_dir, (unsigned long long)field);
-    f = fopen(path, "wb");
+    FILE* f = fopen(path, "wb");
     if (!f)
         return;
     u32 row = (width * 3 + 3) & ~3u;
@@ -1244,13 +1287,11 @@ void gx_raster_xfb_field(CPUState* cpu, u64 field, u32 tfbl, u32 picture_cfg) {
     fwrite(hdr, 1, 54, f);
     u8* line = (u8*)calloc(1, row);
     for (u32 y = 0; y < height; y++) {
-        const u8* src = cpu->ram + addr + (height - 1 - y) * stride;
-        for (u32 x = 0; x + 1 < width; x += 2) {
-            int y0 = src[x * 2], u = src[x * 2 + 1] - 128, y1 = src[x * 2 + 2], v = src[x * 2 + 3] - 128;
-            int r = (int)(1.371f * v), g = (int)(-0.698f * v - 0.336f * u), b = (int)(1.732f * u);
-            u8* d = line + x * 3;
-            d[0] = clamp8(y0 + b); d[1] = clamp8(y0 + g); d[2] = clamp8(y0 + r);
-            d[3] = clamp8(y1 + b); d[4] = clamp8(y1 + g); d[5] = clamp8(y1 + r);
+        const u32* src = pixels + (height - 1 - y) * width;
+        for (u32 x = 0; x < width; x++) {
+            line[x * 3 + 0] = (u8)src[x];
+            line[x * 3 + 1] = (u8)(src[x] >> 8);
+            line[x * 3 + 2] = (u8)(src[x] >> 16);
         }
         fwrite(line, 1, row, f);
     }

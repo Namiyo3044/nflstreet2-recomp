@@ -58,6 +58,26 @@ elseif(MSVC)
     target_compile_options(nfls2_game PRIVATE /w /bigobj)
 endif()
 
+# Live window (SDL3). Uses an installed SDL3 if CMake can find one, otherwise
+# downloads and builds it (static) on the first configure.
+option(NFLS2_WINDOW "Build the live window (SDL3)" ON)
+if(NFLS2_WINDOW)
+    find_package(SDL3 CONFIG QUIET)
+    if(NOT SDL3_FOUND)
+        message(STATUS "SDL3 not found: downloading and building SDL 3.2.20")
+        include(FetchContent)
+        set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+        set(SDL_STATIC ON CACHE BOOL "" FORCE)
+        set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(SDL3
+            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+            GIT_TAG release-3.2.20
+            GIT_SHALLOW TRUE)
+        FetchContent_MakeAvailable(SDL3)
+    endif()
+endif()
+
 add_executable(nfls2
     src/main.c
     src/audio/ax_hle.c
@@ -74,6 +94,19 @@ add_executable(nfls2
     src/runtime/sha1.c
     src/runtime/symbols.c)
 target_link_libraries(nfls2 PRIVATE nfls2_game)
+if(NFLS2_WINDOW)
+    target_sources(nfls2 PRIVATE src/platform/window.c)
+    target_compile_definitions(nfls2 PRIVATE NFLS2_HAVE_WINDOW)
+    if(TARGET SDL3::SDL3-static)
+        target_link_libraries(nfls2 PRIVATE SDL3::SDL3-static)
+    else()
+        target_link_libraries(nfls2 PRIVATE SDL3::SDL3)
+    endif()
+endif()
+if(NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(nfls2 PRIVATE Threads::Threads)
+endif()
 if(NOT MSVC)
     target_link_libraries(nfls2 PRIVATE m)
 endif()

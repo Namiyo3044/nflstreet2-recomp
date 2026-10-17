@@ -26,6 +26,12 @@ static const struct { const char* name; uint32_t bits; } k_names[] = {
     {"SUP", STICK_UP}, {"SDOWN", STICK_DOWN}, {"SLEFT", STICK_LEFT}, {"SRIGHT", STICK_RIGHT},
 };
 
+static PadLive g_live = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
+
+void pad_set_live(const PadLive* live) {
+    g_live = *live;
+}
+
 typedef struct { double at, hold; uint32_t bits; int state; } Press;
 static Press g_presses[256];
 static int g_count;
@@ -98,15 +104,17 @@ void pad_poll_response(double t, uint8_t out[8]) {
         }
     }
 
-    uint16_t buttons = (uint16_t)(held & 0xFFFFu);
+    uint16_t buttons = (uint16_t)((held & 0xFFFFu) | g_live.buttons);
     out[0] = (uint8_t)(buttons >> 8);
     out[1] = (uint8_t)(0x80u | (buttons & 0x7Fu));
-    out[2] = held & STICK_LEFT ? 0x00 : held & STICK_RIGHT ? 0xFF : 0x80;
-    out[3] = held & STICK_DOWN ? 0x00 : held & STICK_UP ? 0xFF : 0x80;
-    out[4] = 0x80;                       /* C-stick centred */
-    out[5] = 0x80;
-    out[6] = held & BTN_L ? 0xFF : 0x00; /* analog triggers follow the digital ones */
-    out[7] = held & BTN_R ? 0xFF : 0x00;
+    /* Scripted stick directions win over the live stick. */
+    out[2] = held & STICK_LEFT ? 0x00 : held & STICK_RIGHT ? 0xFF : g_live.stick_x;
+    out[3] = held & STICK_DOWN ? 0x00 : held & STICK_UP ? 0xFF : g_live.stick_y;
+    out[4] = g_live.cstick_x;
+    out[5] = g_live.cstick_y;
+    /* analog triggers: scripted presses push them fully */
+    out[6] = held & BTN_L ? 0xFF : g_live.trigger_l;
+    out[7] = held & BTN_R ? 0xFF : g_live.trigger_r;
 }
 
 const char* pad_button_names(void) {

@@ -10,6 +10,10 @@ void interrupts_poll(CPUState* cpu);
 /* Game time so far, in seconds, counted in video fields. */
 double interrupts_game_seconds(void);
 
+/* Optional function called once at the start of every video field (the live
+   window uses it to show the frame, read input and keep real-time pace). */
+void interrupts_set_field_callback(void (*cb)(CPUState* cpu));
+
 void interrupts_report(void);
 
 #endif

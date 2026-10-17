@@ -16,6 +16,9 @@
 #include "audio/ax_hle.h"
 #include "runtime/mmio.h"
 #include "runtime/symbols.h"
+#ifdef NFLS2_HAVE_WINDOW
+#include "platform/window.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -193,6 +196,7 @@ static void usage(const char* argv0) {
             "         [--trace-at SECONDS (log frame-pacing calls for a few frames from then)]\n"
             "         [--unpaced (let the game draw as many frames per video field as it likes)]\n"
             "         [--render-threads N (threads that draw frames; 0 = draw on the game thread)]\n"
+            "         [--window (play in a window at real-time speed)] [--scale N (window size, default 2)]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -201,6 +205,9 @@ int main(int argc, char** argv) {
     const char* disc_dir = NULL;
     const char* map_path = NULL;
     unsigned long long max_steps = 50000000ull;
+    bool max_steps_given = false;
+    bool want_window = false;
+    int window_scale = 2;
     bool skip_hash = false;
     const char* dump_dir = "frames";
     u32 dump_every = 60;
@@ -212,6 +219,11 @@ int main(int argc, char** argv) {
             map_path = argv[++i];
         } else if (strcmp(argv[i], "--max-steps") == 0 && i + 1 < argc) {
             max_steps = strtoull(argv[++i], NULL, 10);
+            max_steps_given = true;
+        } else if (strcmp(argv[i], "--window") == 0) {
+            want_window = true;
+        } else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
+            window_scale = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--quiet") == 0) {
             g_verbose_entries = false;
         } else if (strcmp(argv[i], "--dump-every") == 0 && i + 1 < argc) {
@@ -257,6 +269,19 @@ int main(int argc, char** argv) {
     g_profile = (u32*)calloc(GC_MAIN_RAM_SIZE >> 2, sizeof(u32));
     gx_raster_config(dump_dir, dump_every);
     gx_raster_config_xfb(xfb_every);
+    if (want_window) {
+#ifdef NFLS2_HAVE_WINDOW
+        if (!window_open(window_scale))
+            return 1;
+        gx_raster_render_all();
+        interrupts_set_field_callback(window_field);
+        if (!max_steps_given)
+            max_steps = ~0ull;         /* play until the window is closed */
+#else
+        fprintf(stderr, "error: this build has no window support (configure with -DNFLS2_WINDOW=ON)\n");
+        return 2;
+#endif
+    }
 
     static CPUState cpu;
     if (!cpu_init(&cpu))
@@ -311,6 +336,12 @@ int main(int argc, char** argv) {
             break;
         }
         interrupts_poll(&cpu);
+#ifdef NFLS2_HAVE_WINDOW
+        if (want_window && window_quit_requested()) {
+            reason = "window closed";
+            break;
+        }
+#endif
         if (stop_at > 0 && (steps & 0xFFFu) == 0 && interrupts_game_seconds() >= stop_at) {
             reason = "game time limit reached";
             break;
@@ -348,6 +379,10 @@ int main(int argc, char** argv) {
     ax_hle_report();
     hle_cpu_report();
     mmio_report();
+#ifdef NFLS2_HAVE_WINDOW
+    if (want_window)
+        window_close();
+#endif
     cpu_free(&cpu);
     return 0;
 }
