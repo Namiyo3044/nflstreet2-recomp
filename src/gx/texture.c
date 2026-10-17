@@ -1,6 +1,7 @@
 #include "gx/texture.h"
 #include "gx/state.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -187,20 +188,59 @@ void gx_tex_load_tlut(CPUState* cpu, u32 src_reg, u32 dest_reg) {
 }
 
 /* ------------------------------------------------------------- cache --- */
+/* Decoded textures are kept across frames. Once per frame, the first time an
+   entry is used its source bytes (and colour table) are hashed; it is only
+   decoded again if they changed. Least recently used entries are dropped
+   when the cache is full. */
 typedef struct {
     u32 addr, fmt, w, h, tlut_addr, tlut_fmt;
+    u64 hash;
+    u32 checked_frame, used_frame;
     GxTexture tex;
     u32* data;
 } CacheEntry;
 
-#define CACHE_MAX 512
+#define CACHE_MAX 1024
 static CacheEntry g_cache[CACHE_MAX];
 static u32 g_cache_count;
+static u32 g_frame = 1;
+static unsigned long long g_decodes, g_hits;
 
+static u64 hash_bytes(const u8* p, u32 n) {
+    u64 h = 0x9E3779B97F4A7C15ull ^ n;
+    u32 i = 0;
+    for (; i + 8 <= n; i += 8) {
+        u64 w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
+static u32 tlut_bytes(u32 fmt) {
+    return fmt == FMT_C4 ? 16u * 2u : fmt == FMT_C8 ? 256u * 2u : 16384u * 2u;
+}
+
+static u64 entry_hash(CPUState* cpu, u32 addr, u32 size, bool paletted, u32 fmt, u32 tlut_addr) {
+    u64 h = hash_bytes(cpu->ram + addr, size);
+    if (paletted) {
+        u32 n = tlut_bytes(fmt);
+        if (tlut_addr + n <= TMEM_SIZE)
+            h ^= hash_bytes(g_tmem + tlut_addr, n) * 31u;
+    }
+    return h;
+}
+
+/* Called once per displayed frame: starts a new validation round. */
 void gx_tex_flush_cache(void) {
-    for (u32 i = 0; i < g_cache_count; i++)
-        free(g_cache[i].data);
-    g_cache_count = 0;
+    g_frame++;
+}
+
+void gx_tex_report(void) {
+    printf("textures: %u cached, %llu decodes, %llu cache hits\n", g_cache_count, g_decodes, g_hits);
 }
 
 const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
@@ -216,30 +256,75 @@ const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
     bool paletted = fmt == FMT_C4 || fmt == FMT_C8 || fmt == FMT_C14X2;
     u32 tlut_addr = paletted ? (tlut & 0x3FFu) << 9 : 0;
     u32 tlut_fmt = paletted ? (tlut >> 10) & 3u : 0;
-
-    for (u32 k = 0; k < g_cache_count; k++) {
-        CacheEntry* e = &g_cache[k];
-        if (e->addr == addr && e->fmt == fmt && e->w == w && e->h == h &&
-            e->tlut_addr == tlut_addr && e->tlut_fmt == tlut_fmt)
-            return &e->tex;
-    }
-
     u32 size = gx_tex_size(fmt, w, h);
-    if (addr >= cpu->ram_size || size > cpu->ram_size - addr || g_cache_count >= CACHE_MAX)
+    if (addr >= cpu->ram_size || size > cpu->ram_size - addr)
         return NULL;
-    u32* data = (u32*)malloc((size_t)w * h * 4);
-    if (!data)
-        return NULL;
-    if (!gx_tex_decode(cpu->ram + addr, fmt, w, h, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, data)) {
-        free(data);
+
+    static u32 last_hit[8] = {0};
+    CacheEntry* e = NULL;
+    CacheEntry* c = &g_cache[last_hit[map & 7u]];
+    if (last_hit[map & 7u] < g_cache_count && c->addr == addr && c->fmt == fmt && c->w == w && c->h == h &&
+        c->tlut_addr == tlut_addr && c->tlut_fmt == tlut_fmt) {
+        e = c;
+    } else {
+        for (u32 k = 0; k < g_cache_count; k++) {
+            c = &g_cache[k];
+            if (c->addr == addr && c->fmt == fmt && c->w == w && c->h == h &&
+                c->tlut_addr == tlut_addr && c->tlut_fmt == tlut_fmt) {
+                e = c;
+                last_hit[map & 7u] = k;
+                break;
+            }
+        }
+    }
+
+    if (e) {
+        e->used_frame = g_frame;
+        if (e->checked_frame == g_frame) {
+            g_hits++;
+            return &e->tex;
+        }
+        u64 hsh = entry_hash(cpu, addr, size, paletted, fmt, tlut_addr);
+        e->checked_frame = g_frame;
+        if (hsh == e->hash) {
+            g_hits++;
+            return &e->tex;
+        }
+        if (!gx_tex_decode(cpu->ram + addr, fmt, w, h, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, e->data))
+            return NULL;
+        e->hash = hsh;
+        g_decodes++;
+        return &e->tex;
+    }
+
+    /* New entry: take a free slot, or the least recently used one. */
+    u32 slot = g_cache_count;
+    if (slot >= CACHE_MAX) {
+        slot = 0;
+        for (u32 k = 1; k < CACHE_MAX; k++)
+            if (g_cache[k].used_frame < g_cache[slot].used_frame)
+                slot = k;
+        free(g_cache[slot].data);
+    } else {
+        g_cache_count++;
+    }
+    e = &g_cache[slot];
+    memset(e, 0, sizeof(*e));
+    e->data = (u32*)malloc((size_t)w * h * 4);
+    if (!e->data || !gx_tex_decode(cpu->ram + addr, fmt, w, h, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, e->data)) {
+        free(e->data);
+        e->data = NULL;
+        e->addr = 0xFFFFFFFFu;       /* matches nothing; reused later */
         return NULL;
     }
-    CacheEntry* e = &g_cache[g_cache_count++];
     e->addr = addr; e->fmt = fmt; e->w = w; e->h = h;
     e->tlut_addr = tlut_addr; e->tlut_fmt = tlut_fmt;
-    e->data = data;
+    e->hash = entry_hash(cpu, addr, size, paletted, fmt, tlut_addr);
+    e->checked_frame = e->used_frame = g_frame;
     e->tex.width = w;
     e->tex.height = h;
-    e->tex.texels = data;
+    e->tex.texels = e->data;
+    last_hit[map & 7u] = slot;
+    g_decodes++;
     return &e->tex;
 }

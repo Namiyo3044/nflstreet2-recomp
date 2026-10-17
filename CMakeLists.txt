@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Optimised build unless asked otherwise (an empty build type means no
+# optimisation at all, which makes the renderer and CPU runtime ~4x slower).
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 project(nfls2_port C)
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

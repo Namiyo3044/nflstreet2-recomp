@@ -193,7 +193,7 @@ typedef struct {
     bool valid;
 } SVtx;
 
-static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+static float clamp01(float v);
 
 static void unpack(u32 rgba, float out[4]) {
     out[0] = (float)(rgba >> 24) / 255.0f;
@@ -317,117 +317,197 @@ static void transform(const Vtx* in, SVtx* out) {
 }
 
 /* ---------------------------------------------------------------- TEV --- */
+/* Everything that is the same for every pixel of a draw is worked out once
+   in tev_prepare(); the per-pixel loop only does the arithmetic.
+
+   TEV inputs are read from a table of rows (RGBA floats):
+     0-3  PREV, REG0, REG1, REG2   (copied from the start values per pixel)
+     4    texture colour of the current stage (after swizzle)
+     5    rasterised colour of the current stage (after swizzle)
+     6-8  constants 1, 0.5, 0
+     9+   konstant colour / alpha for each stage (two rows per stage) */
+enum { ROW_PREV = 0, ROW_TEX = 4, ROW_RAS = 5, ROW_ONE = 6, ROW_HALF = 7, ROW_ZERO = 8, ROW_KONST = 9 };
+static float g_rows[ROW_KONST + 32][4];
+static float g_reg_init[4][4];
+static float g_u8f[256];               /* i / 255 */
+
+typedef struct {
+    const float* ci[4];                /* colour inputs a, b, c, d */
+    bool cbc[4];                       /* input is an alpha broadcast to RGB */
+    const float* ai[4];                /* alpha inputs a, b, c, d (pointers to the A component) */
+    u32 cdst, adst;
+    bool csub, asub, cclamp, aclamp, ccmp, acmp;
+    float cbias, abias, cscale, ascale;
+    bool tex_on;
+    u32 texcoord, chan;
+    u8 tsw[4], rsw[4];
+    /* texture */
+    const u32* texels;
+    u32 tw, th, wrap_s, wrap_t;
+} Stage;
+
+enum { FAST_NONE, FAST_MODULATE, FAST_REPLACE, FAST_PASSCLR };
+
 typedef struct {
     u32 stages;
-    u32 color_op[16], alpha_op[16];
-    u32 texmap[16], texcoord[16], chan[16];
-    bool tex_on[16];
-    u32 kcsel[16], kasel[16];
-    u32 swap[4][4];              /* swap tables: source channel for R, G, B, A */
-    const GxTexture* tex[16];
-    u32 alpha_test;
+    u32 fast;                          /* one-stage standard modes (GXSetTevOp) */
+    Stage st[16];
+    u32 at_ref0, at_ref1, at_f0, at_f1, at_logic;
+    bool at_always;
 } TevSetup;
 
 static TevSetup g_tev;
 
-static void tev_prepare(void) {
-    g_tev.stages = ((gx_bp[0x00] >> 10) & 15u) + 1;
-    for (u32 i = 0; i < g_tev.stages; i++) {
-        g_tev.color_op[i] = gx_bp[0xC0 + i * 2];
-        g_tev.alpha_op[i] = gx_bp[0xC1 + i * 2];
-        u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
-        g_tev.texmap[i] = order & 7u;
-        g_tev.texcoord[i] = (order >> 3) & 7u;
-        g_tev.tex_on[i] = (order >> 6) & 1u;
-        g_tev.chan[i] = (order >> 7) & 7u;
-        u32 ksel = gx_bp[0xF6 + i / 2];
-        g_tev.kcsel[i] = (ksel >> ((i & 1) ? 14 : 4)) & 31u;
-        g_tev.kasel[i] = (ksel >> ((i & 1) ? 19 : 9)) & 31u;
-        g_tev.tex[i] = g_tev.tex_on[i] ? gx_tex_get(g_cpu, g_tev.texmap[i]) : NULL;
+static float clamp01(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+
+static void op_params(u32 op, bool* sub, bool* clamp, bool* cmp, float* bias, float* scale) {
+    u32 b = (op >> 16) & 3u, sc = (op >> 20) & 3u;
+    *cmp = b == 3;                     /* comparison modes: not modelled, pass d through */
+    *sub = (op >> 18) & 1u;
+    *clamp = (op >> 19) & 1u;
+    *bias = b == 1 ? 0.5f : b == 2 ? -0.5f : 0.0f;
+    *scale = sc == 1 ? 2.0f : sc == 2 ? 4.0f : sc == 3 ? 0.5f : 1.0f;
+}
+
+static void konst_rows(u32 st, u32 kcsel, u32 kasel) {
+    static const float frac[8] = {1.0f, 0.875f, 0.75f, 0.625f, 0.5f, 0.375f, 0.25f, 0.125f};
+    float* kc = g_rows[ROW_KONST + st * 2];
+    float* ka = g_rows[ROW_KONST + st * 2 + 1];
+    for (int pass = 0; pass < 2; pass++) {
+        u32 sel = pass ? kasel : kcsel;
+        float* out = pass ? ka : kc;
+        if (sel < 8) {
+            out[0] = out[1] = out[2] = out[3] = frac[sel];
+            continue;
+        }
+        const u8* k = gx_tev_konst[sel & 3u];
+        float rgba[4] = {g_u8f[k[0]], g_u8f[k[1]], g_u8f[k[2]], g_u8f[k[3]]};
+        if (sel >= 0x0C && sel <= 0x0F) {           /* whole colour (alpha uses its A) */
+            if (pass) { out[0] = out[1] = out[2] = out[3] = rgba[3]; }
+            else memcpy(out, rgba, sizeof(rgba));
+            continue;
+        }
+        u32 comp = sel >= 0x1C ? 3 : sel >= 0x18 ? 2 : sel >= 0x14 ? 1 : 0;
+        out[0] = out[1] = out[2] = out[3] = rgba[comp];
     }
+}
+
+static void tev_prepare(void) {
+    if (g_u8f[255] == 0.0f)
+        for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;
+    for (int k = 0; k < 4; k++) {
+        g_rows[ROW_ONE][k] = 1.0f;
+        g_rows[ROW_HALF][k] = 0.5f;
+        g_rows[ROW_ZERO][k] = 0.0f;
+    }
+    for (u32 r = 0; r < 4; r++)
+        for (u32 k = 0; k < 4; k++)
+            g_reg_init[r][k] = (float)gx_tev_reg[r][k] / 255.0f;
+
+    u8 swap[4][4];
     for (u32 t = 0; t < 4; t++) {
         u32 k0 = gx_bp[0xF6 + t * 2], k1 = gx_bp[0xF7 + t * 2];
-        g_tev.swap[t][0] = k0 & 3u;
-        g_tev.swap[t][1] = (k0 >> 2) & 3u;
-        g_tev.swap[t][2] = k1 & 3u;
-        g_tev.swap[t][3] = (k1 >> 2) & 3u;
+        swap[t][0] = k0 & 3u; swap[t][1] = (k0 >> 2) & 3u;
+        swap[t][2] = k1 & 3u; swap[t][3] = (k1 >> 2) & 3u;
     }
-    g_tev.alpha_test = gx_bp[0xF3];
+
+    static const u8 c_row[16] = {0, 0, 1, 1, 2, 2, 3, 3, ROW_TEX, ROW_TEX, ROW_RAS, ROW_RAS, ROW_ONE, ROW_HALF, 0, ROW_ZERO};
+    static const u8 a_row[8] = {0, 1, 2, 3, ROW_TEX, ROW_RAS, 0, ROW_ZERO};
+
+    g_tev.stages = ((gx_bp[0x00] >> 10) & 15u) + 1;
+    for (u32 i = 0; i < g_tev.stages; i++) {
+        Stage* s = &g_tev.st[i];
+        u32 cop = gx_bp[0xC0 + i * 2], aop = gx_bp[0xC1 + i * 2];
+        u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
+        u32 texmap = order & 7u;
+        s->texcoord = (order >> 3) & 7u;
+        s->tex_on = (order >> 6) & 1u;
+        s->chan = (order >> 7) & 7u;
+        u32 ksel = gx_bp[0xF6 + i / 2];
+        konst_rows(i, (ksel >> ((i & 1) ? 14 : 4)) & 31u, (ksel >> ((i & 1) ? 19 : 9)) & 31u);
+
+        const u32 csel[4] = {(cop >> 12) & 15u, (cop >> 8) & 15u, (cop >> 4) & 15u, cop & 15u};
+        for (int j = 0; j < 4; j++) {
+            u32 row = csel[j] == 14 ? ROW_KONST + i * 2 : c_row[csel[j]];
+            s->ci[j] = g_rows[row];
+            s->cbc[j] = csel[j] < 12 && (csel[j] & 1u);
+        }
+        const u32 asel[4] = {(aop >> 13) & 7u, (aop >> 10) & 7u, (aop >> 7) & 7u, (aop >> 4) & 7u};
+        for (int j = 0; j < 4; j++) {
+            u32 row = asel[j] == 6 ? ROW_KONST + i * 2 + 1 : a_row[asel[j]];
+            s->ai[j] = &g_rows[row][3];
+        }
+        s->cdst = (cop >> 22) & 3u;
+        s->adst = (aop >> 22) & 3u;
+        op_params(cop, &s->csub, &s->cclamp, &s->ccmp, &s->cbias, &s->cscale);
+        op_params(aop, &s->asub, &s->aclamp, &s->acmp, &s->abias, &s->ascale);
+        memcpy(s->tsw, swap[(aop >> 2) & 3u], 4);
+        memcpy(s->rsw, swap[aop & 3u], 4);
+
+        s->texels = NULL;
+        if (s->tex_on) {
+            const GxTexture* tex = gx_tex_get(g_cpu, texmap);
+            if (tex) {
+                u32 mode0 = gx_bp[(texmap < 4 ? 0x80u : 0xA0u) + (texmap & 3u)];
+                s->texels = tex->texels;
+                s->tw = tex->width;
+                s->th = tex->height;
+                s->wrap_s = mode0 & 3u;
+                s->wrap_t = (mode0 >> 2) & 3u;
+            }
+        }
+    }
+
+    /* Recognise the standard one-stage modes: output to PREV, no bias/scale,
+       clamped, identity swizzles, colour channel 0 or 1. */
+    g_tev.fast = FAST_NONE;
+    if (g_tev.stages == 1) {
+        u32 cop = gx_bp[0xC0] & 0xFFFFFFu, aop = gx_bp[0xC1] & 0xFFFFFFu;
+        const Stage* s = &g_tev.st[0];
+        bool ident = memcmp(s->tsw, "\0\1\2\3", 4) == 0 && memcmp(s->rsw, "\0\1\2\3", 4) == 0;
+        bool plain = ((cop >> 16) & 0xFFu) == 0x08u && ((aop >> 16) & 0xFFu) == 0x08u;  /* clamp only, PREV */
+        bool aop_ok = (aop & 0xFu) == 0;    /* swap tables 0 */
+        if (ident && plain && aop_ok) {
+            u32 c = cop & 0xFFFFu, a = (aop >> 4) & 0xFFFu;
+            if (c == 0xF8AFu && a == ((7u << 9) | (4u << 6) | (5u << 3) | 7u) && s->tex_on && s->chan <= 1)
+                g_tev.fast = FAST_MODULATE;
+            else if (c == 0xFFF8u && a == ((7u << 9) | (7u << 6) | (7u << 3) | 4u) && s->tex_on)
+                g_tev.fast = FAST_REPLACE;
+            else if (c == 0xFFFAu && a == ((7u << 9) | (7u << 6) | (7u << 3) | 5u) && s->chan <= 1)
+                g_tev.fast = FAST_PASSCLR;
+        }
+    }
+
+    u32 at = gx_bp[0xF3];
+    g_tev.at_ref0 = at & 255u; g_tev.at_ref1 = (at >> 8) & 255u;
+    g_tev.at_f0 = (at >> 16) & 7u; g_tev.at_f1 = (at >> 19) & 7u; g_tev.at_logic = (at >> 22) & 3u;
+    /* "always pass": unconfigured, or both tests always with AND/OR */
+    g_tev.at_always = at == 0 || (g_tev.at_f0 == 7 && g_tev.at_f1 == 7 && g_tev.at_logic <= 1);
 }
 
-static float wrap_coord(float c, u32 size, u32 mode) {
+static inline int wrap_index(float c, u32 size, u32 mode) {
     float f = c * (float)size;
-    int i = (int)floorf(f);
+    int i = (int)f;
+    if (f < (float)i) i--;             /* floor without a libm call */
     int n = (int)size;
     switch (mode) {
-    case 0:  /* clamp */
-        if (i < 0) i = 0;
-        if (i >= n) i = n - 1;
-        break;
-    case 2: { /* mirror */
+    case 0:                            /* clamp */
+        return i < 0 ? 0 : i >= n ? n - 1 : i;
+    case 2: {                          /* mirror */
         int period = 2 * n;
-        int m = ((i % period) + period) % period;
-        i = m < n ? m : period - 1 - m;
-        break;
+        int m = i % period;
+        if (m < 0) m += period;
+        return m < n ? m : period - 1 - m;
     }
-    default: /* repeat */
-        i = ((i % n) + n) % n;
-        break;
+    default:                           /* repeat */
+        if ((size & (size - 1)) == 0)
+            return i & (n - 1);
+        i %= n;
+        return i < 0 ? i + n : i;
     }
-    return (float)i;
 }
 
-static void sample(u32 stage, float s, float t, float out[4]) {
-    const GxTexture* tex = g_tev.tex[stage];
-    if (!tex) {
-        out[0] = out[1] = out[2] = out[3] = 0.0f;
-        return;
-    }
-    u32 map = g_tev.texmap[stage];
-    u32 mode0 = gx_bp[(map < 4 ? 0x80u : 0xA0u) + (map & 3u)];
-    u32 x = (u32)wrap_coord(s, tex->width, mode0 & 3u);
-    u32 y = (u32)wrap_coord(t, tex->height, (mode0 >> 2) & 3u);
-    u32 c = tex->texels[y * tex->width + x];
-    out[0] = (float)((c >> 16) & 255) / 255.0f;
-    out[1] = (float)((c >> 8) & 255) / 255.0f;
-    out[2] = (float)(c & 255) / 255.0f;
-    out[3] = (float)(c >> 24) / 255.0f;
-}
-
-static void konst(u32 sel, bool alpha, float out[4]) {
-    static const float frac[8] = {1.0f, 0.875f, 0.75f, 0.625f, 0.5f, 0.375f, 0.25f, 0.125f};
-    if (sel < 8) {
-        out[0] = out[1] = out[2] = out[3] = frac[sel];
-        return;
-    }
-    u32 k = sel & 3u;
-    const u8* kc = gx_tev_konst[k];
-    float rgba[4] = {kc[0] / 255.0f, kc[1] / 255.0f, kc[2] / 255.0f, kc[3] / 255.0f};
-    if (sel >= 0x0C && sel <= 0x0F && !alpha) {
-        memcpy(out, rgba, sizeof(rgba));
-        return;
-    }
-    u32 comp = sel >= 0x1C ? 3 : sel >= 0x18 ? 2 : sel >= 0x14 ? 1 : 0;
-    if (sel >= 0x0C && sel <= 0x0F) comp = 3;
-    out[0] = out[1] = out[2] = out[3] = rgba[comp];
-}
-
-static float tev_math(float a, float b, float c, float d, u32 op) {
-    u32 bias = (op >> 16) & 3u, sub = (op >> 18) & 1u, clamp = (op >> 19) & 1u, scale = (op >> 20) & 3u;
-    if (bias == 3)               /* comparison modes: not modelled, pass d through */
-        return d;
-    a = clamp01(a); b = clamp01(b); c = clamp01(c);
-    float lerp = a * (1.0f - c) + b * c;
-    float r = sub ? d - lerp : d + lerp;
-    r += bias == 1 ? 0.5f : bias == 2 ? -0.5f : 0.0f;
-    r *= scale == 1 ? 2.0f : scale == 2 ? 4.0f : scale == 3 ? 0.5f : 1.0f;
-    if (clamp)
-        return clamp01(r);
-    return r < -4.0f ? -4.0f : r > 4.0f ? 4.0f : r;
-}
-
-static bool alpha_compare(u32 func, float a, u32 ref) {
-    u32 v = (u32)(clamp01(a) * 255.0f + 0.5f);
+static bool alpha_compare(u32 func, u32 v, u32 ref) {
     switch (func) {
     case 0: return false;
     case 1: return v < ref;
@@ -440,91 +520,102 @@ static bool alpha_compare(u32 func, float a, u32 ref) {
     }
 }
 
+static inline float tev_combine(float a, float b, float c, float d, bool sub, float bias, float scale, bool clamp) {
+    a = clamp01(a); b = clamp01(b); c = clamp01(c);
+    float lerp = a + (b - a) * c;
+    float r = ((sub ? d - lerp : d + lerp) + bias) * scale;
+    if (clamp)
+        return clamp01(r);
+    return r < -4.0f ? -4.0f : r > 4.0f ? 4.0f : r;
+}
+
 /* Runs the TEV stages for one pixel. Returns false if the alpha test
    discards it. */
-static bool tev_pixel(float col[2][4], float tc[MAX_TC][2], float out[4]) {
-    float reg[4][4];
-    for (u32 r = 0; r < 4; r++)
-        for (u32 k = 0; k < 4; k++)
-            reg[r][k] = (float)gx_tev_reg[r][k] / 255.0f;
+static bool alpha_test(float a01);
 
-    for (u32 st = 0; st < g_tev.stages; st++) {
-        float tex[4] = {0, 0, 0, 0}, ras[4] = {0, 0, 0, 0}, kc[4], ka[4];
-        if (g_tev.tex_on[st]) {
-            float raw[4];
-            u32 tci = g_tev.texcoord[st];
-            sample(st, tc[tci][0], tc[tci][1], raw);
-            u32 tsw = (g_tev.alpha_op[st] >> 2) & 3u;
-            for (u32 k = 0; k < 4; k++) tex[k] = raw[g_tev.swap[tsw][k]];
-        }
-        u32 ch = g_tev.chan[st];
-        if (ch <= 1) {
-            u32 rsw = g_tev.alpha_op[st] & 3u;
-            for (u32 k = 0; k < 4; k++) ras[k] = col[ch][g_tev.swap[rsw][k]];
-        }
-        konst(g_tev.kcsel[st], false, kc);
-        konst(g_tev.kasel[st], true, ka);
+static inline void sample_stage(const Stage* s, const float tc[][2], float out[4]) {
+    if (!s->texels) {
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        return;
+    }
+    int x = wrap_index(tc[s->texcoord][0], s->tw, s->wrap_s);
+    int y = wrap_index(tc[s->texcoord][1], s->th, s->wrap_t);
+    u32 c = s->texels[(u32)y * s->tw + (u32)x];
+    out[0] = g_u8f[(c >> 16) & 255]; out[1] = g_u8f[(c >> 8) & 255];
+    out[2] = g_u8f[c & 255]; out[3] = g_u8f[c >> 24];
+}
 
-        u32 cop = g_tev.color_op[st];
-        u32 csel[4] = {(cop >> 12) & 15u, (cop >> 8) & 15u, (cop >> 4) & 15u, cop & 15u}; /* a b c d */
-        float cin[4][3];
-        for (u32 j = 0; j < 4; j++) {
-            for (u32 k = 0; k < 3; k++) {
-                float vsrc;
-                switch (csel[j]) {
-                case 0: vsrc = reg[0][k]; break;
-                case 1: vsrc = reg[0][3]; break;
-                case 2: vsrc = reg[1][k]; break;
-                case 3: vsrc = reg[1][3]; break;
-                case 4: vsrc = reg[2][k]; break;
-                case 5: vsrc = reg[2][3]; break;
-                case 6: vsrc = reg[3][k]; break;
-                case 7: vsrc = reg[3][3]; break;
-                case 8: vsrc = tex[k]; break;
-                case 9: vsrc = tex[3]; break;
-                case 10: vsrc = ras[k]; break;
-                case 11: vsrc = ras[3]; break;
-                case 12: vsrc = 1.0f; break;
-                case 13: vsrc = 0.5f; break;
-                case 14: vsrc = kc[k]; break;
-                default: vsrc = 0.0f; break;
-                }
-                cin[j][k] = vsrc;
+static bool tev_pixel(const float col[2][4], const float tc[][2], float out[4]) {
+    if (g_tev.fast != FAST_NONE) {
+        const Stage* s = &g_tev.st[0];
+        switch (g_tev.fast) {
+        case FAST_MODULATE: {
+            float t[4];
+            sample_stage(s, tc, t);
+            const float* c = col[s->chan];
+            for (int k = 0; k < 4; k++) out[k] = t[k] * clamp01(c[k]);
+            break;
+        }
+        case FAST_REPLACE:
+            sample_stage(s, tc, out);
+            break;
+        default: {
+            const float* c = col[s->chan];
+            for (int k = 0; k < 4; k++) out[k] = clamp01(c[k]);
+            break;
+        }
+        }
+        return g_tev.at_always || alpha_test(out[3]);
+    }
+    memcpy(g_rows, g_reg_init, sizeof(g_reg_init));
+    for (u32 n = 0; n < g_tev.stages; n++) {
+        const Stage* s = &g_tev.st[n];
+        if (s->tex_on) {
+            float* tex = g_rows[ROW_TEX];
+            if (s->texels) {
+                int x = wrap_index(tc[s->texcoord][0], s->tw, s->wrap_s);
+                int y = wrap_index(tc[s->texcoord][1], s->th, s->wrap_t);
+                u32 c = s->texels[(u32)y * s->tw + (u32)x];
+                float raw[4] = {g_u8f[(c >> 16) & 255], g_u8f[(c >> 8) & 255], g_u8f[c & 255], g_u8f[c >> 24]};
+                tex[0] = raw[s->tsw[0]]; tex[1] = raw[s->tsw[1]]; tex[2] = raw[s->tsw[2]]; tex[3] = raw[s->tsw[3]];
+            } else {
+                tex[0] = tex[1] = tex[2] = tex[3] = 0.0f;
             }
         }
-        u32 aop = g_tev.alpha_op[st];
-        u32 asel[4] = {(aop >> 13) & 7u, (aop >> 10) & 7u, (aop >> 7) & 7u, (aop >> 4) & 7u};
-        float ain[4];
-        for (u32 j = 0; j < 4; j++) {
-            switch (asel[j]) {
-            case 0: ain[j] = reg[0][3]; break;
-            case 1: ain[j] = reg[1][3]; break;
-            case 2: ain[j] = reg[2][3]; break;
-            case 3: ain[j] = reg[3][3]; break;
-            case 4: ain[j] = tex[3]; break;
-            case 5: ain[j] = ras[3]; break;
-            case 6: ain[j] = ka[3]; break;
-            default: ain[j] = 0.0f; break;
+        float* ras = g_rows[ROW_RAS];
+        if (s->chan <= 1) {
+            const float* c = col[s->chan];
+            ras[0] = c[s->rsw[0]]; ras[1] = c[s->rsw[1]]; ras[2] = c[s->rsw[2]]; ras[3] = c[s->rsw[3]];
+        } else {
+            ras[0] = ras[1] = ras[2] = ras[3] = 0.0f;
+        }
+
+        float res[3], ares;
+        if (s->ccmp) {
+            for (int k = 0; k < 3; k++) res[k] = s->cbc[3] ? s->ci[3][3] : s->ci[3][k];
+        } else {
+            for (int k = 0; k < 3; k++) {
+                float in[4];
+                for (int j = 0; j < 4; j++) in[j] = s->cbc[j] ? s->ci[j][3] : s->ci[j][k];
+                res[k] = tev_combine(in[0], in[1], in[2], in[3], s->csub, s->cbias, s->cscale, s->cclamp);
             }
         }
-        u32 cdst = (cop >> 22) & 3u, adst = (aop >> 22) & 3u;
-        float res[3];
-        for (u32 k = 0; k < 3; k++)
-            res[k] = tev_math(cin[0][k], cin[1][k], cin[2][k], cin[3][k], cop);
-        float ares = tev_math(ain[0], ain[1], ain[2], ain[3], aop);
-        for (u32 k = 0; k < 3; k++) reg[cdst][k] = res[k];
-        reg[adst][3] = ares;
+        ares = s->acmp ? *s->ai[3]
+                       : tev_combine(*s->ai[0], *s->ai[1], *s->ai[2], *s->ai[3], s->asub, s->abias, s->ascale, s->aclamp);
+        float* cd = g_rows[s->cdst];
+        cd[0] = res[0]; cd[1] = res[1]; cd[2] = res[2];
+        g_rows[s->adst][3] = ares;
     }
 
     /* Output is the PREV register after the last stage. */
-    for (u32 k = 0; k < 4; k++) out[k] = clamp01(reg[0][k]);
+    for (int k = 0; k < 4; k++) out[k] = clamp01(g_rows[ROW_PREV][k]);
+    return g_tev.at_always || alpha_test(out[3]);
+}
 
-    u32 at = g_tev.alpha_test;
-    u32 ref0 = at & 255u, ref1 = (at >> 8) & 255u, f0 = (at >> 16) & 7u, f1 = (at >> 19) & 7u, logic = (at >> 22) & 3u;
-    if (at == 0)
-        return true;   /* not configured yet */
-    bool r0 = alpha_compare(f0, out[3], ref0), r1 = alpha_compare(f1, out[3], ref1);
-    switch (logic) {
+static bool alpha_test(float a01) {
+    u32 a = (u32)(a01 * 255.0f + 0.5f);
+    bool r0 = alpha_compare(g_tev.at_f0, a, g_tev.at_ref0), r1 = alpha_compare(g_tev.at_f1, a, g_tev.at_ref1);
+    switch (g_tev.at_logic) {
     case 0: return r0 && r1;
     case 1: return r0 || r1;
     case 2: return r0 != r1;
@@ -572,6 +663,10 @@ static void scissor(int* x0, int* y0, int* x1, int* y1) {
     *y1 = bottom >= EFB_H ? EFB_H - 1 : bottom;
 }
 
+static inline u32 to_u8(float v) {      /* v already in 0..255 */
+    return (u32)(v + 0.5f);
+}
+
 static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
     if (!a->valid || !b->valid || !c->valid) { g_tris_skipped++; return; }
     if ((gx_bp[0x00] >> 14 & 3u) == 3u) return;
@@ -596,74 +691,103 @@ static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
     bool subtract = (cmode >> 11) & 1u;
     if (!(cmode & 0x18u))
         color_update = true;
+    bool blend_alpha = blend && !subtract && sfac == 4 && dfac == 5;   /* the usual src*a + dst*(1-a) */
 
     u32 ntex = gx_xf_reg[0x3F] & 15u;
     if (ntex > MAX_TC) ntex = MAX_TC;
     float inv = 1.0f / area;
     g_tris_drawn++;
 
+    /* Per-triangle shortcuts: flat 2D (no perspective), constant colours,
+       texture coordinates that don't need the projective divide. */
+    bool affine = a->inv_w == b->inv_w && b->inv_w == c->inv_w;
+    bool flat_col = memcmp(a->col, b->col, sizeof(a->col)) == 0 && memcmp(b->col, c->col, sizeof(a->col)) == 0;
+    bool no_q = true;
+    for (u32 t = 0; t < ntex; t++)
+        if (a->tc[t][2] != 1.0f || b->tc[t][2] != 1.0f || c->tc[t][2] != 1.0f) no_q = false;
+
+    /* Edge functions step linearly across a row. */
+    float dw0dx = (b->y - c->y) * inv, dw1dx = (c->y - a->y) * inv;
+
+    float col[2][4];
+    float tc[MAX_TC][2];
+    memset(tc, 0, sizeof(tc));
+    if (flat_col)
+        memcpy(col, a->col, sizeof(col));
+
     for (int y = y0; y <= y1; y++) {
         float py = (float)y + 0.5f;
-        for (int x = x0; x <= x1; x++) {
-            float px = (float)x + 0.5f;
-            float w0 = ((b->x - px) * (c->y - py) - (b->y - py) * (c->x - px)) * inv;
-            float w1 = ((c->x - px) * (a->y - py) - (c->y - py) * (a->x - px)) * inv;
+        float px0 = (float)x0 + 0.5f;
+        float w0 = ((b->x - px0) * (c->y - py) - (b->y - py) * (c->x - px0)) * inv;
+        float w1 = ((c->x - px0) * (a->y - py) - (c->y - py) * (a->x - px0)) * inv;
+        u32* crow = &g_color[(size_t)y * EFB_W];
+        u32* zrow = &g_depth[(size_t)y * EFB_W];
+        for (int x = x0; x <= x1; x++, w0 += dw0dx, w1 += dw1dx) {
             float w2 = 1.0f - w0 - w1;
             if (w0 < 0 || w1 < 0 || w2 < 0)
                 continue;
 
-            float zf = w0 * a->z + w1 * b->z + w2 * c->z;
-            u32 z = zf <= 0 ? 0u : zf >= 16777215.0f ? 16777215u : (u32)zf;
-            size_t i = (size_t)y * EFB_W + (size_t)x;
-            if (ztest && !depth_pass(zfunc, z, g_depth[i]))
-                continue;
+            u32 z = 0;
+            if (ztest) {
+                float zf = w0 * a->z + w1 * b->z + w2 * c->z;
+                z = zf <= 0 ? 0u : zf >= 16777215.0f ? 16777215u : (u32)zf;
+                if (!depth_pass(zfunc, z, zrow[x]))
+                    continue;
+            }
 
-            /* Perspective-correct weights for colours and texture coordinates. */
-            float p0 = w0 * a->inv_w, p1 = w1 * b->inv_w, p2 = w2 * c->inv_w;
-            float ps = p0 + p1 + p2;
-            if (ps <= 0) continue;
-            p0 /= ps; p1 /= ps; p2 /= ps;
-
-            float col[2][4];
-            for (u32 ch = 0; ch < 2; ch++)
-                for (u32 k = 0; k < 4; k++)
-                    col[ch][k] = p0 * a->col[ch][k] + p1 * b->col[ch][k] + p2 * c->col[ch][k];
-            float tc[MAX_TC][2];
+            float p0 = w0, p1 = w1, p2 = w2;
+            if (!affine) {             /* perspective-correct weights */
+                p0 = w0 * a->inv_w; p1 = w1 * b->inv_w; p2 = w2 * c->inv_w;
+                float ps = p0 + p1 + p2;
+                if (ps <= 0) continue;
+                float r = 1.0f / ps;
+                p0 *= r; p1 *= r; p2 *= r;
+            }
+            if (!flat_col)
+                for (u32 ch = 0; ch < 2; ch++)
+                    for (u32 k = 0; k < 4; k++)
+                        col[ch][k] = p0 * a->col[ch][k] + p1 * b->col[ch][k] + p2 * c->col[ch][k];
             for (u32 t = 0; t < ntex; t++) {
                 float s = p0 * a->tc[t][0] + p1 * b->tc[t][0] + p2 * c->tc[t][0];
                 float tt = p0 * a->tc[t][1] + p1 * b->tc[t][1] + p2 * c->tc[t][1];
-                float q = p0 * a->tc[t][2] + p1 * b->tc[t][2] + p2 * c->tc[t][2];
-                if (fabsf(q) > 1e-9f) { s /= q; tt /= q; }
+                if (!no_q) {
+                    float q = p0 * a->tc[t][2] + p1 * b->tc[t][2] + p2 * c->tc[t][2];
+                    if (fabsf(q) > 1e-9f) { float r = 1.0f / q; s *= r; tt *= r; }
+                }
                 tc[t][0] = s; tc[t][1] = tt;
             }
-            for (u32 t = ntex; t < MAX_TC; t++) tc[t][0] = tc[t][1] = 0.0f;
 
             float out[4];
             if (!tev_pixel(col, tc, out))
                 continue;
             float r = out[0] * 255.0f, g = out[1] * 255.0f, bl = out[2] * 255.0f, al = out[3] * 255.0f;
 
-            u32 dst = g_color[i];
-            if (blend) {
-                float sa = al / 255.0f, da = (float)(dst >> 24) / 255.0f;
+            u32 dst = crow[x];
+            if (blend_alpha) {
+                float sa = out[3], ia = 1.0f - sa;
+                r = r * sa + (float)((dst >> 16) & 255) * ia;
+                g = g * sa + (float)((dst >> 8) & 255) * ia;
+                bl = bl * sa + (float)(dst & 255) * ia;
+            } else if (blend) {
+                float sa = out[3], da = g_u8f[dst >> 24];
                 float d[3] = {(float)((dst >> 16) & 255), (float)((dst >> 8) & 255), (float)(dst & 255)};
-                float s[3] = {r, g, bl};
+                float sv[3] = {r, g, bl};
                 for (int k = 0; k < 3; k++) {
-                    float sf = blend_factor(sfac, true, sa, da, s[k] / 255.0f, d[k] / 255.0f);
-                    float df = blend_factor(dfac, false, sa, da, s[k] / 255.0f, d[k] / 255.0f);
-                    float o = subtract ? d[k] - s[k] : s[k] * sf + d[k] * df;
-                    s[k] = o < 0 ? 0 : o > 255 ? 255 : o;
+                    float sf = blend_factor(sfac, true, sa, da, sv[k] / 255.0f, d[k] / 255.0f);
+                    float df = blend_factor(dfac, false, sa, da, sv[k] / 255.0f, d[k] / 255.0f);
+                    float o = subtract ? d[k] - sv[k] : sv[k] * sf + d[k] * df;
+                    sv[k] = o < 0 ? 0 : o > 255 ? 255 : o;
                 }
-                r = s[0]; g = s[1]; bl = s[2];
+                r = sv[0]; g = sv[1]; bl = sv[2];
             }
             u32 o = dst;
             if (color_update)
-                o = (o & 0xFF000000u) | ((u32)r << 16) | ((u32)g << 8) | (u32)bl;
+                o = (o & 0xFF000000u) | (to_u8(r) << 16) | (to_u8(g) << 8) | to_u8(bl);
             if (alpha_update)
-                o = (o & 0x00FFFFFFu) | ((u32)(al < 0 ? 0 : al > 255 ? 255 : al) << 24);
-            g_color[i] = o;
+                o = (o & 0x00FFFFFFu) | (to_u8(al) << 24);
+            crow[x] = o;
             if (ztest && zupdate)
-                g_depth[i] = z;
+                zrow[x] = z;
         }
     }
 }
@@ -805,7 +929,7 @@ void gx_raster_copy(u32 cmd) {
             }
         }
         g_frames++;
-        gx_tex_flush_cache();   /* texture data in RAM may change between frames */
+        gx_tex_flush_cache();   /* texture data in RAM may change between frames: re-check */
     }
 
     if (clear) {
@@ -894,6 +1018,7 @@ u32 gx_raster_frames(void) {
 }
 
 void gx_raster_report(void) {
+    gx_tex_report();
     printf("renderer: %u frames shown, %u dumped to %s, %llu triangles drawn, %llu clipped\n",
            g_frames, g_dumped, g_every ? g_dir : "(off)", g_tris_drawn, g_tris_skipped);
 }

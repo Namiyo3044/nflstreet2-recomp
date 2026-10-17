@@ -7,7 +7,8 @@
  *
  * Textures live in main RAM in the GPU's tiled formats; paletted ones use a
  * colour table (TLUT) that the game first copies into texture memory (TMEM).
- * Decoded textures are cached as plain RGBA8 for the current frame.
+ * Decoded textures are cached as plain RGBA8 across frames, and decoded
+ * again only when their bytes in RAM (or their colour table) change.
  */
 
 typedef struct {
@@ -22,9 +23,12 @@ void gx_tex_load_tlut(CPUState* cpu, u32 src_reg, u32 dest_reg);
    be read). */
 const GxTexture* gx_tex_get(CPUState* cpu, u32 map);
 
-/* Forget decoded textures (called once per frame: the game may have changed
-   texture data in RAM). */
+/* Called once per displayed frame: each cached texture is re-checked against
+   RAM the first time it is used in the new frame. */
 void gx_tex_flush_cache(void);
+
+/* Prints cache statistics. */
+void gx_tex_report(void);
 
 /* Decodes one texture; exposed for tests. fmt: GX texture format id.
    tlut / tlut_fmt are used for the paletted formats (4/8/14-bit index). */
