@@ -4,9 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* How long a scripted press is held: 0.15 s, long enough for a game polling
-   once per frame to see it, short enough not to auto-repeat in menus. */
-#define HOLD_SECONDS 0.15
+/* How long a scripted press is held: one video field, so the game sees it on
+   exactly one controller update. Longer holds trigger menu auto-repeat. */
+#define HOLD_SECONDS 0.017
 
 /* Poll response layout (mode 3):
    byte 0: 0 0 0 START Y X B A      byte 1: 1 L R Z UP DOWN RIGHT LEFT
@@ -26,7 +26,7 @@ static const struct { const char* name; uint32_t bits; } k_names[] = {
     {"SUP", STICK_UP}, {"SDOWN", STICK_DOWN}, {"SLEFT", STICK_LEFT}, {"SRIGHT", STICK_RIGHT},
 };
 
-typedef struct { double at; uint32_t bits; } Press;
+typedef struct { double at, hold; uint32_t bits; int state; } Press;
 static Press g_presses[256];
 static int g_count;
 
@@ -55,29 +55,48 @@ bool pad_add_press(const char* spec) {
         return false;
     uint32_t bits = 0;
     const char* p = end + 1;
-    while (*p) {
+    double hold = HOLD_SECONDS;
+    while (*p && *p != '@') {
         const char* q = p;
-        while (*q && *q != '+')
+        while (*q && *q != '+' && *q != '@')
             q++;
         uint32_t b = lookup(p, (size_t)(q - p));
         if (!b)
             return false;
         bits |= b;
-        p = *q ? q + 1 : q;
+        p = *q == '+' ? q + 1 : q;
+    }
+    if (*p == '@') {
+        hold = strtod(p + 1, &end);
+        if (!end || *end || hold <= 0)
+            return false;
     }
     if (!bits)
         return false;
     g_presses[g_count].at = at;
+    g_presses[g_count].hold = hold;
     g_presses[g_count].bits = bits;
+    g_presses[g_count].state = 0;
     g_count++;
     return true;
 }
 
 void pad_poll_response(double t, uint8_t out[8]) {
     uint32_t held = 0;
-    for (int i = 0; i < g_count; i++)
-        if (t >= g_presses[i].at && t < g_presses[i].at + HOLD_SECONDS)
-            held |= g_presses[i].bits;
+    for (int i = 0; i < g_count; i++) {
+        Press* pr = &g_presses[i];
+        bool down = t >= pr->at && t < pr->at + pr->hold;
+        if (down)
+            held |= pr->bits;
+        /* log each press once when the game first sees it and once when released */
+        if (down && pr->state == 0) {
+            pr->state = 1;
+            printf("  pad: press %d down at %.3f s\n", i + 1, t);
+        } else if (!down && pr->state == 1) {
+            pr->state = 2;
+            printf("  pad: press %d up at %.3f s\n", i + 1, t);
+        }
+    }
 
     uint16_t buttons = (uint16_t)(held & 0xFFFFu);
     out[0] = (uint8_t)(buttons >> 8);

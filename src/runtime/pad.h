@@ -10,8 +10,9 @@
  * feed real keyboard/controller input through the same state later.
  */
 
-/* Parses "SECONDS:BUTTON[+BUTTON...]" (e.g. "5.5:A", "12:START", "8:DOWN+B").
-   Returns false if the text isn't understood. */
+/* Parses "SECONDS:BUTTON[+BUTTON...][@HOLD]" (e.g. "5.5:A", "12:START",
+   "8:DOWN+B", "9:A@0.2"). HOLD is how long to hold, in seconds (default one
+   video field). Returns false if the text isn't understood. */
 bool pad_add_press(const char* spec);
 
 /* The 8-byte standard-controller poll response for the current game time:

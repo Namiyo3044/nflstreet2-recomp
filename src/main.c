@@ -67,7 +67,7 @@ static void usage(const char* argv0) {
     fprintf(stderr,
             "usage: %s <disc folder> [--map main.map] [--max-steps N] [--quiet] [--skip-hash]\n"
             "         [--dump-every N (default 60, 0 = off)] [--dump-dir DIR (default frames)]\n"
-            "         [--press SECONDS:BUTTON[+BUTTON]]...  e.g. --press 5.5:A --press 7:DOWN\n"
+            "         [--press SECONDS:BUTTON[+BUTTON][@HOLD]]...  e.g. --press 5.5:A --press 7:DOWN@0.2\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
             dump_dir = argv[++i];
         } else if (strcmp(argv[i], "--press") == 0 && i + 1 < argc) {
             if (!pad_add_press(argv[++i])) {
-                fprintf(stderr, "error: --press %s: expected SECONDS:BUTTON[+BUTTON], buttons: %s\n",
+                fprintf(stderr, "error: --press %s: expected SECONDS:BUTTON[+BUTTON][@HOLD], buttons: %s\n",
                         argv[i], pad_button_names());
                 return 2;
             }
