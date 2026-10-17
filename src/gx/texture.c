@@ -234,6 +234,32 @@ static u64 entry_hash(CPUState* cpu, u32 addr, u32 size, bool paletted, u32 fmt,
     return h;
 }
 
+/* Decoded buffers that were replaced or evicted while a frame that uses them
+   may still be drawing; freed by gx_tex_collect_garbage() once it is done. */
+static u32** g_garbage;
+static u32 g_garbage_n, g_garbage_cap;
+
+static void retire(u32* data) {
+    if (!data)
+        return;
+    if (g_garbage_n == g_garbage_cap) {
+        u32 cap = g_garbage_cap ? g_garbage_cap * 2 : 64;
+        u32** g = (u32**)realloc(g_garbage, sizeof(u32*) * cap);
+        if (!g) {
+            return;                    /* leak rather than free memory in use */
+        }
+        g_garbage = g;
+        g_garbage_cap = cap;
+    }
+    g_garbage[g_garbage_n++] = data;
+}
+
+void gx_tex_collect_garbage(void) {
+    for (u32 i = 0; i < g_garbage_n; i++)
+        free(g_garbage[i]);
+    g_garbage_n = 0;
+}
+
 /* Called once per displayed frame: starts a new validation round. */
 void gx_tex_flush_cache(void) {
     g_frame++;
@@ -290,8 +316,16 @@ const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
             g_hits++;
             return &e->tex;
         }
-        if (!gx_tex_decode(cpu->ram + addr, fmt, w, h, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, e->data))
+        /* Changed: decode into a new buffer; the old one may still be in use
+           by the frame being drawn. */
+        u32* fresh = (u32*)malloc((size_t)w * h * 4);
+        if (!fresh || !gx_tex_decode(cpu->ram + addr, fmt, w, h, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, fresh)) {
+            free(fresh);
             return NULL;
+        }
+        retire(e->data);
+        e->data = fresh;
+        e->tex.texels = fresh;
         e->hash = hsh;
         g_decodes++;
         return &e->tex;
@@ -304,7 +338,9 @@ const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
         for (u32 k = 1; k < CACHE_MAX; k++)
             if (g_cache[k].used_frame < g_cache[slot].used_frame)
                 slot = k;
-        free(g_cache[slot].data);
+        if (g_cache[slot].used_frame == g_frame)
+            return NULL;               /* every entry is in use this frame */
+        retire(g_cache[slot].data);
     } else {
         g_cache_count++;
     }
@@ -312,7 +348,7 @@ const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
     memset(e, 0, sizeof(*e));
     e->data = (u32*)malloc((size_t)w * h * 4);
     if (!e->data || !gx_tex_decode(cpu->ram + addr, fmt, w, h, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, e->data)) {
-        free(e->data);
+        free(e->data);             /* never handed out */
         e->data = NULL;
         e->addr = 0xFFFFFFFFu;       /* matches nothing; reused later */
         return NULL;

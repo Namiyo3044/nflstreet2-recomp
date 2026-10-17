@@ -27,6 +27,10 @@ const GxTexture* gx_tex_get(CPUState* cpu, u32 map);
    RAM the first time it is used in the new frame. */
 void gx_tex_flush_cache(void);
 
+/* Frees decoded buffers that were replaced or evicted. Call only when no
+   frame that may use them is still being drawn. */
+void gx_tex_collect_garbage(void);
+
 /* Prints cache statistics. */
 void gx_tex_report(void);
 

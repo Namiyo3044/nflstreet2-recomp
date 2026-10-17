@@ -103,6 +103,13 @@ int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
     return 0;
 }
 
+/* Wall-clock seconds (clock() counts CPU time of all threads on some systems). */
+static double wall_seconds(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
 static void print_location(const char* label, u32 addr) {
     if (g_have_symbols) {
         u32 off = 0;
@@ -185,6 +192,7 @@ static void usage(const char* argv0) {
             "         [--xfb-every FIELDS (also save the TV frame buffer every N video fields)]\n"
             "         [--trace-at SECONDS (log frame-pacing calls for a few frames from then)]\n"
             "         [--unpaced (let the game draw as many frames per video field as it likes)]\n"
+            "         [--render-threads N (threads that draw frames; 0 = draw on the game thread)]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -216,6 +224,8 @@ int main(int argc, char** argv) {
                         argv[i], pad_button_names());
                 return 2;
             }
+        } else if (strcmp(argv[i], "--render-threads") == 0 && i + 1 < argc) {
+            gx_raster_set_threads(atoi(argv[++i]));
         } else if (strcmp(argv[i], "--unpaced") == 0) {
             mmio_set_frame_pacing(false);
         } else if (strcmp(argv[i], "--trace-at") == 0 && i + 1 < argc) {
@@ -268,7 +278,7 @@ int main(int argc, char** argv) {
     cpu.pc = entry;
     print_location("entry", entry);
 
-    clock_t started = clock();
+    double started = wall_seconds();
     const char* reason = "step limit reached";
     unsigned long long steps = 0;
     while (steps < max_steps) {
@@ -307,7 +317,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    double secs = (double)(clock() - started) / CLOCKS_PER_SEC;
+    gx_raster_sync();
+    double secs = wall_seconds() - started;
     printf("\n=== stopped after %llu steps: %s ===\n", steps, reason);
     printf("run time %.1f s (%.1f million steps/s), game time %.1f s\n", secs,
            secs > 0 ? (double)steps / secs / 1e6 : 0.0, interrupts_game_seconds());

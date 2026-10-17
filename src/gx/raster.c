@@ -28,7 +28,7 @@ static u32 g_every;          /* render every Nth displayed frame */
 static bool g_save;          /* and save it as frame_N.bmp */
 static u32 g_frames;        /* frames copied to the display so far */
 static u32 g_dumped;
-static unsigned long long g_tris_drawn, g_tris_skipped;
+static unsigned long long g_tris_skipped, g_tris_recorded;
 static CPUState* g_cpu;     /* for texture fetches during rasterisation */
 
 void gx_raster_config(const char* dir, u32 every) {
@@ -316,33 +316,34 @@ static void transform(const Vtx* in, SVtx* out) {
     }
 }
 
-/* ---------------------------------------------------------------- TEV --- */
-/* Everything that is the same for every pixel of a draw is worked out once
-   in tev_prepare(); the per-pixel loop only does the arithmetic.
+/* ------------------------------------------------------- draw state --- */
+/* Rendering is split in two. The game thread decodes and transforms vertices
+   and records each triangle together with a snapshot of the GPU state it
+   needs (RenderState). At the end of a frame the recorded command list is drawn
+   by worker threads, each owning a horizontal band of the frame buffer,
+   while the game thread already records the next frame.
 
-   TEV inputs are read from a table of rows (RGBA floats):
-     0-3  PREV, REG0, REG1, REG2   (copied from the start values per pixel)
+   TEV inputs are read from a per-thread table of rows (RGBA floats):
+     0-3  PREV, REG0, REG1, REG2   (reset from the start values per pixel)
      4    texture colour of the current stage (after swizzle)
      5    rasterised colour of the current stage (after swizzle)
      6-8  constants 1, 0.5, 0
      9+   konstant colour / alpha for each stage (two rows per stage) */
-enum { ROW_PREV = 0, ROW_TEX = 4, ROW_RAS = 5, ROW_ONE = 6, ROW_HALF = 7, ROW_ZERO = 8, ROW_KONST = 9 };
-static float g_rows[ROW_KONST + 32][4];
-static float g_reg_init[4][4];
+enum { ROW_PREV = 0, ROW_TEX = 4, ROW_RAS = 5, ROW_ONE = 6, ROW_HALF = 7, ROW_ZERO = 8, ROW_KONST = 9,
+       ROW_COUNT = ROW_KONST + 32 };
 static float g_u8f[256];               /* i / 255 */
 
 typedef struct {
-    const float* ci[4];                /* colour inputs a, b, c, d */
+    u8 ci[4];                          /* colour input rows a, b, c, d */
     bool cbc[4];                       /* input is an alpha broadcast to RGB */
-    const float* ai[4];                /* alpha inputs a, b, c, d (pointers to the A component) */
-    u32 cdst, adst;
+    u8 ai[4];                          /* alpha input rows a, b, c, d (A component) */
+    u8 cdst, adst;
     bool csub, asub, cclamp, aclamp, ccmp, acmp;
     float cbias, abias, cscale, ascale;
     bool tex_on;
-    u32 texcoord, chan;
+    u8 texcoord, chan;
     u8 tsw[4], rsw[4];
-    /* texture */
-    const u32* texels;
+    const u32* texels;                 /* decoded texture; stays valid until the frame is drawn */
     u32 tw, th, wrap_s, wrap_t;
 } Stage;
 
@@ -352,11 +353,15 @@ typedef struct {
     u32 stages;
     u32 fast;                          /* one-stage standard modes (GXSetTevOp) */
     Stage st[16];
+    float reg_init[4][4];
+    float konst[32][4];
     u32 at_ref0, at_ref1, at_f0, at_f1, at_logic;
     bool at_always;
-} TevSetup;
-
-static TevSetup g_tev;
+    /* rasteriser and pixel engine */
+    int sx0, sy0, sx1, sy1;            /* scissor, inclusive */
+    bool ztest, zupdate, blend, blend_alpha, subtract, color_update, alpha_update;
+    u32 zfunc, sfac, dfac, ntex;
+} RenderState;
 
 static float clamp01(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
 
@@ -369,13 +374,11 @@ static void op_params(u32 op, bool* sub, bool* clamp, bool* cmp, float* bias, fl
     *scale = sc == 1 ? 2.0f : sc == 2 ? 4.0f : sc == 3 ? 0.5f : 1.0f;
 }
 
-static void konst_rows(u32 st, u32 kcsel, u32 kasel) {
+static void konst_rows(RenderState* ds, u32 st, u32 kcsel, u32 kasel) {
     static const float frac[8] = {1.0f, 0.875f, 0.75f, 0.625f, 0.5f, 0.375f, 0.25f, 0.125f};
-    float* kc = g_rows[ROW_KONST + st * 2];
-    float* ka = g_rows[ROW_KONST + st * 2 + 1];
     for (int pass = 0; pass < 2; pass++) {
         u32 sel = pass ? kasel : kcsel;
-        float* out = pass ? ka : kc;
+        float* out = ds->konst[st * 2 + (u32)pass];
         if (sel < 8) {
             out[0] = out[1] = out[2] = out[3] = frac[sel];
             continue;
@@ -392,17 +395,25 @@ static void konst_rows(u32 st, u32 kcsel, u32 kasel) {
     }
 }
 
-static void tev_prepare(void) {
-    if (g_u8f[255] == 0.0f)
-        for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;
-    for (int k = 0; k < 4; k++) {
-        g_rows[ROW_ONE][k] = 1.0f;
-        g_rows[ROW_HALF][k] = 0.5f;
-        g_rows[ROW_ZERO][k] = 0.0f;
+static void scissor(int* x0, int* y0, int* x1, int* y1) {
+    u32 tl = gx_bp[0x20], br = gx_bp[0x21];
+    int top = (int)(tl & 0x7FF) - 342, left = (int)((tl >> 12) & 0x7FF) - 342;
+    int bottom = (int)(br & 0x7FF) - 342, right = (int)((br >> 12) & 0x7FF) - 342;
+    if (right < left || bottom < top) {
+        left = 0; top = 0; right = EFB_W - 1; bottom = EFB_H - 1;
     }
+    *x0 = left < 0 ? 0 : left;
+    *y0 = top < 0 ? 0 : top;
+    *x1 = right >= EFB_W ? EFB_W - 1 : right;
+    *y1 = bottom >= EFB_H ? EFB_H - 1 : bottom;
+}
+
+/* Snapshot of everything a draw needs from the current register state. */
+static void snapshot_state(RenderState* ds) {
+    memset(ds, 0, sizeof(*ds));
     for (u32 r = 0; r < 4; r++)
         for (u32 k = 0; k < 4; k++)
-            g_reg_init[r][k] = (float)gx_tev_reg[r][k] / 255.0f;
+            ds->reg_init[r][k] = (float)gx_tev_reg[r][k] / 255.0f;
 
     u8 swap[4][4];
     for (u32 t = 0; t < 4; t++) {
@@ -414,37 +425,33 @@ static void tev_prepare(void) {
     static const u8 c_row[16] = {0, 0, 1, 1, 2, 2, 3, 3, ROW_TEX, ROW_TEX, ROW_RAS, ROW_RAS, ROW_ONE, ROW_HALF, 0, ROW_ZERO};
     static const u8 a_row[8] = {0, 1, 2, 3, ROW_TEX, ROW_RAS, 0, ROW_ZERO};
 
-    g_tev.stages = ((gx_bp[0x00] >> 10) & 15u) + 1;
-    for (u32 i = 0; i < g_tev.stages; i++) {
-        Stage* s = &g_tev.st[i];
+    ds->stages = ((gx_bp[0x00] >> 10) & 15u) + 1;
+    for (u32 i = 0; i < ds->stages; i++) {
+        Stage* s = &ds->st[i];
         u32 cop = gx_bp[0xC0 + i * 2], aop = gx_bp[0xC1 + i * 2];
         u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
         u32 texmap = order & 7u;
-        s->texcoord = (order >> 3) & 7u;
+        s->texcoord = (u8)((order >> 3) & 7u);
         s->tex_on = (order >> 6) & 1u;
-        s->chan = (order >> 7) & 7u;
+        s->chan = (u8)((order >> 7) & 7u);
         u32 ksel = gx_bp[0xF6 + i / 2];
-        konst_rows(i, (ksel >> ((i & 1) ? 14 : 4)) & 31u, (ksel >> ((i & 1) ? 19 : 9)) & 31u);
+        konst_rows(ds, i, (ksel >> ((i & 1) ? 14 : 4)) & 31u, (ksel >> ((i & 1) ? 19 : 9)) & 31u);
 
         const u32 csel[4] = {(cop >> 12) & 15u, (cop >> 8) & 15u, (cop >> 4) & 15u, cop & 15u};
         for (int j = 0; j < 4; j++) {
-            u32 row = csel[j] == 14 ? ROW_KONST + i * 2 : c_row[csel[j]];
-            s->ci[j] = g_rows[row];
+            s->ci[j] = (u8)(csel[j] == 14 ? ROW_KONST + i * 2 : c_row[csel[j]]);
             s->cbc[j] = csel[j] < 12 && (csel[j] & 1u);
         }
         const u32 asel[4] = {(aop >> 13) & 7u, (aop >> 10) & 7u, (aop >> 7) & 7u, (aop >> 4) & 7u};
-        for (int j = 0; j < 4; j++) {
-            u32 row = asel[j] == 6 ? ROW_KONST + i * 2 + 1 : a_row[asel[j]];
-            s->ai[j] = &g_rows[row][3];
-        }
-        s->cdst = (cop >> 22) & 3u;
-        s->adst = (aop >> 22) & 3u;
+        for (int j = 0; j < 4; j++)
+            s->ai[j] = (u8)(asel[j] == 6 ? ROW_KONST + i * 2 + 1 : a_row[asel[j]]);
+        s->cdst = (u8)((cop >> 22) & 3u);
+        s->adst = (u8)((aop >> 22) & 3u);
         op_params(cop, &s->csub, &s->cclamp, &s->ccmp, &s->cbias, &s->cscale);
         op_params(aop, &s->asub, &s->aclamp, &s->acmp, &s->abias, &s->ascale);
         memcpy(s->tsw, swap[(aop >> 2) & 3u], 4);
         memcpy(s->rsw, swap[aop & 3u], 4);
 
-        s->texels = NULL;
         if (s->tex_on) {
             const GxTexture* tex = gx_tex_get(g_cpu, texmap);
             if (tex) {
@@ -460,31 +467,49 @@ static void tev_prepare(void) {
 
     /* Recognise the standard one-stage modes: output to PREV, no bias/scale,
        clamped, identity swizzles, colour channel 0 or 1. */
-    g_tev.fast = FAST_NONE;
-    if (g_tev.stages == 1) {
+    ds->fast = FAST_NONE;
+    if (ds->stages == 1) {
         u32 cop = gx_bp[0xC0] & 0xFFFFFFu, aop = gx_bp[0xC1] & 0xFFFFFFu;
-        const Stage* s = &g_tev.st[0];
+        const Stage* s = &ds->st[0];
         bool ident = memcmp(s->tsw, "\0\1\2\3", 4) == 0 && memcmp(s->rsw, "\0\1\2\3", 4) == 0;
         bool plain = ((cop >> 16) & 0xFFu) == 0x08u && ((aop >> 16) & 0xFFu) == 0x08u;  /* clamp only, PREV */
         bool aop_ok = (aop & 0xFu) == 0;    /* swap tables 0 */
         if (ident && plain && aop_ok) {
             u32 c = cop & 0xFFFFu, a = (aop >> 4) & 0xFFFu;
             if (c == 0xF8AFu && a == ((7u << 9) | (4u << 6) | (5u << 3) | 7u) && s->tex_on && s->chan <= 1)
-                g_tev.fast = FAST_MODULATE;
+                ds->fast = FAST_MODULATE;
             else if (c == 0xFFF8u && a == ((7u << 9) | (7u << 6) | (7u << 3) | 4u) && s->tex_on)
-                g_tev.fast = FAST_REPLACE;
+                ds->fast = FAST_REPLACE;
             else if (c == 0xFFFAu && a == ((7u << 9) | (7u << 6) | (7u << 3) | 5u) && s->chan <= 1)
-                g_tev.fast = FAST_PASSCLR;
+                ds->fast = FAST_PASSCLR;
         }
     }
 
     u32 at = gx_bp[0xF3];
-    g_tev.at_ref0 = at & 255u; g_tev.at_ref1 = (at >> 8) & 255u;
-    g_tev.at_f0 = (at >> 16) & 7u; g_tev.at_f1 = (at >> 19) & 7u; g_tev.at_logic = (at >> 22) & 3u;
+    ds->at_ref0 = at & 255u; ds->at_ref1 = (at >> 8) & 255u;
+    ds->at_f0 = (at >> 16) & 7u; ds->at_f1 = (at >> 19) & 7u; ds->at_logic = (at >> 22) & 3u;
     /* "always pass": unconfigured, or both tests always with AND/OR */
-    g_tev.at_always = at == 0 || (g_tev.at_f0 == 7 && g_tev.at_f1 == 7 && g_tev.at_logic <= 1);
+    ds->at_always = at == 0 || (ds->at_f0 == 7 && ds->at_f1 == 7 && ds->at_logic <= 1);
+
+    scissor(&ds->sx0, &ds->sy0, &ds->sx1, &ds->sy1);
+    u32 zmode = gx_bp[0x40], cmode = gx_bp[0x41];
+    ds->ztest = zmode & 1u;
+    ds->zupdate = (zmode >> 4) & 1u;
+    ds->zfunc = (zmode >> 1) & 7u;
+    ds->blend = cmode & 1u;
+    ds->color_update = (cmode >> 3) & 1u;
+    ds->alpha_update = (cmode >> 4) & 1u;
+    ds->dfac = (cmode >> 5) & 7u;
+    ds->sfac = (cmode >> 8) & 7u;
+    ds->subtract = (cmode >> 11) & 1u;
+    if (!(cmode & 0x18u))
+        ds->color_update = true;
+    ds->blend_alpha = ds->blend && !ds->subtract && ds->sfac == 4 && ds->dfac == 5;  /* src*a + dst*(1-a) */
+    ds->ntex = gx_xf_reg[0x3F] & 15u;
+    if (ds->ntex > MAX_TC) ds->ntex = MAX_TC;
 }
 
+/* ---------------------------------------------------------------- TEV --- */
 static inline int wrap_index(float c, u32 size, u32 mode) {
     float f = c * (float)size;
     int i = (int)f;
@@ -520,6 +545,17 @@ static bool alpha_compare(u32 func, u32 v, u32 ref) {
     }
 }
 
+static bool alpha_test(const RenderState* ds, float a01) {
+    u32 a = (u32)(a01 * 255.0f + 0.5f);
+    bool r0 = alpha_compare(ds->at_f0, a, ds->at_ref0), r1 = alpha_compare(ds->at_f1, a, ds->at_ref1);
+    switch (ds->at_logic) {
+    case 0: return r0 && r1;
+    case 1: return r0 || r1;
+    case 2: return r0 != r1;
+    default: return r0 == r1;
+    }
+}
+
 static inline float tev_combine(float a, float b, float c, float d, bool sub, float bias, float scale, bool clamp) {
     a = clamp01(a); b = clamp01(b); c = clamp01(c);
     float lerp = a + (b - a) * c;
@@ -528,10 +564,6 @@ static inline float tev_combine(float a, float b, float c, float d, bool sub, fl
         return clamp01(r);
     return r < -4.0f ? -4.0f : r > 4.0f ? 4.0f : r;
 }
-
-/* Runs the TEV stages for one pixel. Returns false if the alpha test
-   discards it. */
-static bool alpha_test(float a01);
 
 static inline void sample_stage(const Stage* s, const float tc[][2], float out[4]) {
     if (!s->texels) {
@@ -545,10 +577,12 @@ static inline void sample_stage(const Stage* s, const float tc[][2], float out[4
     out[2] = g_u8f[c & 255]; out[3] = g_u8f[c >> 24];
 }
 
-static bool tev_pixel(const float col[2][4], const float tc[][2], float out[4]) {
-    if (g_tev.fast != FAST_NONE) {
-        const Stage* s = &g_tev.st[0];
-        switch (g_tev.fast) {
+/* Runs the TEV stages for one pixel. Returns false if the alpha test
+   discards it. rows: this thread's input table, konst rows already filled. */
+static bool tev_pixel(const RenderState* ds, float (*rows)[4], const float col[2][4], const float tc[][2], float out[4]) {
+    if (ds->fast != FAST_NONE) {
+        const Stage* s = &ds->st[0];
+        switch (ds->fast) {
         case FAST_MODULATE: {
             float t[4];
             sample_stage(s, tc, t);
@@ -565,24 +599,18 @@ static bool tev_pixel(const float col[2][4], const float tc[][2], float out[4]) 
             break;
         }
         }
-        return g_tev.at_always || alpha_test(out[3]);
+        return ds->at_always || alpha_test(ds, out[3]);
     }
-    memcpy(g_rows, g_reg_init, sizeof(g_reg_init));
-    for (u32 n = 0; n < g_tev.stages; n++) {
-        const Stage* s = &g_tev.st[n];
+    memcpy(rows, ds->reg_init, sizeof(ds->reg_init));
+    for (u32 n = 0; n < ds->stages; n++) {
+        const Stage* s = &ds->st[n];
         if (s->tex_on) {
-            float* tex = g_rows[ROW_TEX];
-            if (s->texels) {
-                int x = wrap_index(tc[s->texcoord][0], s->tw, s->wrap_s);
-                int y = wrap_index(tc[s->texcoord][1], s->th, s->wrap_t);
-                u32 c = s->texels[(u32)y * s->tw + (u32)x];
-                float raw[4] = {g_u8f[(c >> 16) & 255], g_u8f[(c >> 8) & 255], g_u8f[c & 255], g_u8f[c >> 24]};
-                tex[0] = raw[s->tsw[0]]; tex[1] = raw[s->tsw[1]]; tex[2] = raw[s->tsw[2]]; tex[3] = raw[s->tsw[3]];
-            } else {
-                tex[0] = tex[1] = tex[2] = tex[3] = 0.0f;
-            }
+            float raw[4];
+            float* tex = rows[ROW_TEX];
+            sample_stage(s, tc, raw);
+            tex[0] = raw[s->tsw[0]]; tex[1] = raw[s->tsw[1]]; tex[2] = raw[s->tsw[2]]; tex[3] = raw[s->tsw[3]];
         }
-        float* ras = g_rows[ROW_RAS];
+        float* ras = rows[ROW_RAS];
         if (s->chan <= 1) {
             const float* c = col[s->chan];
             ras[0] = c[s->rsw[0]]; ras[1] = c[s->rsw[1]]; ras[2] = c[s->rsw[2]]; ras[3] = c[s->rsw[3]];
@@ -591,36 +619,27 @@ static bool tev_pixel(const float col[2][4], const float tc[][2], float out[4]) 
         }
 
         float res[3], ares;
+        const float* ci[4] = {rows[s->ci[0]], rows[s->ci[1]], rows[s->ci[2]], rows[s->ci[3]]};
         if (s->ccmp) {
-            for (int k = 0; k < 3; k++) res[k] = s->cbc[3] ? s->ci[3][3] : s->ci[3][k];
+            for (int k = 0; k < 3; k++) res[k] = s->cbc[3] ? ci[3][3] : ci[3][k];
         } else {
             for (int k = 0; k < 3; k++) {
                 float in[4];
-                for (int j = 0; j < 4; j++) in[j] = s->cbc[j] ? s->ci[j][3] : s->ci[j][k];
+                for (int j = 0; j < 4; j++) in[j] = s->cbc[j] ? ci[j][3] : ci[j][k];
                 res[k] = tev_combine(in[0], in[1], in[2], in[3], s->csub, s->cbias, s->cscale, s->cclamp);
             }
         }
-        ares = s->acmp ? *s->ai[3]
-                       : tev_combine(*s->ai[0], *s->ai[1], *s->ai[2], *s->ai[3], s->asub, s->abias, s->ascale, s->aclamp);
-        float* cd = g_rows[s->cdst];
+        ares = s->acmp ? rows[s->ai[3]][3]
+                       : tev_combine(rows[s->ai[0]][3], rows[s->ai[1]][3], rows[s->ai[2]][3], rows[s->ai[3]][3],
+                                     s->asub, s->abias, s->ascale, s->aclamp);
+        float* cd = rows[s->cdst];
         cd[0] = res[0]; cd[1] = res[1]; cd[2] = res[2];
-        g_rows[s->adst][3] = ares;
+        rows[s->adst][3] = ares;
     }
 
     /* Output is the PREV register after the last stage. */
-    for (int k = 0; k < 4; k++) out[k] = clamp01(g_rows[ROW_PREV][k]);
-    return g_tev.at_always || alpha_test(out[3]);
-}
-
-static bool alpha_test(float a01) {
-    u32 a = (u32)(a01 * 255.0f + 0.5f);
-    bool r0 = alpha_compare(g_tev.at_f0, a, g_tev.at_ref0), r1 = alpha_compare(g_tev.at_f1, a, g_tev.at_ref1);
-    switch (g_tev.at_logic) {
-    case 0: return r0 && r1;
-    case 1: return r0 || r1;
-    case 2: return r0 != r1;
-    default: return r0 == r1;
-    }
+    for (int k = 0; k < 4; k++) out[k] = clamp01(rows[ROW_PREV][k]);
+    return ds->at_always || alpha_test(ds, out[3]);
 }
 
 /* --------------------------------------------------------- rasteriser --- */
@@ -650,53 +669,27 @@ static float blend_factor(u32 f, bool is_src, float sa, float da, float sc, floa
     }
 }
 
-static void scissor(int* x0, int* y0, int* x1, int* y1) {
-    u32 tl = gx_bp[0x20], br = gx_bp[0x21];
-    int top = (int)(tl & 0x7FF) - 342, left = (int)((tl >> 12) & 0x7FF) - 342;
-    int bottom = (int)(br & 0x7FF) - 342, right = (int)((br >> 12) & 0x7FF) - 342;
-    if (right < left || bottom < top) {
-        left = 0; top = 0; right = EFB_W - 1; bottom = EFB_H - 1;
-    }
-    *x0 = left < 0 ? 0 : left;
-    *y0 = top < 0 ? 0 : top;
-    *x1 = right >= EFB_W ? EFB_W - 1 : right;
-    *y1 = bottom >= EFB_H ? EFB_H - 1 : bottom;
-}
-
 static inline u32 to_u8(float v) {      /* v already in 0..255 */
     return (u32)(v + 0.5f);
 }
 
-static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
-    if (!a->valid || !b->valid || !c->valid) { g_tris_skipped++; return; }
-    if ((gx_bp[0x00] >> 14 & 3u) == 3u) return;
-
+/* Draws the rows [band_y0, band_y1] of one triangle. */
+static void draw_triangle(const RenderState* ds, float (*rows)[4], const SVtx* a, const SVtx* b, const SVtx* c,
+                          int band_y0, int band_y1) {
     float area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
     if (fabsf(area) < 1e-6f || !isfinite(area)) return;
 
-    int sx0, sy0, sx1, sy1;
-    scissor(&sx0, &sy0, &sx1, &sy1);
+    int sy0 = ds->sy0 > band_y0 ? ds->sy0 : band_y0;
+    int sy1 = ds->sy1 < band_y1 ? ds->sy1 : band_y1;
     float fx0 = fminf(a->x, fminf(b->x, c->x)), fx1 = fmaxf(a->x, fmaxf(b->x, c->x));
     float fy0 = fminf(a->y, fminf(b->y, c->y)), fy1 = fmaxf(a->y, fmaxf(b->y, c->y));
-    if (fx1 < sx0 || fy1 < sy0 || fx0 > sx1 + 1 || fy0 > sy1 + 1) return;
-    int x0 = fx0 < sx0 ? sx0 : (int)fx0, x1 = fx1 > sx1 ? sx1 : (int)fx1;
+    if (fx1 < ds->sx0 || fy1 < sy0 || fx0 > ds->sx1 + 1 || fy0 > sy1 + 1) return;
+    int x0 = fx0 < ds->sx0 ? ds->sx0 : (int)fx0, x1 = fx1 > ds->sx1 ? ds->sx1 : (int)fx1;
     int y0 = fy0 < sy0 ? sy0 : (int)fy0, y1 = fy1 > sy1 ? sy1 : (int)fy1;
+    if (y0 > y1 || x0 > x1) return;
 
-    u32 zmode = gx_bp[0x40], cmode = gx_bp[0x41];
-    bool ztest = zmode & 1u, zupdate = (zmode >> 4) & 1u;
-    u32 zfunc = (zmode >> 1) & 7u;
-    bool blend = cmode & 1u;
-    bool color_update = (cmode >> 3) & 1u, alpha_update = (cmode >> 4) & 1u;
-    u32 dfac = (cmode >> 5) & 7u, sfac = (cmode >> 8) & 7u;
-    bool subtract = (cmode >> 11) & 1u;
-    if (!(cmode & 0x18u))
-        color_update = true;
-    bool blend_alpha = blend && !subtract && sfac == 4 && dfac == 5;   /* the usual src*a + dst*(1-a) */
-
-    u32 ntex = gx_xf_reg[0x3F] & 15u;
-    if (ntex > MAX_TC) ntex = MAX_TC;
+    u32 ntex = ds->ntex;
     float inv = 1.0f / area;
-    g_tris_drawn++;
 
     /* Per-triangle shortcuts: flat 2D (no perspective), constant colours,
        texture coordinates that don't need the projective divide. */
@@ -728,10 +721,10 @@ static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
                 continue;
 
             u32 z = 0;
-            if (ztest) {
+            if (ds->ztest) {
                 float zf = w0 * a->z + w1 * b->z + w2 * c->z;
                 z = zf <= 0 ? 0u : zf >= 16777215.0f ? 16777215u : (u32)zf;
-                if (!depth_pass(zfunc, z, zrow[x]))
+                if (!depth_pass(ds->zfunc, z, zrow[x]))
                     continue;
             }
 
@@ -758,45 +751,275 @@ static void draw_triangle(const SVtx* a, const SVtx* b, const SVtx* c) {
             }
 
             float out[4];
-            if (!tev_pixel(col, tc, out))
+            if (!tev_pixel(ds, rows, col, tc, out))
                 continue;
             float r = out[0] * 255.0f, g = out[1] * 255.0f, bl = out[2] * 255.0f, al = out[3] * 255.0f;
 
             u32 dst = crow[x];
-            if (blend_alpha) {
+            if (ds->blend_alpha) {
                 float sa = out[3], ia = 1.0f - sa;
                 r = r * sa + (float)((dst >> 16) & 255) * ia;
                 g = g * sa + (float)((dst >> 8) & 255) * ia;
                 bl = bl * sa + (float)(dst & 255) * ia;
-            } else if (blend) {
+            } else if (ds->blend) {
                 float sa = out[3], da = g_u8f[dst >> 24];
                 float d[3] = {(float)((dst >> 16) & 255), (float)((dst >> 8) & 255), (float)(dst & 255)};
                 float sv[3] = {r, g, bl};
                 for (int k = 0; k < 3; k++) {
-                    float sf = blend_factor(sfac, true, sa, da, sv[k] / 255.0f, d[k] / 255.0f);
-                    float df = blend_factor(dfac, false, sa, da, sv[k] / 255.0f, d[k] / 255.0f);
-                    float o = subtract ? d[k] - sv[k] : sv[k] * sf + d[k] * df;
+                    float sf = blend_factor(ds->sfac, true, sa, da, sv[k] / 255.0f, d[k] / 255.0f);
+                    float df = blend_factor(ds->dfac, false, sa, da, sv[k] / 255.0f, d[k] / 255.0f);
+                    float o = ds->subtract ? d[k] - sv[k] : sv[k] * sf + d[k] * df;
                     sv[k] = o < 0 ? 0 : o > 255 ? 255 : o;
                 }
                 r = sv[0]; g = sv[1]; bl = sv[2];
             }
             u32 o = dst;
-            if (color_update)
+            if (ds->color_update)
                 o = (o & 0xFF000000u) | (to_u8(r) << 16) | (to_u8(g) << 8) | to_u8(bl);
-            if (alpha_update)
+            if (ds->alpha_update)
                 o = (o & 0x00FFFFFFu) | (to_u8(al) << 24);
             crow[x] = o;
-            if (ztest && zupdate)
+            if (ds->ztest && ds->zupdate)
                 zrow[x] = z;
         }
     }
 }
 
+/* ----------------------------------------------------- command lists --- */
+typedef struct {
+    u32 cmd, sx, sy, w, h;             /* copy command and source rectangle */
+    u32 dest, stride, lines;           /* to_xfb: destination in RAM */
+    float yscale;
+    bool to_xfb, clear;
+    u32 clear_color, clear_z;
+} CopyCmd;
+
+typedef struct {
+    u32 type;                          /* CMD_TRI or CMD_COPY */
+    u32 state;                         /* RenderState index (triangles) */
+    union {
+        SVtx v[3];
+        CopyCmd copy;
+    } u;
+} Cmd;
+
+enum { CMD_TRI, CMD_COPY };
+
+typedef struct {
+    Cmd* cmds;
+    u32 n, cap;
+    RenderState* states;
+    u32 ns, cap_s;
+} CmdList;
+
+static CmdList g_lists[2];
+static u32 g_rec;                      /* list being recorded */
+
+static Cmd* list_push(CmdList* l) {
+    if (l->n == l->cap) {
+        u32 cap = l->cap ? l->cap * 2 : 4096;
+        Cmd* c = (Cmd*)realloc(l->cmds, sizeof(Cmd) * cap);
+        if (!c)
+            return NULL;
+        l->cmds = c;
+        l->cap = cap;
+    }
+    return &l->cmds[l->n++];
+}
+
+static u32 list_state(CmdList* l) {
+    if (l->ns == l->cap_s) {
+        u32 cap = l->cap_s ? l->cap_s * 2 : 256;
+        RenderState* s = (RenderState*)realloc(l->states, sizeof(RenderState) * cap);
+        if (!s)
+            return 0;
+        l->states = s;
+        l->cap_s = cap;
+    }
+    RenderState tmp;
+    snapshot_state(&tmp);
+    /* Consecutive draws often share state: reuse the previous snapshot. */
+    if (l->ns && memcmp(&l->states[l->ns - 1], &tmp, sizeof(tmp)) == 0)
+        return l->ns - 1;
+    l->states[l->ns] = tmp;
+    return l->ns++;
+}
+
+/* --------------------------------------------------------- workers --- */
+#include "gx/thread.h"
+
+#define MAX_WORKERS 16
+static int g_workers;                  /* 0 = draw on the game thread */
+static int g_workers_wanted = -1;      /* -1 = automatic */
+static gx_mutex g_mx;
+static gx_cond g_cv_work, g_cv_done;
+static u32 g_generation;               /* bumped for each submitted list */
+static int g_busy;                     /* workers still drawing the current list */
+static const CmdList* g_drawing;
+
+/* Executes the whole list for frame-buffer rows [y0, y1]. */
+static void run_list(const CmdList* l, int y0, int y1) {
+    float rows[ROW_COUNT][4];
+    for (int k = 0; k < 4; k++) {
+        rows[ROW_ONE][k] = 1.0f;
+        rows[ROW_HALF][k] = 0.5f;
+        rows[ROW_ZERO][k] = 0.0f;
+    }
+    u32 cur = 0xFFFFFFFFu;
+    for (u32 i = 0; i < l->n; i++) {
+        const Cmd* c = &l->cmds[i];
+        if (c->type == CMD_TRI) {
+            const RenderState* ds = &l->states[c->state];
+            if (c->state != cur) {
+                memcpy(rows[ROW_KONST], ds->konst, sizeof(ds->konst));
+                cur = c->state;
+            }
+            draw_triangle(ds, rows, &c->u.v[0], &c->u.v[1], &c->u.v[2], y0, y1);
+            continue;
+        }
+        const CopyCmd* cp = &c->u.copy;
+        if (cp->to_xfb && cp->lines && g_cpu) {
+            /* Each destination line is written by the worker that owns its
+               source line, so no thread reads rows another is still drawing. */
+            for (u32 y = 0; y < cp->lines; y++) {
+                u32 srcy = cp->sy + (u32)(y / cp->yscale);
+                if (srcy >= EFB_H || srcy >= cp->sy + cp->h)
+                    srcy = cp->sy + cp->h - 1 < EFB_H ? cp->sy + cp->h - 1 : EFB_H - 1;
+                if ((int)srcy < y0 || (int)srcy > y1)
+                    continue;
+                u8* d = g_cpu->ram + cp->dest + y * cp->stride;
+                const u32* src = &g_color[srcy * EFB_W];
+                for (u32 x = 0; x + 1 < cp->w; x += 2) {
+                    u32 c0 = cp->sx + x < EFB_W ? src[cp->sx + x] : 0;
+                    u32 c1 = cp->sx + x + 1 < EFB_W ? src[cp->sx + x + 1] : 0;
+                    int r0 = (c0 >> 16) & 255, g0 = (c0 >> 8) & 255, b0 = c0 & 255;
+                    int r1 = (c1 >> 16) & 255, g1 = (c1 >> 8) & 255, b1 = c1 & 255;
+                    int r = (r0 + r1) / 2, g = (g0 + g1) / 2, b = (b0 + b1) / 2;
+                    d[x * 2 + 0] = (u8)((66 * r0 + 129 * g0 + 25 * b0 + 128) / 256 + 16);
+                    d[x * 2 + 1] = (u8)((-38 * r - 74 * g + 112 * b + 128) / 256 + 128);
+                    d[x * 2 + 2] = (u8)((66 * r1 + 129 * g1 + 25 * b1 + 128) / 256 + 16);
+                    d[x * 2 + 3] = (u8)((112 * r - 94 * g - 18 * b + 128) / 256 + 128);
+                }
+            }
+        }
+        if (cp->clear) {
+            for (int y = y0; y <= y1; y++) {
+                u32* cr = &g_color[(size_t)y * EFB_W];
+                u32* zr = &g_depth[(size_t)y * EFB_W];
+                for (int x = 0; x < EFB_W; x++) {
+                    cr[x] = cp->clear_color;
+                    zr[x] = cp->clear_z;
+                }
+            }
+        }
+    }
+}
+
+static void band(int who, int count, int* y0, int* y1) {
+    *y0 = EFB_H * who / count;
+    *y1 = EFB_H * (who + 1) / count - 1;
+}
+
+static void worker_main(void* arg) {
+    int who = (int)(size_t)arg;
+    u32 seen = 0;
+    for (;;) {
+        gx_mutex_lock(&g_mx);
+        while (g_generation == seen)
+            gx_cond_wait(&g_cv_work, &g_mx);
+        seen = g_generation;
+        const CmdList* l = g_drawing;
+        int count = g_workers;
+        gx_mutex_unlock(&g_mx);
+
+        int y0, y1;
+        band(who, count, &y0, &y1);
+        run_list(l, y0, y1);
+
+        gx_mutex_lock(&g_mx);
+        if (--g_busy == 0)
+            gx_cond_broadcast(&g_cv_done);
+        gx_mutex_unlock(&g_mx);
+    }
+}
+
+static void start_workers(void) {
+    static bool started;
+    if (started)
+        return;
+    started = true;
+    for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;
+    int n = g_workers_wanted;
+    if (n < 0) {
+        n = gx_cpu_count() - 1;        /* leave one core for the game */
+        if (n > 8) n = 8;
+        if (n < 1) n = 1;
+    }
+    if (n > MAX_WORKERS) n = MAX_WORKERS;
+    gx_mutex_init(&g_mx);
+    gx_cond_init(&g_cv_work);
+    gx_cond_init(&g_cv_done);
+    g_workers = 0;
+    for (int i = 0; i < n; i++) {
+        gx_thread t;
+        if (!gx_thread_create(&t, worker_main, (void*)(size_t)i))
+            break;
+        g_workers++;
+    }
+    printf("renderer: %d drawing thread%s\n", g_workers, g_workers == 1 ? "" : "s");
+}
+
+/* Waits until the workers have finished the list they are drawing. */
+static void wait_idle(void) {
+    if (!g_workers)
+        return;
+    gx_mutex_lock(&g_mx);
+    while (g_busy > 0)
+        gx_cond_wait(&g_cv_done, &g_mx);
+    gx_mutex_unlock(&g_mx);
+}
+
+/* Ends the recorded frame: hands its list to the workers (or draws it here
+   when there are none) and starts recording into the other list. */
+static void submit(void) {
+    start_workers();
+    wait_idle();                       /* the other list is free again */
+    gx_tex_collect_garbage();          /* texture memory the finished frame used */
+    CmdList* l = &g_lists[g_rec];
+    if (!g_workers) {
+        run_list(l, 0, EFB_H - 1);
+    } else {
+        gx_mutex_lock(&g_mx);
+        g_drawing = l;
+        g_busy = g_workers;
+        g_generation++;
+        gx_cond_broadcast(&g_cv_work);
+        gx_mutex_unlock(&g_mx);
+    }
+    g_rec ^= 1u;
+    g_lists[g_rec].n = 0;
+    g_lists[g_rec].ns = 0;
+}
+
+void gx_raster_set_threads(int n) {
+    g_workers_wanted = n;
+}
+
+void gx_raster_sync(void) {
+    wait_idle();
+}
+
+/* ------------------------------------------------------------ record --- */
 void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) {
     if (!gx_raster_active() || count == 0)
         return;
+    if ((gx_bp[0x00] >> 14 & 3u) == 3u)
+        return;                        /* cull everything */
     g_cpu = cpu;
-    tev_prepare();
+    if (g_u8f[255] == 0.0f)
+        for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;
+    CmdList* l = &g_lists[g_rec];
+    u32 state = list_state(l);
 
     SVtx* sv = (SVtx*)malloc(sizeof(SVtx) * count);
     if (!sv)
@@ -808,29 +1031,40 @@ void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) 
         transform(&v, &sv[i]);
     }
 
+#define EMIT(i0, i1, i2) do {                                                        \
+        const SVtx *a_ = &sv[i0], *b_ = &sv[i1], *c_ = &sv[i2];                      \
+        if (!a_->valid || !b_->valid || !c_->valid) { g_tris_skipped++; break; }     \
+        Cmd* cmd_ = list_push(l);                                                    \
+        if (!cmd_) break;                                                            \
+        cmd_->type = CMD_TRI; cmd_->state = state;                                   \
+        cmd_->u.v[0] = *a_; cmd_->u.v[1] = *b_; cmd_->u.v[2] = *c_;                  \
+        g_tris_recorded++;                                                           \
+    } while (0)
+
     switch (prim & 0xF8) {
     case 0x80:
     case 0x88:
         for (u32 i = 0; i + 3 < count; i += 4) {
-            draw_triangle(&sv[i], &sv[i + 1], &sv[i + 2]);
-            draw_triangle(&sv[i], &sv[i + 2], &sv[i + 3]);
+            EMIT(i, i + 1, i + 2);
+            EMIT(i, i + 2, i + 3);
         }
         break;
     case 0x90:
         for (u32 i = 0; i + 2 < count; i += 3)
-            draw_triangle(&sv[i], &sv[i + 1], &sv[i + 2]);
+            EMIT(i, i + 1, i + 2);
         break;
     case 0x98:
         for (u32 i = 0; i + 2 < count; i++)
-            draw_triangle(&sv[i], &sv[i + 1], &sv[i + 2]);
+            EMIT(i, i + 1, i + 2);
         break;
     case 0xA0:
         for (u32 i = 1; i + 1 < count; i++)
-            draw_triangle(&sv[0], &sv[i], &sv[i + 1]);
+            EMIT(0, i, i + 1);
         break;
     default:
         break;
     }
+#undef EMIT
     free(sv);
 }
 
@@ -870,77 +1104,90 @@ static void write_bmp(const char* path, u32 sx, u32 sy, u32 w, u32 h) {
    does, so the copy never runs past the buffer the game allocated. */
 static u32 g_xfb_copy_log;
 
-static void copy_to_xfb(u32 cmd, u32 sx, u32 sy, u32 w, u32 h) {
-    if (!g_cpu)
-        return;
+static void setup_xfb_copy(CPUState* cpu, CopyCmd* cp) {
     u32 dest = (gx_bp[0x4B] & 0x00FFFFFFu) << 5;
     u32 stride = (gx_bp[0x4D] & 0x3FFu) << 5;
     u32 yscale_reg = gx_bp[0x4E] & 0x1FFu;
-    bool invert = (cmd >> 10) & 1u;
+    bool invert = (cp->cmd >> 10) & 1u;
     double yscale = 1.0;
     if (yscale_reg)
         yscale = invert ? 256.0 / yscale_reg : yscale_reg / 256.0;
-    u32 lines = (u32)(h * yscale + 0.5);
+    u32 lines = (u32)(cp->h * yscale + 0.5);
     if (lines > 1024)
         lines = 1024;
+    u32 w = cp->w;
     if (w * 2u > stride)
-        w = stride / 2u;          /* a line never spills into the next one */
+        w = stride / 2u;               /* a line never spills into the next one */
     if (g_xfb_copy_log < 8) {
         g_xfb_copy_log++;
         printf("  xfb copy: %ux%u from (%u,%u) -> 0x%08X stride %u, yscale 0x%03X%s = %u lines, cmd 0x%06X\n",
-               w, h, sx, sy, dest, stride, yscale_reg, invert ? " (inverted)" : "", lines, cmd);
+               w, cp->h, cp->sx, cp->sy, dest, stride, yscale_reg, invert ? " (inverted)" : "", lines, cp->cmd);
     }
-    if (!w || !lines || dest >= g_cpu->ram_size || (u64)lines * stride > g_cpu->ram_size - dest)
-        return;
-    for (u32 y = 0; y < lines; y++) {
-        u32 srcy = sy + (u32)(y / yscale);
-        if (srcy >= EFB_H || srcy >= sy + h)
-            srcy = sy + h - 1 < EFB_H ? sy + h - 1 : EFB_H - 1;
-        u8* d = g_cpu->ram + dest + y * stride;
-        for (u32 x = 0; x + 1 < w; x += 2) {
-            u32 c0 = sx + x < EFB_W ? g_color[srcy * EFB_W + sx + x] : 0;
-            u32 c1 = sx + x + 1 < EFB_W ? g_color[srcy * EFB_W + sx + x + 1] : 0;
-            int r0 = (c0 >> 16) & 255, g0 = (c0 >> 8) & 255, b0 = c0 & 255;
-            int r1 = (c1 >> 16) & 255, g1 = (c1 >> 8) & 255, b1 = c1 & 255;
-            int r = (r0 + r1) / 2, g = (g0 + g1) / 2, b = (b0 + b1) / 2;
-            d[x * 2 + 0] = (u8)((66 * r0 + 129 * g0 + 25 * b0 + 128) / 256 + 16);
-            d[x * 2 + 1] = (u8)((-38 * r - 74 * g + 112 * b + 128) / 256 + 128);
-            d[x * 2 + 2] = (u8)((66 * r1 + 129 * g1 + 25 * b1 + 128) / 256 + 16);
-            d[x * 2 + 3] = (u8)((112 * r - 94 * g - 18 * b + 128) / 256 + 128);
-        }
-    }
+    if (!cpu || !w || !lines || dest >= cpu->ram_size || (u64)lines * stride > cpu->ram_size - dest)
+        lines = 0;
+    cp->w = w;
+    cp->dest = dest;
+    cp->stride = stride;
+    cp->lines = lines;
+    cp->yscale = (float)yscale;
 }
 
 void gx_raster_copy(u32 cmd) {
     bool to_xfb = (cmd >> 14) & 1u;
     bool clear = (cmd >> 11) & 1u;
+    bool active = gx_raster_active();
+
+    if (active && (to_xfb || clear)) {
+        Cmd* c = list_push(&g_lists[g_rec]);
+        if (c) {
+            CopyCmd* cp = &c->u.copy;
+            memset(c, 0, sizeof(*c));
+            c->type = CMD_COPY;
+            cp->cmd = cmd;
+            cp->sx = gx_bp[0x49] & 0x3FFu;
+            cp->sy = (gx_bp[0x49] >> 10) & 0x3FFu;
+            cp->w = (gx_bp[0x4A] & 0x3FFu) + 1;
+            cp->h = ((gx_bp[0x4A] >> 10) & 0x3FFu) + 1;
+            cp->to_xfb = to_xfb;
+            if (to_xfb)
+                setup_xfb_copy(g_cpu, cp);
+            cp->clear = clear;
+            u32 a = (gx_bp[0x4F] >> 8) & 255u, r = gx_bp[0x4F] & 255u;
+            u32 g = (gx_bp[0x50] >> 8) & 255u, b = gx_bp[0x50] & 255u;
+            cp->clear_color = (a << 24) | (r << 16) | (g << 8) | b;
+            cp->clear_z = gx_bp[0x51] & 0xFFFFFFu;
+        }
+    }
 
     if (to_xfb) {
-        if (gx_raster_active()) {
+        if (active) {
             u32 sx = gx_bp[0x49] & 0x3FFu, sy = (gx_bp[0x49] >> 10) & 0x3FFu;
             u32 w = (gx_bp[0x4A] & 0x3FFu) + 1, h = ((gx_bp[0x4A] >> 10) & 0x3FFu) + 1;
-            copy_to_xfb(cmd, sx, sy, w, h);
-            if (g_save && g_dumped < MAX_DUMPS) {
+            bool save = g_save && g_dumped < MAX_DUMPS;
+            if (save) {
+                /* The picture is needed before the copy's clear: draw the
+                   frame without its final command, save it, then finish. */
+                CmdList* l = &g_lists[g_rec];
+                Cmd last;
+                bool have_last = l->n && l->cmds[l->n - 1].type == CMD_COPY;
+                if (have_last)
+                    last = l->cmds[--l->n];
+                submit();
+                wait_idle();
                 char path[600];
                 snprintf(path, sizeof(path), "%s/frame_%06u.bmp", g_dir, g_frames + 1);
                 write_bmp(path, sx, sy, w, h);
                 printf("  frame %u saved (game time %.2f s)\n", g_frames + 1, interrupts_game_seconds());
                 g_dumped++;
+                if (have_last) {
+                    Cmd* c = list_push(&g_lists[g_rec]);
+                    if (c) *c = last;
+                }
             }
+            submit();
         }
         g_frames++;
         gx_tex_flush_cache();   /* texture data in RAM may change between frames: re-check */
-    }
-
-    if (clear) {
-        u32 a = (gx_bp[0x4F] >> 8) & 255u, r = gx_bp[0x4F] & 255u;
-        u32 g = (gx_bp[0x50] >> 8) & 255u, b = gx_bp[0x50] & 255u;
-        u32 color = (a << 24) | (r << 16) | (g << 8) | b;
-        u32 z = gx_bp[0x51] & 0xFFFFFFu;
-        for (size_t i = 0; i < (size_t)EFB_W * EFB_H; i++) {
-            g_color[i] = color;
-            g_depth[i] = z;
-        }
     }
 }
 
@@ -964,6 +1211,7 @@ static u8 clamp8(int v) { return (u8)(v < 0 ? 0 : v > 255 ? 255 : v); }
 void gx_raster_xfb_field(CPUState* cpu, u64 field, u32 tfbl, u32 picture_cfg) {
     if (!g_xfb_every || g_xfb_dumped >= MAX_DUMPS || field % g_xfb_every)
         return;
+    wait_idle();                       /* the frame being drawn may be the one shown */
     u32 addr = (tfbl & 0x10000000u) ? (tfbl & 0x00FFFFFFu) << 5 : (tfbl & 0x00FFFFFFu);
     u32 width = ((picture_cfg >> 8) & 0x7Fu) * 16u;   /* WPL: width in 16-pixel units */
     u32 stride = (picture_cfg & 0xFFu) * 32u;          /* STD is per field line; a frame line is half */
@@ -1018,7 +1266,9 @@ u32 gx_raster_frames(void) {
 }
 
 void gx_raster_report(void) {
+    wait_idle();
     gx_tex_report();
-    printf("renderer: %u frames shown, %u dumped to %s, %llu triangles drawn, %llu clipped\n",
-           g_frames, g_dumped, g_every ? g_dir : "(off)", g_tris_drawn, g_tris_skipped);
+    unsigned long long drawn = g_tris_recorded;
+    printf("renderer: %u frames shown, %u dumped to %s, %llu triangles drawn, %llu clipped, %d drawing threads\n",
+           g_frames, g_dumped, g_every ? g_dir : "(off)", drawn, g_tris_skipped, g_workers);
 }
