@@ -11,6 +11,7 @@
 #include "runtime/hle_exceptions.h"
 #include "runtime/interrupts.h"
 #include "gx/fifo.h"
+#include "gx/raster.h"
 #include "runtime/mmio.h"
 #include "runtime/symbols.h"
 
@@ -62,6 +63,7 @@ static void print_location(const char* label, u32 addr) {
 static void usage(const char* argv0) {
     fprintf(stderr,
             "usage: %s <disc folder> [--map main.map] [--max-steps N] [--quiet] [--skip-hash]\n"
+            "         [--dump-every N (default 60, 0 = off)] [--dump-dir DIR (default frames)]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -71,6 +73,8 @@ int main(int argc, char** argv) {
     const char* map_path = NULL;
     unsigned long long max_steps = 50000000ull;
     bool skip_hash = false;
+    const char* dump_dir = "frames";
+    u32 dump_every = 60;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--map") == 0 && i + 1 < argc) {
@@ -79,6 +83,10 @@ int main(int argc, char** argv) {
             max_steps = strtoull(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--quiet") == 0) {
             g_verbose_entries = false;
+        } else if (strcmp(argv[i], "--dump-every") == 0 && i + 1 < argc) {
+            dump_every = (u32)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--dump-dir") == 0 && i + 1 < argc) {
+            dump_dir = argv[++i];
         } else if (strcmp(argv[i], "--skip-hash") == 0) {
             skip_hash = true;
         } else if (argv[i][0] != '-' && !disc_dir) {
@@ -99,6 +107,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "warning: couldn't load symbols from %s\n", map_path);
     }
     g_seen = (u8*)calloc(GC_MAIN_RAM_SIZE >> 5, 1);
+    gx_raster_config(dump_dir, dump_every);
 
     static CPUState cpu;
     if (!cpu_init(&cpu))
@@ -160,6 +169,7 @@ int main(int argc, char** argv) {
     hle_exceptions_report();
     interrupts_report();
     gx_fifo_report();
+    gx_raster_report();
     disc_report();
     hle_cpu_report();
     mmio_report();

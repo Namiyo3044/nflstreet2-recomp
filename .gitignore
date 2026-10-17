@@ -15,3 +15,6 @@
 
 # Run logs
 /run*.txt
+
+# Frame dumps
+/frames/

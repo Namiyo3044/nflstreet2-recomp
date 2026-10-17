@@ -1,14 +1,16 @@
 #include "gx/fifo.h"
+#include "gx/raster.h"
+#include "gx/state.h"
 #include "runtime/mmio.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Command-processor registers (vertex descriptors and attribute formats). */
-static u32 g_cp[256];
-/* Blitting-processor ("BP") registers: rasteriser, TEV, pixel engine. */
-static u32 g_bp[256] = {[0xFE] = 0x00FFFFFFu};  /* 0xFE: write mask, all bits by default */
+u32 gx_cp[256];
+u32 gx_bp[256] = {[0xFE] = 0x00FFFFFFu};  /* 0xFE: write mask, all bits by default */
+u32 gx_xf_mem[0x800];
+u32 gx_xf_reg[0x100];
 
 /* Bytes received from the write-gather pipe that don't yet form a command. */
 static u8* g_buf;
@@ -43,8 +45,8 @@ static u32 index_size(u32 type) {
    vertex descriptor (which attributes are present, and how) and the VAT
    (component count and number format of each attribute). */
 static u32 vertex_size(u32 vat) {
-    u32 lo = g_cp[0x50], hi = g_cp[0x60];
-    u32 a = g_cp[0x70 + vat], b = g_cp[0x80 + vat], c = g_cp[0x90 + vat];
+    u32 lo = gx_cp[0x50], hi = gx_cp[0x60];
+    u32 a = gx_cp[0x70 + vat], b = gx_cp[0x80 + vat], c = gx_cp[0x90 + vat];
     u32 size = 0;
 
     for (u32 i = 0; i < 9; i++)          /* position/normal matrix index, 8 texture matrix indices */
@@ -98,12 +100,12 @@ static void write_bp(u32 value) {
     u32 data = value & 0x00FFFFFFu;
 
     /* BP 0xFE is a write mask for the next BP write. */
-    if (reg != 0xFE && g_bp[0xFE] != 0x00FFFFFFu) {
-        u32 mask = g_bp[0xFE];
-        data = (g_bp[reg] & ~mask) | (data & mask);
-        g_bp[0xFE] = 0x00FFFFFFu;
+    if (reg != 0xFE && gx_bp[0xFE] != 0x00FFFFFFu) {
+        u32 mask = gx_bp[0xFE];
+        data = (gx_bp[reg] & ~mask) | (data & mask);
+        gx_bp[0xFE] = 0x00FFFFFFu;
     }
-    g_bp[reg] = data;
+    gx_bp[reg] = data;
     g_stats.bp++;
 
     switch (reg) {
@@ -124,6 +126,7 @@ static void write_bp(u32 value) {
             g_stats.copies_xfb++;
         else
             g_stats.copies_tex++;
+        gx_raster_copy(data);
         break;
     default:
         break;
@@ -141,6 +144,20 @@ static void log_unknown(const u8* p, size_t avail, bool in_dl) {
     printf("\n");
 }
 
+/* LOAD_INDX_A-D: copy a matrix (or light) from attribute array 12-15 in RAM
+   into transform memory. value = index << 16 | (count - 1) << 12 | address. */
+static void load_indexed(CPUState* cpu, u32 array, u32 value) {
+    u32 index = value >> 16;
+    u32 count = ((value >> 12) & 0xFu) + 1u;
+    u32 addr = value & 0xFFFu;
+    u32 src = ((gx_cp[0xA0 + array] & 0x03FFFFFFu) + index * gx_cp[0xB0 + array]) & 0x01FFFFFFu;
+    for (u32 i = 0; i < count; i++, addr++, src += 4) {
+        if (src + 4 > cpu->ram_size || addr >= 0x800u)
+            break;
+        gx_xf_mem[addr] = be32(cpu->ram + src);
+    }
+}
+
 static void run_display_list(CPUState* cpu, u32 addr, u32 size);
 
 /* Decodes one command at p. Returns its length, or 0 if more bytes are
@@ -153,20 +170,30 @@ static size_t parse_one(CPUState* cpu, const u8* p, size_t avail, bool in_dl) {
 
     if (op == 0x08) {                          /* LOAD_CP_REG: reg, value */
         if (avail < 6) return 0;
-        g_cp[p[1]] = be32(p + 2);
+        gx_cp[p[1]] = be32(p + 2);
         g_stats.cp++;
         return 6;
     }
     if (op == 0x10) {                          /* LOAD_XF_REG: (count-1)<<16 | addr, values */
         if (avail < 5) return 0;
-        size_t n = ((be32(p + 1) >> 16) & 0xFFFFu) + 1u;
+        u32 hdr = be32(p + 1);
+        size_t n = ((hdr >> 16) & 0xFFFFu) + 1u;
         size_t len = 5 + n * 4;
         if (avail < len) return 0;
+        u32 addr = hdr & 0xFFFFu;
+        for (size_t i = 0; i < n; i++, addr++) {
+            u32 v = be32(p + 5 + i * 4);
+            if (addr < 0x800u)
+                gx_xf_mem[addr] = v;
+            else if (addr >= 0x1000u && addr < 0x1100u)
+                gx_xf_reg[addr - 0x1000u] = v;
+        }
         g_stats.xf++;
         return len;
     }
     if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) { /* LOAD_INDX_A-D */
         if (avail < 5) return 0;
+        load_indexed(cpu, 12u + ((op >> 3) - 4u), be32(p + 1));
         g_stats.indexed++;
         return 5;
     }
@@ -191,6 +218,7 @@ static size_t parse_one(CPUState* cpu, const u8* p, size_t avail, bool in_dl) {
             if (avail < len) return 0;
             g_stats.draws++;
             g_stats.vertices += count;
+            gx_raster_draw(cpu, op, op & 7u, count, p + 3);
             return len;
         }
     }
