@@ -3,6 +3,7 @@
 #include "runtime/disc.h"
 #include "runtime/pad.h"
 #include "runtime/interrupts.h"
+#include "audio/ax_hle.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -200,9 +201,10 @@ static void dsp_receive_mail(CPUState* cpu, u32 mail) {
     if ((g_dsp_prev_mail & 0xFFFF0000u) == 0xBABE0000u) {
         /* AX: this mail is the address of the frame's command list (the one
            before it, 0xBABE0180, announced it). The mixing itself isn't done
-           yet; reply "resume" so AX knows the frame is finished, as its DSP
-           program would after mixing. */
+           yet, but voices are advanced (ax_hle.c); then reply "resume" so AX
+           knows the frame is finished, as its DSP program would. */
         g_ax_frames++;
+        ax_hle_command_list(cpu, mail);
         dsp_send_to_cpu(0xDCD10001u, true);
         mail = 0;   /* an address, not a command: don't let it match anything */
     }

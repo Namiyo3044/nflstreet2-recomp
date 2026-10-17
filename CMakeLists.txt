@@ -52,6 +52,7 @@ endif()
 
 add_executable(nfls2
     src/main.c
+    src/audio/ax_hle.c
     src/gx/fifo.c
     src/gx/raster.c
     src/runtime/disc.c

@@ -13,6 +13,7 @@
 #include "runtime/pad.h"
 #include "gx/fifo.h"
 #include "gx/raster.h"
+#include "audio/ax_hle.h"
 #include "runtime/mmio.h"
 #include "runtime/symbols.h"
 
@@ -184,6 +185,7 @@ int main(int argc, char** argv) {
     gx_fifo_report();
     gx_raster_report();
     disc_report();
+    ax_hle_report();
     hle_cpu_report();
     mmio_report();
     cpu_free(&cpu);
