@@ -20,4 +20,7 @@ void mmio_vi_raise(u32 which);   /* assert VI display interrupt DI0-DI3 */
 void mmio_pe_finish(void);
 void mmio_pe_token(u16 token, bool interrupt);
 
+/* Controller polling, once per video field. */
+void mmio_si_field(void);
+
 #endif

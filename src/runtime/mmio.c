@@ -1,6 +1,8 @@
 #include "mmio.h"
 #include "gx/fifo.h"
 #include "runtime/disc.h"
+#include "runtime/pad.h"
+#include "runtime/interrupts.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -360,6 +362,139 @@ static bool di_write(CPUState* cpu, u32 off, u32 value, u8 size) {
     return false;
 }
 
+/* ----------------------------------------------------------------- SI --- */
+/* Serial interface: controller ports. A standard controller answers on port 1
+   (channel 0); ports 2-4 are empty and report "no response". Transfers
+   complete instantly; polled controller data is refreshed every video field. */
+#define SI 0x6400u
+#define SI_POLL   (SI + 0x30)
+#define SI_COMCSR (SI + 0x34)
+#define SI_SR     (SI + 0x38)
+#define SI_IOBUF  (SI + 0x80)
+#define SI_TCINT      0x80000000u
+#define SI_TCINTMSK   0x40000000u
+#define SI_COMERR     0x20000000u
+#define SI_RDSTINT    0x10000000u
+#define SI_RDSTINTMSK 0x08000000u
+
+static u32 g_si_comcsr, g_si_sr;
+static u32 g_si_inbuf[4][2];
+static unsigned g_si_logged;
+
+static bool si_interrupt_pending(void) {
+    return ((g_si_comcsr & SI_TCINT) && (g_si_comcsr & SI_TCINTMSK)) ||
+           ((g_si_comcsr & SI_RDSTINT) && (g_si_comcsr & SI_RDSTINTMSK));
+}
+
+static void si_transfer(void) {
+    u32 ch = (g_si_comcsr >> 1) & 3u;
+    u32 out_len = (g_si_comcsr >> 16) & 0x7Fu;
+    u32 in_len = (g_si_comcsr >> 8) & 0x7Fu;
+    if (!out_len) out_len = 128;
+    if (!in_len) in_len = 128;
+    u8 cmd = g_regs[SI_IOBUF];
+    u8 resp[128];
+    u32 n = 0;
+    bool present = (ch == 0);
+
+    memset(resp, 0, sizeof(resp));
+    if (present) {
+        switch (cmd) {
+        case 0x00:   /* identify / reset: standard GameCube controller */
+        case 0xFF:
+            resp[0] = 0x09; resp[1] = 0x00; resp[2] = 0x00;
+            n = 3;
+            break;
+        case 0x41:   /* read origin */
+        case 0x42:   /* recalibrate */
+            resp[0] = 0x00; resp[1] = 0x80;
+            resp[2] = resp[3] = resp[4] = resp[5] = 0x80;   /* sticks centred */
+            resp[6] = resp[7] = 0x1F;                        /* trigger rest values */
+            n = 10;
+            break;
+        case 0x40:   /* direct poll */
+            pad_poll_response(interrupts_game_seconds(), resp);
+            n = 8;
+            break;
+        default:
+            present = false;
+            break;
+        }
+    }
+    if (g_si_logged < 16) {
+        g_si_logged++;
+        printf("  si: port %u command 0x%02X (%u out, %u in) -> %s\n", ch + 1, cmd, out_len, in_len,
+               present ? "controller" : "no device");
+    }
+
+    g_si_comcsr &= ~(SI_COMERR | 1u);              /* TSTART done */
+    if (present) {
+        for (u32 i = 0; i < in_len && i < sizeof(resp); i++)
+            g_regs[SI_IOBUF + i] = i < n ? resp[i] : 0;
+    } else {
+        g_si_comcsr |= SI_COMERR;
+        g_si_sr |= 0x08u << ((3 - ch) * 8);         /* no response */
+    }
+    g_si_comcsr |= SI_TCINT;
+}
+
+/* Once per video field: refresh the polled controller data, as the hardware
+   does on its own when polling is enabled. */
+void mmio_si_field(void) {
+    u32 poll = reg_get(SI_POLL, 4);
+    for (u32 ch = 0; ch < 4; ch++) {
+        if (!(poll & (0x80u >> ch)))
+            continue;
+        if (ch != 0) {
+            g_si_sr |= 0x08u << ((3 - ch) * 8);
+            continue;
+        }
+        u8 r[8];
+        pad_poll_response(interrupts_game_seconds(), r);
+        g_si_inbuf[ch][0] = ((u32)r[0] << 24) | ((u32)r[1] << 16) | ((u32)r[2] << 8) | r[3];
+        g_si_inbuf[ch][1] = ((u32)r[4] << 24) | ((u32)r[5] << 16) | ((u32)r[6] << 8) | r[7];
+        g_si_sr |= 0x20u << ((3 - ch) * 8);         /* RDST: new data ready */
+        g_si_comcsr |= SI_RDSTINT;
+    }
+}
+
+static bool si_read(u32 off, u8 size, u32* out) {
+    if (size != 4)
+        return false;
+    if (off == SI_COMCSR) { *out = g_si_comcsr; return true; }
+    if (off == SI_SR) { *out = g_si_sr; return true; }
+    if (off < SI + 0x30) {
+        u32 ch = (off - SI) / 0x0Cu, r = (off - SI) % 0x0Cu;
+        if (r == 4) {                                /* input buffer high: reading consumes RDST */
+            *out = g_si_inbuf[ch][0];
+            g_si_sr &= ~(0x20u << ((3 - ch) * 8));
+            if (!(g_si_sr & 0x20202020u))
+                g_si_comcsr &= ~SI_RDSTINT;
+            return true;
+        }
+        if (r == 8) { *out = g_si_inbuf[ch][1]; return true; }
+    }
+    return false;
+}
+
+static bool si_write(u32 off, u32 value, u8 size) {
+    if (size != 4)
+        return false;
+    if (off == SI_COMCSR) {
+        u32 w1c = value & (SI_TCINT | SI_RDSTINT);
+        g_si_comcsr = (g_si_comcsr & (SI_TCINT | SI_RDSTINT | SI_COMERR) & ~w1c) |
+                      (value & ~(SI_TCINT | SI_RDSTINT | SI_COMERR));
+        if (value & 1u)
+            si_transfer();
+        return true;
+    }
+    if (off == SI_SR) {
+        g_si_sr &= ~(value & 0x0F0F0F0Fu);           /* write 1 to clear error bits */
+        return true;
+    }
+    return false;
+}
+
 /* ----------------------------------------------------------------- AI --- */
 /* Audio streaming interface. Only the sample counter matters for now: while
    streaming is on it advances at 32 or 48 kHz of game time, which AIInit
@@ -438,6 +573,8 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         value = ai_sample_count(cpu);
     else if (off >= DI && off < DI + 0x40 && di_read(off, size, &value))
         ;
+    else if (off >= SI && off < SI + 0x40 && si_read(off, size, &value))
+        ;
     else if (off == 0x0000u && size == 2)
         value = 0x000Cu;                   /* CP status: FIFO read and command processing idle */
     else if (off == PE_INTRCTRL && size == 2)
@@ -480,6 +617,8 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
     }
     if (off >= DI && off < DI + 0x40 && di_write(cpu, off, value, size))
         return;
+    if (off >= SI && off < SI + 0x40 && si_write(off, value, size))
+        return;
     if (off == PE_INTRCTRL && size == 2) {
         /* Enable bits are stored; writing 1 to a status bit acknowledges it. */
         u16 v = (u16)value;
@@ -514,6 +653,8 @@ u32 mmio_pi_cause(void) {
         cause |= PI_INT_DSP;
     if (di_interrupt_pending())
         cause |= 0x00000004u;   /* DI */
+    if (si_interrupt_pending())
+        cause |= 0x00000008u;   /* SI */
     if ((g_pe_ctrl & PE_TOKEN_INT) && (g_pe_ctrl & PE_TOKEN_EN))
         cause |= 0x00000200u;   /* PE token */
     if ((g_pe_ctrl & PE_FINISH_INT) && (g_pe_ctrl & PE_FINISH_EN))

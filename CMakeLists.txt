@@ -60,6 +60,7 @@ add_executable(nfls2
     src/runtime/hle_exceptions.c
     src/runtime/interrupts.c
     src/runtime/mmio.c
+    src/runtime/pad.c
     src/runtime/sha1.c
     src/runtime/symbols.c)
 target_link_libraries(nfls2 PRIVATE nfls2_game)

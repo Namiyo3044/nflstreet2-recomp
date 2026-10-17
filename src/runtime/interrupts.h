@@ -7,6 +7,9 @@
    one is pending, enters the OS interrupt handler. Call between steps. */
 void interrupts_poll(CPUState* cpu);
 
+/* Game time so far, in seconds, counted in video fields. */
+double interrupts_game_seconds(void);
+
 void interrupts_report(void);
 
 #endif

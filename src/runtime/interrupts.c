@@ -83,6 +83,7 @@ void interrupts_poll(CPUState* cpu) {
     while (cpu->timebase >= g_next_field) {
         g_next_field += FIELD_TICKS;
         mmio_vi_raise(g_field ? 0u : 1u);
+        mmio_si_field();
         g_field ^= 1u;
         g_fields++;
     }
@@ -92,6 +93,10 @@ void interrupts_poll(CPUState* cpu) {
     u32 pending = mmio_pi_cause() & mmio_pi_mask() & ~0x00010000u;
     if (pending && mem_read32(cpu, OS_EXCEPTION_TABLE + OS_EXCEPTION_EXTERNAL * 4u))
         take_external_interrupt(cpu);
+}
+
+double interrupts_game_seconds(void) {
+    return (double)g_fields * 1001.0 / 60000.0;
 }
 
 void interrupts_report(void) {

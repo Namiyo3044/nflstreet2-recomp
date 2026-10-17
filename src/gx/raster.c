@@ -1,5 +1,6 @@
 #include "gx/raster.h"
 #include "gx/state.h"
+#include "runtime/interrupts.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -418,6 +419,7 @@ void gx_raster_copy(u32 cmd) {
             char path[600];
             snprintf(path, sizeof(path), "%s/frame_%06u.bmp", g_dir, g_frames + 1);
             write_bmp(path, sx, sy, w, h);
+            printf("  frame %u saved (game time %.2f s)\n", g_frames + 1, interrupts_game_seconds());
             g_dumped++;
         }
         g_frames++;

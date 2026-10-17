@@ -10,6 +10,7 @@
 #include "runtime/hle_cpu.h"
 #include "runtime/hle_exceptions.h"
 #include "runtime/interrupts.h"
+#include "runtime/pad.h"
 #include "gx/fifo.h"
 #include "gx/raster.h"
 #include "runtime/mmio.h"
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define TRACE_LEN 24
 
@@ -64,6 +66,7 @@ static void usage(const char* argv0) {
     fprintf(stderr,
             "usage: %s <disc folder> [--map main.map] [--max-steps N] [--quiet] [--skip-hash]\n"
             "         [--dump-every N (default 60, 0 = off)] [--dump-dir DIR (default frames)]\n"
+            "         [--press SECONDS:BUTTON[+BUTTON]]...  e.g. --press 5.5:A --press 7:DOWN\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -87,6 +90,12 @@ int main(int argc, char** argv) {
             dump_every = (u32)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--dump-dir") == 0 && i + 1 < argc) {
             dump_dir = argv[++i];
+        } else if (strcmp(argv[i], "--press") == 0 && i + 1 < argc) {
+            if (!pad_add_press(argv[++i])) {
+                fprintf(stderr, "error: --press %s: expected SECONDS:BUTTON[+BUTTON], buttons: %s\n",
+                        argv[i], pad_button_names());
+                return 2;
+            }
         } else if (strcmp(argv[i], "--skip-hash") == 0) {
             skip_hash = true;
         } else if (argv[i][0] != '-' && !disc_dir) {
@@ -129,6 +138,7 @@ int main(int argc, char** argv) {
     cpu.pc = entry;
     print_location("entry", entry);
 
+    clock_t started = clock();
     const char* reason = "step limit reached";
     unsigned long long steps = 0;
     while (steps < max_steps) {
@@ -151,14 +161,17 @@ int main(int argc, char** argv) {
         interrupts_poll(&cpu);
     }
 
+    double secs = (double)(clock() - started) / CLOCKS_PER_SEC;
     printf("\n=== stopped after %llu steps: %s ===\n", steps, reason);
+    printf("run time %.1f s (%.1f million steps/s), game time %.1f s\n", secs,
+           secs > 0 ? (double)steps / secs / 1e6 : 0.0, interrupts_game_seconds());
     print_location("pc   ", cpu.pc);
     if (cpu.exception) {
         printf("exception flags 0x%08X, program cause 0x%08X\n", cpu.exception, cpu.program_exception);
         print_location("srr0 ", cpu.srr0);
     }
     print_location("lr   ", cpu.lr);
-    printf("r1 (stack) 0x%08X  r2 0x%08X  r13 0x%08X\n", cpu.gpr[1], cpu.gpr[2], cpu.gpr[13]);
+    printf("r1 (stack) 0x%08X  r2 0x%08X  r13 0x%08X  r14 0x%08X\n", cpu.gpr[1], cpu.gpr[2], cpu.gpr[13], cpu.gpr[14]);
 
     printf("\nlast dispatched addresses (oldest first):\n");
     u32 n = g_trace_pos < TRACE_LEN ? g_trace_pos : TRACE_LEN;
