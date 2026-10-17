@@ -52,6 +52,7 @@ endif()
 
 add_executable(nfls2
     src/main.c
+    src/gx/fifo.c
     src/runtime/dol.c
     src/runtime/hle_cpu.c
     src/runtime/hle_exceptions.c

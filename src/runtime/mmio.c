@@ -1,4 +1,5 @@
 #include "mmio.h"
+#include "gx/fifo.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -148,12 +149,32 @@ static void dsp_send_to_cpu(u32 mail, bool interrupt) {
     }
 }
 
-static void dsp_receive_mail(u32 mail) {
+static u32 g_dsp_ucode_addr, g_dsp_ucode_len;
+
+/* Identifies the DSP program being started, so audio can later be handled
+   by a native implementation of that exact program (AX version). */
+static void dsp_log_ucode(CPUState* cpu) {
+    u32 phys = g_dsp_ucode_addr & 0x01FFFFFFu;
+    if (!g_dsp_ucode_len || phys >= cpu->ram_size || g_dsp_ucode_len > cpu->ram_size - phys)
+        return;
+    u64 h = 0xCBF29CE484222325ull;               /* FNV-1a */
+    for (u32 i = 0; i < g_dsp_ucode_len; i++)
+        h = (h ^ cpu->ram[phys + i]) * 0x100000001B3ull;
+    printf("  dsp: starting program from 0x%08X, %u bytes, fnv64 %016llX\n",
+           g_dsp_ucode_addr, g_dsp_ucode_len, (unsigned long long)h);
+}
+
+static void dsp_receive_mail(CPUState* cpu, u32 mail) {
     if (g_dsp_mail_log < 64) {
         g_dsp_mail_log++;
         printf("  dsp mail <- cpu 0x%08X\n", mail);
     }
+    if (g_dsp_prev_mail == 0x80F3A001u)
+        g_dsp_ucode_addr = mail;
+    else if (g_dsp_prev_mail == 0x80F3A002u)
+        g_dsp_ucode_len = mail;
     if (g_dsp_prev_mail == 0x80F3D001u) {
+        dsp_log_ucode(cpu);
         /* That was the task's entry point: the task is now running. */
         dsp_send_to_cpu(0xDCD10000u, true);
     }
@@ -177,7 +198,7 @@ static bool dsp_write(CPUState* cpu, u32 off, u32 value, u8 size) {
     /* CPU -> DSP mailbox: the mail is complete once the low half is written. */
     if (r == 0x00 && size == 4) {
         reg_set(off, value, 4);
-        dsp_receive_mail(value);
+        dsp_receive_mail(cpu, value);
         return true;
     }
     if (r == 0x00 && size == 2) {
@@ -187,13 +208,35 @@ static bool dsp_write(CPUState* cpu, u32 off, u32 value, u8 size) {
     }
     if (r == 0x02 && size == 2) {
         reg_set(off, value, 2);
-        dsp_receive_mail((g_dsp_cpu_mail_hi << 16) | (value & 0xFFFFu));
+        dsp_receive_mail(cpu, (g_dsp_cpu_mail_hi << 16) | (value & 0xFFFFu));
         return true;
     }
     reg_set(off, value, size);
     if ((r == 0x28 && size == 4) || (r == 0x2A && size == 2))
         aram_dma(cpu);
     return true;
+}
+
+/* ----------------------------------------------------------------- PE --- */
+/* Pixel engine interrupts: "draw done" (finish) and tokens, raised by the
+   graphics command stream (gx/fifo.c). */
+#define PE_INTRCTRL 0x100Au
+#define PE_TOKEN    0x100Eu
+#define PE_TOKEN_EN  0x1u
+#define PE_FINISH_EN 0x2u
+#define PE_TOKEN_INT 0x4u
+#define PE_FINISH_INT 0x8u
+
+static u16 g_pe_ctrl;
+
+void mmio_pe_finish(void) {
+    g_pe_ctrl |= PE_FINISH_INT;
+}
+
+void mmio_pe_token(u16 token, bool interrupt) {
+    set16(PE_TOKEN, token);
+    if (interrupt)
+        g_pe_ctrl |= PE_TOKEN_INT;
 }
 
 /* ----------------------------------------------------------------- AI --- */
@@ -272,6 +315,10 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         value = mmio_pi_cause();
     else if (off == AI + 0x08u && size == 4)
         value = ai_sample_count(cpu);
+    else if (off == 0x0000u && size == 2)
+        value = 0x000Cu;                   /* CP status: FIFO read and command processing idle */
+    else if (off == PE_INTRCTRL && size == 2)
+        value = g_pe_ctrl;
     else if (!(off >= DSP && off < DSP + 0x200 && dsp_read(off, size, &value)))
         value = reg_get(off, size);
     g_last_read_addr = ea;
@@ -292,8 +339,10 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
     if (d)
         d->writes++;
 
-    if (d && strcmp(d->name, "WGPIPE") == 0)
-        return; /* graphics commands: ignored until the GX layer exists */
+    if (d && strcmp(d->name, "WGPIPE") == 0) {
+        gx_fifo_write(cpu, value, size);   /* graphics command stream */
+        return;
+    }
     log_access(true, ea, value, size);
 
     if (off >= DSP && off < DSP + 0x200) {
@@ -304,6 +353,12 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
         return;
     if (off == AI && size == 4) {
         ai_write_control(cpu, value);
+        return;
+    }
+    if (off == PE_INTRCTRL && size == 2) {
+        /* Enable bits are stored; writing 1 to a status bit acknowledges it. */
+        u16 v = (u16)value;
+        g_pe_ctrl = (u16)((v & 0x3u) | (g_pe_ctrl & 0xCu & ~(v & 0xCu)));
         return;
     }
     reg_set(off, value, size);
@@ -332,6 +387,10 @@ u32 mmio_pi_cause(void) {
     }
     if (dsp_interrupt_pending())
         cause |= PI_INT_DSP;
+    if ((g_pe_ctrl & PE_TOKEN_INT) && (g_pe_ctrl & PE_TOKEN_EN))
+        cause |= 0x00000200u;   /* PE token */
+    if ((g_pe_ctrl & PE_FINISH_INT) && (g_pe_ctrl & PE_FINISH_EN))
+        cause |= 0x00000400u;   /* PE finish */
     return cause;
 }
 

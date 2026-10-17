@@ -16,4 +16,8 @@ u32 mmio_pi_cause(void);         /* PI interrupt cause register, from device sta
 u32 mmio_pi_mask(void);          /* PI interrupt mask register */
 void mmio_vi_raise(u32 which);   /* assert VI display interrupt DI0-DI3 */
 
+/* Pixel-engine events from the graphics command stream. */
+void mmio_pe_finish(void);
+void mmio_pe_token(u16 token, bool interrupt);
+
 #endif
