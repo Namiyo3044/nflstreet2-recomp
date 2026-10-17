@@ -590,10 +590,36 @@ static void log_access(bool write, u32 addr, u32 value, u8 size) {
            size * 2, value);
 }
 
+/* Virtual memory window at 0x7E000000-0x7FFFFFFF. The game places its
+   database heap here (0x104000 bytes at 0x7E000000, set up in fn_800246C0)
+   and maps it with the CPU's address translation; we simply back the whole
+   window with its own host memory, as Dolphin does ("fake VMEM"). */
+#define VMEM_BASE 0x7E000000u
+#define VMEM_SIZE 0x02000000u
+static u8* g_vmem;
+static unsigned long long g_vmem_reads, g_vmem_writes, g_unmapped;
+
+static bool in_vmem(u32 ea, u8 size) {
+    return ea >= VMEM_BASE && ea - VMEM_BASE <= VMEM_SIZE - size;
+}
+
+static void warn_unmapped(const char* what, u32 ea, u8 size, u32 pc) {
+    if (g_unmapped++ < 16)
+        fprintf(stderr, "warn: %s%u %s unmapped 0x%08X (pc 0x%08X)\n", what, size * 8,
+                what[0] == 'r' ? "from" : "to", ea, pc);
+}
+
 static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
-    (void)cpu;
+    if (in_vmem(ea, size)) {
+        const u8* p = g_vmem + (ea - VMEM_BASE);
+        u64 v = 0;
+        for (u8 i = 0; i < size; i++)
+            v = (v << 8) | p[i];
+        g_vmem_reads++;
+        return v;
+    }
     if ((ea & 0xFFFF0000u) != MMIO_BASE) {
-        fprintf(stderr, "warn: read%u from unmapped 0x%08X (pc 0x%08X)\n", size * 8, ea, cpu->pc);
+        warn_unmapped("read", ea, size, cpu->pc);
         return 0;
     }
     u32 off = ea - MMIO_BASE;
@@ -625,8 +651,17 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
 
 static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
     u32 value = (u32)value64;
+    if (in_vmem(ea, size)) {
+        u8* p = g_vmem + (ea - VMEM_BASE);
+        for (int i = size - 1; i >= 0; i--) {
+            p[i] = (u8)value64;
+            value64 >>= 8;
+        }
+        g_vmem_writes++;
+        return;
+    }
     if ((ea & 0xFFFF0000u) != MMIO_BASE) {
-        fprintf(stderr, "warn: write%u to unmapped 0x%08X (pc 0x%08X)\n", size * 8, ea, cpu->pc);
+        warn_unmapped("write", ea, size, cpu->pc);
         return;
     }
     u32 off = ea - MMIO_BASE;
@@ -720,6 +755,8 @@ void mmio_install(CPUState* cpu) {
     memset(g_regs, 0, sizeof(g_regs));
     if (!g_aram)
         g_aram = (u8*)calloc(1, ARAM_SIZE);
+    if (!g_vmem)
+        g_vmem = (u8*)calloc(1, VMEM_SIZE);
     set16(DSP + 0x0A, DSP_CSR_HALT);
     cpu->external_read = external_read;
     cpu->external_write = external_write;
@@ -727,6 +764,8 @@ void mmio_install(CPUState* cpu) {
 
 void mmio_report(void) {
     printf("audio: %llu AI DMA buffers played, %llu AX frames\n", g_ai_dma_blocks, g_ax_frames);
+    printf("memory: virtual window 0x7E000000 r%llu/w%llu, unmapped accesses %llu\n",
+           g_vmem_reads, g_vmem_writes, g_unmapped);
     printf("hardware register accesses:");
     for (size_t i = 0; i < sizeof(g_devices) / sizeof(g_devices[0]); i++)
         if (g_devices[i].reads || g_devices[i].writes)

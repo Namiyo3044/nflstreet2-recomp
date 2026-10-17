@@ -146,6 +146,7 @@ static void usage(const char* argv0) {
             "usage: %s <disc folder> [--map main.map] [--max-steps N] [--quiet] [--skip-hash]\n"
             "         [--dump-every N (default 60, 0 = off)] [--dump-dir DIR (default frames)]\n"
             "         [--press SECONDS:BUTTON[+BUTTON][@HOLD]]...  e.g. --press 5.5:A --press 7:DOWN@0.2\n"
+            "         [--stop-at SECONDS (stop at this much game time)]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -157,6 +158,7 @@ int main(int argc, char** argv) {
     bool skip_hash = false;
     const char* dump_dir = "frames";
     u32 dump_every = 60;
+    double stop_at = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--map") == 0 && i + 1 < argc) {
@@ -175,6 +177,8 @@ int main(int argc, char** argv) {
                         argv[i], pad_button_names());
                 return 2;
             }
+        } else if (strcmp(argv[i], "--stop-at") == 0 && i + 1 < argc) {
+            stop_at = strtod(argv[++i], NULL);
         } else if (strcmp(argv[i], "--skip-hash") == 0) {
             skip_hash = true;
         } else if (argv[i][0] != '-' && !disc_dir) {
@@ -223,7 +227,8 @@ int main(int argc, char** argv) {
     unsigned long long steps = 0;
     while (steps < max_steps) {
         u32 pc = cpu.pc;
-        g_profiling = g_profile && steps + PROFILE_STEPS >= max_steps;
+        g_profiling = g_profile && (steps + PROFILE_STEPS >= max_steps ||
+                                    (stop_at > 0 && interrupts_game_seconds() >= stop_at - 1.0));
         cpu.downcount = 0;
         if (!dolrecomp_call(&cpu, pc)) {
             reason = "no recompiled code at this address";
@@ -240,6 +245,10 @@ int main(int argc, char** argv) {
             break;
         }
         interrupts_poll(&cpu);
+        if (stop_at > 0 && (steps & 0xFFFu) == 0 && interrupts_game_seconds() >= stop_at) {
+            reason = "game time limit reached";
+            break;
+        }
     }
 
     double secs = (double)(clock() - started) / CLOCKS_PER_SEC;
