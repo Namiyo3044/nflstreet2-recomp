@@ -12,3 +12,6 @@
 /out/
 .vs/
 *.user
+
+# Run logs
+/run*.txt
