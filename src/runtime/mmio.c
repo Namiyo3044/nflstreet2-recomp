@@ -1,5 +1,6 @@
 #include "mmio.h"
 #include "gx/fifo.h"
+#include "runtime/disc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -239,6 +240,126 @@ void mmio_pe_token(u16 token, bool interrupt) {
         g_pe_ctrl |= PE_TOKEN_INT;
 }
 
+/* ----------------------------------------------------------------- DI --- */
+/* Disc interface: commands complete instantly, reading from the virtual disc
+   built from the extracted disc folder (runtime/disc.c). */
+#define DI 0x6000u
+#define DI_SR     (DI + 0x00)   /* status: masks and interrupt flags */
+#define DI_CVR    (DI + 0x04)   /* cover */
+#define DI_CMD0   (DI + 0x08)
+#define DI_CMD1   (DI + 0x0C)
+#define DI_CMD2   (DI + 0x10)
+#define DI_MAR    (DI + 0x14)   /* DMA address in main RAM */
+#define DI_LENGTH (DI + 0x18)
+#define DI_CR     (DI + 0x1C)   /* control: start, DMA, read/write */
+#define DI_IMMBUF (DI + 0x20)
+#define DI_SR_DEINTMASK 0x02u
+#define DI_SR_DEINT     0x04u
+#define DI_SR_TCINTMASK 0x08u
+#define DI_SR_TCINT     0x10u
+#define DI_SR_BRKINTMASK 0x20u
+#define DI_SR_BRKINT    0x40u
+
+static u32 g_di_sr, g_di_cvr;
+static unsigned g_di_logged;
+
+static bool di_interrupt_pending(void) {
+    return ((g_di_sr & DI_SR_TCINT) && (g_di_sr & DI_SR_TCINTMASK)) ||
+           ((g_di_sr & DI_SR_DEINT) && (g_di_sr & DI_SR_DEINTMASK)) ||
+           ((g_di_sr & DI_SR_BRKINT) && (g_di_sr & DI_SR_BRKINTMASK)) ||
+           ((g_di_cvr & 0x4u) && (g_di_cvr & 0x2u));
+}
+
+static void di_execute(CPUState* cpu) {
+    u32 cmd0 = reg_get(DI_CMD0, 4);
+    u32 cmd = cmd0 >> 24;
+    u32 cr = reg_get(DI_CR, 4);
+    bool dma = (cr & 2u) != 0;
+    u32 mar = reg_get(DI_MAR, 4) & 0x01FFFFE0u;
+    u32 len = reg_get(DI_LENGTH, 4);
+
+    switch (cmd) {
+    case 0xA8: {   /* read: offset in 4-byte units, length in bytes */
+        u64 offset = (u64)reg_get(DI_CMD1, 4) << 2;
+        u32 n = reg_get(DI_CMD2, 4);
+        if (g_di_logged < 64) {
+            g_di_logged++;
+            printf("  disc read 0x%09llX +0x%X -> 0x%08X\n", (unsigned long long)offset, n,
+                   0x80000000u | mar);
+        }
+        if (dma) {
+            if (mar + n <= cpu->ram_size)
+                disc_read(offset, cpu->ram + mar, n);
+            set16(DI_LENGTH, 0);
+            reg_set(DI_LENGTH, 0, 4);
+        } else {
+            u8 word[4];
+            disc_read(offset, word, 4);
+            reg_set(DI_IMMBUF, ((u32)word[0] << 24) | ((u32)word[1] << 16) | ((u32)word[2] << 8) | word[3], 4);
+        }
+        break;
+    }
+    case 0x12: {   /* inquiry: drive information */
+        if (dma && mar + 0x20 <= cpu->ram_size) {
+            memset(cpu->ram + mar, 0, 0x20);
+            cpu->ram[mar + 3] = 0x02;              /* revision */
+            cpu->ram[mar + 4] = 0x20; cpu->ram[mar + 5] = 0x02;
+            cpu->ram[mar + 6] = 0x04; cpu->ram[mar + 7] = 0x02;
+            reg_set(DI_LENGTH, 0, 4);
+        }
+        break;
+    }
+    case 0xE0:     /* request error: no error */
+        reg_set(DI_IMMBUF, 0, 4);
+        break;
+    case 0xAB:     /* seek */
+    case 0xE1:     /* audio stream play */
+    case 0xE2:     /* audio stream status */
+    case 0xE3:     /* stop motor */
+    case 0xE4:     /* audio buffer config */
+        reg_set(DI_IMMBUF, 0, 4);
+        break;
+    default:
+        if (g_di_logged < 64) {
+            g_di_logged++;
+            printf("  disc: unhandled command 0x%08X\n", cmd0);
+        }
+        reg_set(DI_IMMBUF, 0, 4);
+        break;
+    }
+    (void)len;
+    reg_set(DI_CR, cr & ~1u, 4);      /* transfer finished */
+    g_di_sr |= DI_SR_TCINT;
+}
+
+static bool di_read(u32 off, u8 size, u32* out) {
+    if (off == DI_SR && size == 4) { *out = g_di_sr; return true; }
+    if (off == DI_CVR && size == 4) { *out = g_di_cvr; return true; }  /* cover closed */
+    return false;
+}
+
+static bool di_write(CPUState* cpu, u32 off, u32 value, u8 size) {
+    if (off == DI_SR && size == 4) {
+        u32 masks = value & (DI_SR_DEINTMASK | DI_SR_TCINTMASK | DI_SR_BRKINTMASK);
+        u32 flags = g_di_sr & (DI_SR_DEINT | DI_SR_TCINT | DI_SR_BRKINT);
+        flags &= ~(value & (DI_SR_DEINT | DI_SR_TCINT | DI_SR_BRKINT));   /* write 1 to clear */
+        g_di_sr = masks | flags;
+        return true;
+    }
+    if (off == DI_CVR && size == 4) {
+        u32 flags = (g_di_cvr & 0x4u) & ~(value & 0x4u);
+        g_di_cvr = (value & 0x2u) | flags;
+        return true;
+    }
+    if (off == DI_CR && size == 4) {
+        reg_set(off, value, 4);
+        if (value & 1u)
+            di_execute(cpu);
+        return true;
+    }
+    return false;
+}
+
 /* ----------------------------------------------------------------- AI --- */
 /* Audio streaming interface. Only the sample counter matters for now: while
    streaming is on it advances at 32 or 48 kHz of game time, which AIInit
@@ -315,6 +436,8 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         value = mmio_pi_cause();
     else if (off == AI + 0x08u && size == 4)
         value = ai_sample_count(cpu);
+    else if (off >= DI && off < DI + 0x40 && di_read(off, size, &value))
+        ;
     else if (off == 0x0000u && size == 2)
         value = 0x000Cu;                   /* CP status: FIFO read and command processing idle */
     else if (off == PE_INTRCTRL && size == 2)
@@ -355,6 +478,8 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
         ai_write_control(cpu, value);
         return;
     }
+    if (off >= DI && off < DI + 0x40 && di_write(cpu, off, value, size))
+        return;
     if (off == PE_INTRCTRL && size == 2) {
         /* Enable bits are stored; writing 1 to a status bit acknowledges it. */
         u16 v = (u16)value;
@@ -387,6 +512,8 @@ u32 mmio_pi_cause(void) {
     }
     if (dsp_interrupt_pending())
         cause |= PI_INT_DSP;
+    if (di_interrupt_pending())
+        cause |= 0x00000004u;   /* DI */
     if ((g_pe_ctrl & PE_TOKEN_INT) && (g_pe_ctrl & PE_TOKEN_EN))
         cause |= 0x00000200u;   /* PE token */
     if ((g_pe_ctrl & PE_FINISH_INT) && (g_pe_ctrl & PE_FINISH_EN))

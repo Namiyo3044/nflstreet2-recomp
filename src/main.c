@@ -5,6 +5,7 @@
  * why. Nothing is drawn yet; this proves the CPU side works end to end.
  */
 #include "generated.h"
+#include "runtime/disc.h"
 #include "runtime/dol.h"
 #include "runtime/hle_cpu.h"
 #include "runtime/hle_exceptions.h"
@@ -110,6 +111,8 @@ int main(int argc, char** argv) {
         return 1;
     if (!boot_globals_init(&cpu, disc_dir))
         return 1;
+    if (!disc_open(disc_dir) || !boot_place_fst(&cpu))
+        return 1;
 
     /* State the IPL leaves behind: translation and FP on, paired singles enabled. */
     cpu.msr = 0x00002032u;
@@ -157,6 +160,7 @@ int main(int argc, char** argv) {
     hle_exceptions_report();
     interrupts_report();
     gx_fifo_report();
+    disc_report();
     hle_cpu_report();
     mmio_report();
     cpu_free(&cpu);

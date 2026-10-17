@@ -1,5 +1,6 @@
 #include "dol.h"
 #include "sha1.h"
+#include "disc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,7 +128,23 @@ bool boot_globals_init(CPUState* cpu, const char* disc_dir) {
     put32(cpu, 0x800000F0, GC_MAIN_RAM_SIZE);    /* simulated memory size */
     put32(cpu, 0x800000F8, 162000000u);          /* bus clock */
     put32(cpu, 0x800000FC, 486000000u);          /* CPU clock */
-    /* Arena bounds (0x80000030/0x80000034) stay 0 so OSInit uses the DOL's own.
-       FST location (0x80000038) is filled when disc reads are implemented. */
+    /* Arena low (0x80000030) stays 0 so OSInit uses the DOL's own; arena high
+       and the FST location are set by boot_place_fst. */
+    return true;
+}
+
+bool boot_place_fst(CPUState* cpu) {
+    size_t size = 0;
+    const u8* fst = disc_fst(&size);
+    if (!fst || !size)
+        return false;
+    /* Where the apploader puts it: at the very top of main RAM. The OS arena
+       ends just below it so the game's heap never overwrites it. */
+    u32 addr = (GC_RAM_BASE + GC_MAIN_RAM_SIZE - (u32)size) & ~31u;
+    copy_to_guest(cpu, addr, fst, (u32)size);
+    put32(cpu, 0x80000034, addr);           /* arena high */
+    put32(cpu, 0x80000038, addr);           /* FST location */
+    put32(cpu, 0x8000003C, (u32)size);      /* FST max size */
+    printf("file table loaded at 0x%08X (%u bytes)\n", addr, (u32)size);
     return true;
 }

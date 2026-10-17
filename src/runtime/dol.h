@@ -13,4 +13,8 @@ u32 dol_load(CPUState* cpu, const char* disc_dir, bool skip_hash);
    (disc ID, memory size, console type, clock speeds). */
 bool boot_globals_init(CPUState* cpu, const char* disc_dir);
 
+/* Copies the disc's file table to the top of RAM and points the OS at it,
+   as the apploader does. Call after disc_open. */
+bool boot_place_fst(CPUState* cpu);
+
 #endif
