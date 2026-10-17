@@ -55,6 +55,7 @@ typedef struct {
     bool has_color[2];
     float tc[8][2];              /* texture coordinates as given */
     bool has_tc[8];
+    float nrm[3];                /* normal as given (0,0,1 if none) */
 } Vtx;
 
 static u32 rd16(const u8* p) { return ((u32)p[0] << 8) | p[1]; }
@@ -140,13 +141,25 @@ static u32 decode_vertex(CPUState* cpu, u32 vat, const u8* p, Vtx* v) {
                 v->pos[k] = read_comp(d + k * cs, fmt, shift);
     }
 
+    v->nrm[2] = 1.0f;
     u32 nrm = (lo >> 11) & 3u;
-    if (nrm) {   /* normals: stepped over (lighting is approximated) */
+    if (nrm) {   /* normal (and binormal/tangent, which are skipped); s8 has 6 and s16 14 fraction bits */
         bool nbt = (a >> 9) & 1u, index3 = (a >> 31) & 1u;
-        if (nrm == 1)
-            p += (nbt ? 9u : 3u) * comp_size((a >> 10) & 7u);
-        else
-            p += ((nbt && index3) ? 3u : 1u) * (nrm == 2 ? 1u : 2u);
+        u32 fmt = (a >> 10) & 7u, cs = comp_size(fmt);
+        u32 shift = cs == 1 ? 6u : cs == 2 ? 14u : 0u;
+        const u8* d = NULL;
+        if (nrm == 1) {
+            d = p;
+            p += (nbt ? 9u : 3u) * cs;
+        } else {
+            u32 n_idx = (nbt && index3) ? 3u : 1u, isz = nrm == 2 ? 1u : 2u;
+            u32 idx = nrm == 2 ? *p : rd16(p);
+            d = array_elem(cpu, 1, idx, 3 * cs);
+            p += n_idx * isz;
+        }
+        if (d)
+            for (u32 k = 0; k < 3; k++)
+                v->nrm[k] = read_comp(d + k * cs, fmt, shift);
     }
 
     for (u32 ch = 0; ch < 2; ch++) {
@@ -202,34 +215,87 @@ static void unpack(u32 rgba, float out[4]) {
     out[3] = (float)(rgba & 255) / 255.0f;
 }
 
-/* Lighting channel: material colour (register or vertex), optionally lit.
-   Lights aren't computed yet: a lit channel gets ambient plus a fixed
-   diffuse term, so lit models are visible without being exactly shaded. */
-static void channel(const Vtx* v, u32 ch, float out[4]) {
+/* Lighting channel (XF 0x100E/0x1010 + ch): material colour from its
+   register or the vertex colour; if lighting is on, it is multiplied by
+   ambient (register or vertex colour) plus the enabled lights, each with
+   its colour, diffuse function and attenuation, as the transform unit does.
+   pos / nrm are the vertex position and normal in view space. Light n lives
+   at XF 0x600 + 16n: colour +3, cos attenuation +4..6, distance attenuation
+   +7..9, position +10..12, direction +13..15. */
+static void light_sum(u32 ctrl, const float pos[3], const float nrm[3], float lit[4], bool alpha) {
+    u32 mask = ((ctrl >> 2) & 0xFu) | (((ctrl >> 11) & 0xFu) << 4);
+    u32 diff_fn = (ctrl >> 7) & 3u, attn_fn = (ctrl >> 9) & 3u;
+    for (u32 n = 0; n < 8; n++) {
+        if (!(mask & (1u << n)))
+            continue;
+        const u32* L = &gx_xf_mem[0x600u + n * 16u];
+        u32 c = L[3];
+        float col[4] = {(float)(c >> 24) / 255.0f, (float)((c >> 16) & 255) / 255.0f,
+                        (float)((c >> 8) & 255) / 255.0f, (float)(c & 255) / 255.0f};
+        float lp[3] = {gx_f32(L[10]), gx_f32(L[11]), gx_f32(L[12])};
+        float ld[3] = {gx_f32(L[13]), gx_f32(L[14]), gx_f32(L[15])};
+        float ldir[3], attn = 1.0f;
+        if (attn_fn == 0) {               /* specular */
+            float len = sqrtf(lp[0] * lp[0] + lp[1] * lp[1] + lp[2] * lp[2]);
+            for (int k = 0; k < 3; k++) ldir[k] = len > 1e-9f ? lp[k] / len : 0.0f;
+            float nd = nrm[0] * ldir[0] + nrm[1] * ldir[1] + nrm[2] * ldir[2];
+            float h = nd >= 0.0f ? fmaxf(0.0f, nrm[0] * ld[0] + nrm[1] * ld[1] + nrm[2] * ld[2]) : 0.0f;
+            float num = gx_f32(L[4]) + gx_f32(L[5]) * h + gx_f32(L[6]) * h * h;
+            float den = gx_f32(L[7]) + gx_f32(L[8]) * h + gx_f32(L[9]) * h * h;
+            attn = fabsf(den) > 1e-9f ? fmaxf(0.0f, num) / den : 0.0f;
+        } else {
+            float v[3] = {lp[0] - pos[0], lp[1] - pos[1], lp[2] - pos[2]};
+            float d2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2], d = sqrtf(d2);
+            for (int k = 0; k < 3; k++) ldir[k] = d > 1e-9f ? v[k] / d : 0.0f;
+            if (attn_fn == 1) {           /* spot */
+                float cs = fmaxf(0.0f, ldir[0] * ld[0] + ldir[1] * ld[1] + ldir[2] * ld[2]);
+                float num = gx_f32(L[4]) + gx_f32(L[5]) * cs + gx_f32(L[6]) * cs * cs;
+                float den = gx_f32(L[7]) + gx_f32(L[8]) * d + gx_f32(L[9]) * d2;
+                attn = fabsf(den) > 1e-9f ? fmaxf(0.0f, num) / den : 0.0f;
+            }
+        }
+        float dif = 1.0f;
+        if (diff_fn != 0) {
+            float nd = nrm[0] * ldir[0] + nrm[1] * ldir[1] + nrm[2] * ldir[2];
+            dif = diff_fn == 1 ? nd : fmaxf(0.0f, nd);
+        }
+        float f = dif * attn;
+        if (alpha) {
+            lit[3] += col[3] * f;
+        } else {
+            for (int k = 0; k < 3; k++) lit[k] += col[k] * f;
+        }
+    }
+}
+
+static void channel(const Vtx* v, u32 ch, const float pos[3], const float nrm[3], float out[4]) {
     u32 cctrl = gx_xf_reg[0x0E + ch], actrl = gx_xf_reg[0x10 + ch];
-    float mat_c[4], mat_a[4], amb[4], vc[4];
-    unpack(gx_xf_reg[0x0C + ch], mat_c);
-    unpack(gx_xf_reg[0x0C + ch], mat_a);
+    float mat[4], amb[4], vc[4];
+    unpack(gx_xf_reg[0x0C + ch], mat);
     unpack(gx_xf_reg[0x0A + ch], amb);
     unpack(v->has_color[ch] ? v->color[ch] : 0xFFFFFFFFu, vc);
-    if (cctrl & 1u) memcpy(mat_c, vc, sizeof(vc));
-    if (actrl & 1u) mat_a[3] = vc[3];
 
-    for (u32 k = 0; k < 3; k++) {
-        float m = mat_c[k];
-        if (cctrl & 2u) {
-            float am = (cctrl & 0x40u) ? vc[k] : amb[k];
-            float lit = (cctrl & 0x783Cu) ? 0.75f : 0.0f;   /* any of lights 0-7 enabled */
-            m *= clamp01(am + lit);
-        }
-        out[k] = m;
+    /* colour */
+    float m[4];
+    memcpy(m, (cctrl & 1u) ? vc : mat, sizeof(m));
+    if (cctrl & 2u) {
+        float lit[4];
+        memcpy(lit, (cctrl & 0x40u) ? vc : amb, sizeof(lit));
+        light_sum(cctrl, pos, nrm, lit, false);
+        for (int k = 0; k < 3; k++) out[k] = m[k] * clamp01(lit[k]);
+    } else {
+        for (int k = 0; k < 3; k++) out[k] = m[k];
     }
-    float am = mat_a[3];
+    /* alpha */
+    float ma = (actrl & 1u) ? vc[3] : mat[3];
     if (actrl & 2u) {
-        float aa = (actrl & 0x40u) ? vc[3] : amb[3];
-        am *= clamp01(aa + 0.75f);
+        float lit[4];
+        lit[3] = (actrl & 0x40u) ? vc[3] : amb[3];
+        light_sum(actrl, pos, nrm, lit, true);
+        out[3] = ma * clamp01(lit[3]);
+    } else {
+        out[3] = ma;
     }
-    out[3] = am;
 }
 
 /* Texture coordinate generation (XF 0x1040+i): regular texgens multiply the
@@ -305,8 +371,20 @@ static void transform(const Vtx* in, SVtx* out) {
     out->y = cy * out->inv_w * gx_f32(vp[1]) + gx_f32(vp[4]) - 342.0f;
     out->z = cz * out->inv_w * gx_f32(vp[2]) + gx_f32(vp[5]);
 
-    channel(in, 0, out->col[0]);
-    channel(in, 1, out->col[1]);
+    /* View-space position and normal for lighting. The normal matrix rows
+       for position matrix row r start at XF 0x400 + 3r (three floats each). */
+    float vpos[3] = {ex, ey, ez}, vn[3] = {0.0f, 0.0f, 1.0f};
+    bool lit = ((gx_xf_reg[0x0E] | gx_xf_reg[0x0F] | gx_xf_reg[0x10] | gx_xf_reg[0x11]) & 2u) != 0;
+    if (lit) {
+        const u32* nm = &gx_xf_mem[0x400u + (in->pos_mtx & 31u) * 3u];
+        for (int r = 0; r < 3; r++)
+            vn[r] = gx_f32(nm[r * 3]) * in->nrm[0] + gx_f32(nm[r * 3 + 1]) * in->nrm[1] + gx_f32(nm[r * 3 + 2]) * in->nrm[2];
+        float len = sqrtf(vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2]);
+        if (len > 1e-9f) { vn[0] /= len; vn[1] /= len; vn[2] /= len; }
+        else { vn[0] = 0.0f; vn[1] = 0.0f; vn[2] = 1.0f; }
+    }
+    channel(in, 0, vpos, vn, out->col[0]);
+    channel(in, 1, vpos, vn, out->col[1]);
     u32 ntex = gx_xf_reg[0x3F] & 15u;
     for (u32 i = 0; i < MAX_TC; i++) {
         if (i < ntex)
