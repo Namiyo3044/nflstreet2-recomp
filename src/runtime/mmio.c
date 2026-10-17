@@ -124,6 +124,42 @@ static bool dsp_read(u32 off, u8 size, u32* out) {
     }
 }
 
+/* The DSP's side of the mail protocol. There is no DSP program running, so
+   this answers the way the DSP ROM and a freshly started task would:
+   - after reset the first boot runs the OS's tiny init program, which reports
+     0x80544348; every later boot is the ROM, which reports 0x8071FEED;
+   - __DSP_boot_task then sends the task's load parameters, ending with
+     0x80F3D001 and the entry point; the task starts and reports 0xDCD10000
+     ("task initialised") with a DSP interrupt, which runs the task's init
+     callback in the game (for AX, the audio library). */
+static bool g_dsp_booted_once;
+static u32 g_dsp_cpu_mail_hi;
+static u32 g_dsp_prev_mail;
+static unsigned g_dsp_mail_log;
+
+static void dsp_send_to_cpu(u32 mail, bool interrupt) {
+    g_dsp_mail = mail;
+    g_dsp_mail_valid = true;
+    if (interrupt)
+        g_dsp_csr |= DSP_CSR_DSPINT;
+    if (g_dsp_mail_log < 64) {
+        g_dsp_mail_log++;
+        printf("  dsp mail -> cpu 0x%08X%s\n", mail, interrupt ? " (interrupt)" : "");
+    }
+}
+
+static void dsp_receive_mail(u32 mail) {
+    if (g_dsp_mail_log < 64) {
+        g_dsp_mail_log++;
+        printf("  dsp mail <- cpu 0x%08X\n", mail);
+    }
+    if (g_dsp_prev_mail == 0x80F3D001u) {
+        /* That was the task's entry point: the task is now running. */
+        dsp_send_to_cpu(0xDCD10000u, true);
+    }
+    g_dsp_prev_mail = mail;
+}
+
 static bool dsp_write(CPUState* cpu, u32 off, u32 value, u8 size) {
     u32 r = off - DSP;
     if (r == 0x0A && size == 2) {
@@ -133,16 +169,64 @@ static bool dsp_write(CPUState* cpu, u32 off, u32 value, u8 size) {
         u16 ints = (u16)(g_dsp_csr & DSP_CSR_W1C & ~(v & DSP_CSR_W1C));
         g_dsp_csr = (u16)(keep | ints);
         if (was_halted && !(g_dsp_csr & DSP_CSR_HALT)) {
-            /* The DSP ROM boots and reports in; the OS checks for this mail. */
-            g_dsp_mail = 0x80544348u;
-            g_dsp_mail_valid = true;
+            dsp_send_to_cpu(g_dsp_booted_once ? 0x8071FEEDu : 0x80544348u, false);
+            g_dsp_booted_once = true;
         }
+        return true;
+    }
+    /* CPU -> DSP mailbox: the mail is complete once the low half is written. */
+    if (r == 0x00 && size == 4) {
+        reg_set(off, value, 4);
+        dsp_receive_mail(value);
+        return true;
+    }
+    if (r == 0x00 && size == 2) {
+        reg_set(off, value, 2);
+        g_dsp_cpu_mail_hi = value & 0xFFFFu;
+        return true;
+    }
+    if (r == 0x02 && size == 2) {
+        reg_set(off, value, 2);
+        dsp_receive_mail((g_dsp_cpu_mail_hi << 16) | (value & 0xFFFFu));
         return true;
     }
     reg_set(off, value, size);
     if ((r == 0x28 && size == 4) || (r == 0x2A && size == 2))
         aram_dma(cpu);
     return true;
+}
+
+/* ----------------------------------------------------------------- AI --- */
+/* Audio streaming interface. Only the sample counter matters for now: while
+   streaming is on it advances at 32 or 48 kHz of game time, which AIInit
+   times to work out the hardware's sample-rate behaviour. */
+#define AI 0x6C00u
+#define AI_PSTAT   0x01u   /* playing */
+#define AI_AFR     0x02u   /* 1 = 48 kHz, 0 = 32 kHz */
+#define AI_AIINT   0x08u   /* interrupt status, write 1 to clear */
+#define AI_SCRESET 0x20u   /* write 1 to reset the sample counter */
+#define TIMEBASE_HZ 40500000ull
+
+static u64 g_ai_base_tb;
+static u32 g_ai_base_count;
+
+static u32 ai_sample_count(CPUState* cpu) {
+    u32 cr = reg_get(AI, 4);
+    if (!(cr & AI_PSTAT))
+        return g_ai_base_count;
+    u64 rate = (cr & AI_AFR) ? 48000ull : 32000ull;
+    return g_ai_base_count + (u32)((cpu->timebase - g_ai_base_tb) * rate / TIMEBASE_HZ);
+}
+
+static void ai_write_control(CPUState* cpu, u32 value) {
+    u32 count = ai_sample_count(cpu);   /* freeze the count at the old rate */
+    u32 old = reg_get(AI, 4);
+    if (value & AI_SCRESET)
+        count = 0;
+    u32 status = (old & AI_AIINT) & ~(value & AI_AIINT);
+    reg_set(AI, (value & ~(AI_SCRESET | AI_AIINT)) | status, 4);
+    g_ai_base_count = count;
+    g_ai_base_tb = cpu->timebase;
 }
 
 /* ---------------------------------------------------------------- EXI --- */
@@ -186,6 +270,8 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
     u32 value;
     if (off == 0x3000u && size == 4)
         value = mmio_pi_cause();
+    else if (off == AI + 0x08u && size == 4)
+        value = ai_sample_count(cpu);
     else if (!(off >= DSP && off < DSP + 0x200 && dsp_read(off, size, &value)))
         value = reg_get(off, size);
     g_last_read_addr = ea;
@@ -216,6 +302,10 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
     }
     if (off >= 0x6800u && off < 0x6800u + 3 * 0x14u && exi_write(off, value, size))
         return;
+    if (off == AI && size == 4) {
+        ai_write_control(cpu, value);
+        return;
+    }
     reg_set(off, value, size);
 }
 
