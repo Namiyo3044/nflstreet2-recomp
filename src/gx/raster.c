@@ -1009,6 +1009,120 @@ void gx_raster_sync(void) {
     wait_idle();
 }
 
+/* ---------------------------------------------------------- draw log --- */
+/* --draw-log-at: writes every draw of a couple of frames, with the full GPU
+   setup each one uses, to drawlog.txt. For finding rendering bugs. */
+static double g_dlog_at = -1.0;
+static int g_dlog_frames;              /* frames still to log once started */
+static FILE* g_dlog;
+static u32 g_dlog_draws;
+
+void gx_raster_draw_log(double at_seconds, int frames) {
+    g_dlog_at = at_seconds;
+    g_dlog_frames = frames;
+}
+
+static const char* const k_csel[16] = {"PREV.rgb", "PREV.a", "REG0.rgb", "REG0.a", "REG1.rgb", "REG1.a",
+                                       "REG2.rgb", "REG2.a", "TEX.rgb", "TEX.a", "RAS.rgb", "RAS.a",
+                                       "1", "0.5", "KONST", "0"};
+static const char* const k_asel[8] = {"PREV.a", "REG0.a", "REG1.a", "REG2.a", "TEX.a", "RAS.a", "KONST", "0"};
+static const char* const k_dst[4] = {"PREV", "REG0", "REG1", "REG2"};
+static const char* const k_fmt[16] = {"I4", "I8", "IA4", "IA8", "RGB565", "RGB5A3", "RGBA8", "?7",
+                                      "C4", "C8", "C14X2", "?11", "?12", "?13", "CMPR", "?15"};
+static const char* const k_blend[8] = {"0", "1", "SRCCLR", "1-SRCCLR", "SRCA", "1-SRCA", "DSTA", "1-DSTA"};
+static const char* const k_cmp[8] = {"never", "<", "==", "<=", ">", "!=", ">=", "always"};
+
+static void dlog_op(FILE* f, u32 op, bool color) {
+    u32 bias = (op >> 16) & 3u, sub = (op >> 18) & 1u, clamp = (op >> 19) & 1u, scale = (op >> 20) & 3u;
+    static const char* const k_bias[4] = {"", " +0.5", " -0.5", " COMPARE"};
+    static const char* const k_scale[4] = {"", " x2", " x4", " x0.5"};
+    if (color) {
+        fprintf(f, "%s = %s %c lerp(%s, %s, %s)%s%s%s", k_dst[(op >> 22) & 3u], k_csel[op & 15u], sub ? '-' : '+',
+                k_csel[(op >> 12) & 15u], k_csel[(op >> 8) & 15u], k_csel[(op >> 4) & 15u], k_bias[bias], k_scale[scale],
+                clamp ? "" : " (no clamp)");
+    } else {
+        fprintf(f, "%s.a = %s %c lerp(%s, %s, %s)%s%s%s  swap ras%u tex%u", k_dst[(op >> 22) & 3u], k_asel[(op >> 4) & 7u],
+                sub ? '-' : '+', k_asel[(op >> 13) & 7u], k_asel[(op >> 10) & 7u], k_asel[(op >> 7) & 7u], k_bias[bias],
+                k_scale[scale], clamp ? "" : " (no clamp)", op & 3u, (op >> 2) & 3u);
+    }
+    if (bias == 3)
+        fprintf(f, " [compare mode %u]", ((op >> 20) & 3u) | (sub << 2));
+}
+
+static void dlog_draw(u8 prim, u32 count, const SVtx* first) {
+    if (!g_dlog) {
+        g_dlog = fopen("drawlog.txt", "w");
+        if (!g_dlog) { g_dlog_frames = 0; return; }
+        fprintf(g_dlog, "draw log from %.2f s of game time, frame %u\n", interrupts_game_seconds(), g_frames + 1);
+    }
+    FILE* f = g_dlog;
+    g_dlog_draws++;
+    fprintf(f, "\n#%u frame %u prim 0x%02X count %u\n", g_dlog_draws, g_frames + 1, prim, count);
+    u32 stages = ((gx_bp[0x00] >> 10) & 15u) + 1;
+    fprintf(f, "  genmode 0x%06X (tev stages %u, texgens %u, chans %u, cull %u)  pe_control 0x%06X (pixel format %u)\n",
+            gx_bp[0x00], stages, gx_bp[0x00] & 15u, (gx_bp[0x00] >> 4) & 7u, (gx_bp[0x00] >> 14) & 3u, gx_bp[0x43],
+            gx_bp[0x43] & 7u);
+    u32 cm = gx_bp[0x41];
+    fprintf(f, "  blend: %s  src %s dst %s%s  color%s alpha%s  cmode1 0x%06X  zmode 0x%06X (test %u func %s update %u)\n",
+            (cm & 1u) ? "on" : "off", k_blend[(cm >> 8) & 7u], k_blend[(cm >> 5) & 7u], (cm >> 11) & 1u ? " SUBTRACT" : "",
+            (cm >> 3) & 1u ? "+" : "-", (cm >> 4) & 1u ? "+" : "-", gx_bp[0x42], gx_bp[0x40], gx_bp[0x40] & 1u,
+            k_cmp[(gx_bp[0x40] >> 1) & 7u], (gx_bp[0x40] >> 4) & 1u);
+    u32 at = gx_bp[0xF3];
+    fprintf(f, "  alpha test: a %s %u %s a %s %u\n", k_cmp[(at >> 16) & 7u], at & 255u,
+            ((const char* const[]){"AND", "OR", "XOR", "XNOR"})[(at >> 22) & 3u], k_cmp[(at >> 19) & 7u], (at >> 8) & 255u);
+    fprintf(f, "  regs PREV %d,%d,%d,%d REG0 %d,%d,%d,%d REG1 %d,%d,%d,%d REG2 %d,%d,%d,%d\n",
+            gx_tev_reg[0][0], gx_tev_reg[0][1], gx_tev_reg[0][2], gx_tev_reg[0][3], gx_tev_reg[1][0], gx_tev_reg[1][1],
+            gx_tev_reg[1][2], gx_tev_reg[1][3], gx_tev_reg[2][0], gx_tev_reg[2][1], gx_tev_reg[2][2], gx_tev_reg[2][3],
+            gx_tev_reg[3][0], gx_tev_reg[3][1], gx_tev_reg[3][2], gx_tev_reg[3][3]);
+    fprintf(f, "  konst K0 %u,%u,%u,%u K1 %u,%u,%u,%u K2 %u,%u,%u,%u K3 %u,%u,%u,%u\n",
+            gx_tev_konst[0][0], gx_tev_konst[0][1], gx_tev_konst[0][2], gx_tev_konst[0][3], gx_tev_konst[1][0],
+            gx_tev_konst[1][1], gx_tev_konst[1][2], gx_tev_konst[1][3], gx_tev_konst[2][0], gx_tev_konst[2][1],
+            gx_tev_konst[2][2], gx_tev_konst[2][3], gx_tev_konst[3][0], gx_tev_konst[3][1], gx_tev_konst[3][2],
+            gx_tev_konst[3][3]);
+    fprintf(f, "  swap tables: ");
+    for (u32 t = 0; t < 4; t++) {
+        u32 k0 = gx_bp[0xF6 + t * 2], k1 = gx_bp[0xF7 + t * 2];
+        fprintf(f, "%u=%c%c%c%c ", t, "rgba"[k0 & 3u], "rgba"[(k0 >> 2) & 3u], "rgba"[k1 & 3u], "rgba"[(k1 >> 2) & 3u]);
+    }
+    fprintf(f, "\n  xf: chans %u  ch0 color ctrl 0x%X alpha ctrl 0x%X mat 0x%08X amb 0x%08X | ch1 color 0x%X alpha 0x%X mat 0x%08X amb 0x%08X\n",
+            gx_xf_reg[0x09], gx_xf_reg[0x0E], gx_xf_reg[0x10], gx_xf_reg[0x0C], gx_xf_reg[0x0A], gx_xf_reg[0x0F],
+            gx_xf_reg[0x11], gx_xf_reg[0x0D], gx_xf_reg[0x0B]);
+    for (u32 i = 0; i < stages; i++) {
+        u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
+        u32 ksel = gx_bp[0xF6 + i / 2];
+        u32 kc = (ksel >> ((i & 1) ? 14 : 4)) & 31u, ka = (ksel >> ((i & 1) ? 19 : 9)) & 31u;
+        fprintf(f, "  stage %u: tex %s map %u coord %u, ras chan %u, kcsel 0x%02X kasel 0x%02X\n", i,
+                (order >> 6) & 1u ? "on" : "off", order & 7u, (order >> 3) & 7u, (order >> 7) & 7u, kc, ka);
+        fprintf(f, "    ");
+        dlog_op(f, gx_bp[0xC0 + i * 2], true);
+        fprintf(f, "\n    ");
+        dlog_op(f, gx_bp[0xC1 + i * 2], false);
+        fprintf(f, "\n");
+        if ((order >> 6) & 1u) {
+            u32 map = order & 7u, bank = map < 4 ? 0u : 0x20u, m = map & 3u;
+            u32 img0 = gx_bp[0x88 + bank + m], img3 = gx_bp[0x94 + bank + m], mode0 = gx_bp[0x80 + bank + m];
+            u32 tlut = gx_bp[0x98 + bank + m];
+            fprintf(f, "    texture: %s %ux%u at 0x%08X  wrap %u/%u  filter mag %u min %u  tlut 0x%06X\n",
+                    k_fmt[(img0 >> 20) & 15u], (img0 & 0x3FFu) + 1, ((img0 >> 10) & 0x3FFu) + 1, (img3 << 5) & 0x01FFFFE0u,
+                    mode0 & 3u, (mode0 >> 2) & 3u, (mode0 >> 4) & 1u, (mode0 >> 5) & 7u, tlut);
+        }
+    }
+    if (first)
+        fprintf(f, "  first vertex: screen %.1f,%.1f z %.0f  col0 %.3f,%.3f,%.3f,%.3f  col1 %.3f,%.3f,%.3f,%.3f  tc0 %.3f,%.3f,%.3f\n",
+                first->x, first->y, first->z, first->col[0][0], first->col[0][1], first->col[0][2], first->col[0][3],
+                first->col[1][0], first->col[1][1], first->col[1][2], first->col[1][3], first->tc[0][0], first->tc[0][1],
+                first->tc[0][2]);
+}
+
+static void dlog_frame_end(void) {
+    if (g_dlog && --g_dlog_frames <= 0) {
+        fclose(g_dlog);
+        g_dlog = NULL;
+        g_dlog_at = -1.0;
+        printf("  draw log written to drawlog.txt (%u draws)\n", g_dlog_draws);
+    }
+}
+
 /* ------------------------------------------------------------ record --- */
 void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) {
     if (!gx_raster_active() || count == 0)
@@ -1030,6 +1144,8 @@ void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) 
         p += decode_vertex(cpu, vat, p, &v);
         transform(&v, &sv[i]);
     }
+    if (g_dlog_at >= 0.0 && g_dlog_frames > 0 && interrupts_game_seconds() >= g_dlog_at)
+        dlog_draw(prim, count, &sv[0]);
 
 #define EMIT(i0, i1, i2) do {                                                        \
         const SVtx *a_ = &sv[i0], *b_ = &sv[i1], *c_ = &sv[i2];                      \
@@ -1137,6 +1253,13 @@ void gx_raster_copy(u32 cmd) {
     bool clear = (cmd >> 11) & 1u;
     bool active = gx_raster_active();
 
+    if (g_dlog)
+        fprintf(g_dlog, "\n-- copy cmd 0x%06X (%s%s) src %u,%u %ux%u dest 0x%08X stride %u yscale 0x%03X clear color 0x%06X%04X z 0x%06X\n",
+                cmd, to_xfb ? "to TV buffer" : "to texture", clear ? ", clear" : "", gx_bp[0x49] & 0x3FFu,
+                (gx_bp[0x49] >> 10) & 0x3FFu, (gx_bp[0x4A] & 0x3FFu) + 1, ((gx_bp[0x4A] >> 10) & 0x3FFu) + 1,
+                (gx_bp[0x4B] & 0x00FFFFFFu) << 5, (gx_bp[0x4D] & 0x3FFu) << 5, gx_bp[0x4E] & 0x1FFu, gx_bp[0x4F],
+                gx_bp[0x50] & 0xFFFFu, gx_bp[0x51] & 0xFFFFFFu);
+
     if (active && (to_xfb || clear)) {
         Cmd* c = list_push(&g_lists[g_rec]);
         if (c) {
@@ -1186,6 +1309,7 @@ void gx_raster_copy(u32 cmd) {
             }
             submit();
         }
+        dlog_frame_end();
         g_frames++;
         gx_tex_flush_cache();   /* texture data in RAM may change between frames: re-check */
     }

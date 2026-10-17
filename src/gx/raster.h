@@ -38,6 +38,10 @@ void gx_raster_xfb_field(CPUState* cpu, u64 field, u32 tfbl, u32 picture_cfg, u3
 bool gx_raster_xfb_rgb(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, u32* out, u32 max_w, u32 max_h,
                        u32* out_w, u32* out_h);
 
+/* Writes every draw of `frames` frames, starting at that much game time,
+   with the GPU setup each uses, to drawlog.txt. */
+void gx_raster_draw_log(double at_seconds, int frames);
+
 /* Draw every frame (needed when frames are shown live). */
 void gx_raster_render_all(void);
 

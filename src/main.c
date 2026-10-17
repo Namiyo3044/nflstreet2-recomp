@@ -196,6 +196,7 @@ static void usage(const char* argv0) {
             "         [--trace-at SECONDS (log frame-pacing calls for a few frames from then)]\n"
             "         [--unpaced (let the game draw as many frames per video field as it likes)]\n"
             "         [--render-threads N (threads that draw frames; 0 = draw on the game thread)]\n"
+            "         [--draw-log-at SECONDS (write two frames of draw calls and GPU state to drawlog.txt)]\n"
             "         [--window (play in a window at real-time speed)] [--scale N (window size, default 2)]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
@@ -213,6 +214,7 @@ int main(int argc, char** argv) {
     u32 dump_every = 60;
     double stop_at = 0;
     u32 xfb_every = 0;
+    bool draw_log = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--map") == 0 && i + 1 < argc) {
@@ -236,6 +238,9 @@ int main(int argc, char** argv) {
                         argv[i], pad_button_names());
                 return 2;
             }
+        } else if (strcmp(argv[i], "--draw-log-at") == 0 && i + 1 < argc) {
+            gx_raster_draw_log(strtod(argv[++i], NULL), 2);
+            draw_log = true;
         } else if (strcmp(argv[i], "--render-threads") == 0 && i + 1 < argc) {
             gx_raster_set_threads(atoi(argv[++i]));
         } else if (strcmp(argv[i], "--unpaced") == 0) {
@@ -269,6 +274,8 @@ int main(int argc, char** argv) {
     g_profile = (u32*)calloc(GC_MAIN_RAM_SIZE >> 2, sizeof(u32));
     gx_raster_config(dump_dir, dump_every);
     gx_raster_config_xfb(xfb_every);
+    if (draw_log)
+        gx_raster_render_all();        /* logged frames must be drawn */
     if (want_window) {
 #ifdef NFLS2_HAVE_WINDOW
         if (!window_open(window_scale))

@@ -28,6 +28,9 @@ void mmio_pe_display_copy(void);
 void mmio_pe_field(void);
 void mmio_set_frame_pacing(bool on);
 
+/* The CPU wrote WPAR: reset the write-gather pipe. */
+void mmio_wpar_written(void);
+
 /* Controller polling, once per video field. */
 void mmio_si_field(void);
 

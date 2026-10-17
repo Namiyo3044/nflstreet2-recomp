@@ -1,4 +1,5 @@
 #include "hle_cpu.h"
+#include "runtime/mmio.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -34,6 +35,8 @@ static void spr_write(CPUState* cpu, u16 spr, u32 value, u32 cia) {
         return;
     }
     g_spr[spr & 1023] = value;
+    if (spr == 921)
+        mmio_wpar_written();           /* resets the write-gather pipe */
 }
 
 static void cache_control(CPUState* cpu, u8 operation, u32 ea, u32 cia) {

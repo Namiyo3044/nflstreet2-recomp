@@ -5,6 +5,7 @@
 #   .\run.ps1 -Press "8:UP","9:A@0.15" -StopAt 15 -DumpEvery 240   (also save frames)
 #   .\run.ps1 -Press "8:UP","9:A@0.15" -StopAt 15 -XfbEvery 30     (TV frame buffer twice a second)
 #   .\run.ps1 -StopAt 7 -TraceAt 6                                  (log frame-pacing calls at 6 s)
+#   .\run.ps1 -StopAt 13 -DrawLogAt 12                              (draw calls + GPU state -> drawlog.txt)
 #
 # Afterwards just paste (Ctrl+V) into the chat. The full log is in run.txt.
 param(
@@ -13,6 +14,7 @@ param(
     [int]$DumpEvery = 0,
     [int]$XfbEvery = 0,
     [double]$TraceAt = 0,
+    [double]$DrawLogAt = -1,
     [string]$Disc = "C:\nfls2\disc",
     [string]$Map = "C:\nfls2\symbols\main.map"
 )
@@ -27,6 +29,7 @@ if (Test-Path frames) { Remove-Item frames\* -ErrorAction SilentlyContinue }
 $gameArgs = @($Disc, "--map", $Map, "--quiet", "--max-steps", "2000000000",
               "--stop-at", $StopAt, "--dump-every", $DumpEvery, "--xfb-every", $XfbEvery, "--trace-at", $TraceAt)
 foreach ($p in $Press) { $gameArgs += @("--press", $p) }
+if ($DrawLogAt -ge 0) { $gameArgs += @("--draw-log-at", $DrawLogAt) }
 
 Write-Host "Running until $StopAt s of game time..."
 & .\build\nfls2.exe @gameArgs *> run.txt
@@ -35,7 +38,7 @@ Write-Host "Running until $StopAt s of game time..."
 $log = Get-Content run.txt
 $summary = @()
 $summary += $log | Select-String -Pattern "pad:" | ForEach-Object { $_.Line }
-$summary += $log | Select-String -Pattern "trace:" | ForEach-Object { $_.Line }
+$summary += $log | Select-String -Pattern "trace:|draw log" | ForEach-Object { $_.Line }
 foreach ($pattern in @("^  frame \d+ saved", "^  tv frame")) {
     $saved = @($log | Select-String -Pattern $pattern | ForEach-Object { $_.Line })
     if ($saved.Count -gt 0) { $summary += $saved[0]; $summary += $saved[-1] }

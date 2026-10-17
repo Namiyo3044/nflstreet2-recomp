@@ -663,7 +663,9 @@ static bool gp_linked(void) {
 static void pipe_flush_burst(CPUState* cpu) {
     u32 wp = reg_get(PI_FIFO_WP, 4);
     u32 base = reg_get(PI_FIFO_BASE, 4) & 0x03FFFFE0u;
-    u32 end = reg_get(PI_FIFO_END, 4) & 0x03FFFFFFu;
+    /* 27 bits: GXRedirectWriteGatherPipe sets base 0, end 0x04000000 ("no end"),
+       which a 26-bit mask would turn into 0. */
+    u32 end = reg_get(PI_FIFO_END, 4) & 0x07FFFFFFu;
     g_burst_len = 0;
     if (end <= base)
         return;                       /* no CPU FIFO set up yet */
@@ -676,6 +678,14 @@ static void pipe_flush_burst(CPUState* cpu) {
         wrap ^= 0x04000000u;
     }
     reg_set(PI_FIFO_WP, addr | wrap, 4);
+}
+
+/* Writing WPAR (the write-gather pipe address register) resets the pipe and
+   discards a partly filled burst. The SDK relies on this: after redirecting
+   the pipe it pads with 31 zero bytes to push the last data out, then writes
+   WPAR so the leftover zeros never reach memory. */
+void mmio_wpar_written(void) {
+    g_burst_len = 0;
 }
 
 static void pipe_write(CPUState* cpu, u32 value, u8 size) {
