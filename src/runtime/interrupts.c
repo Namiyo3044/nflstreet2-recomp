@@ -88,6 +88,8 @@ void interrupts_poll(CPUState* cpu) {
         g_fields++;
     }
 
+    mmio_ai_dma_tick(cpu);
+
     if (!(cpu->msr & MSR_EE))
         return;
     u32 pending = mmio_pi_cause() & mmio_pi_mask() & ~0x00010000u;

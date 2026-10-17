@@ -79,6 +79,20 @@ static u32 g_dsp_mail;
 static bool g_dsp_mail_valid;
 static u16 g_dsp_csr = DSP_CSR_HALT;
 
+/* Audio DMA: while running, each buffer of length*32 bytes (16-bit stereo at
+   32 kHz, 4 bytes per sample) takes that long to play, and its end raises the
+   AI DMA interrupt. AX mixes one 5 ms frame per interrupt. */
+static bool g_ai_dma_on;
+static u64 g_ai_dma_next;
+
+static u64 ai_dma_period(void) {
+    u32 blocks = reg16(DSP + 0x36) & 0x7FFFu;
+    if (!blocks)
+        blocks = 0x14;
+    u64 samples = (u64)blocks * 32u / 4u;
+    return samples * 40500000ull / 32000ull;
+}
+
 static void aram_dma(CPUState* cpu) {
     u32 mm = reg_get(DSP + 0x20, 4) & 0x01FFFFFFu;
     u32 ar = reg_get(DSP + 0x24, 4) & 0x03FFFFFFu;
@@ -137,6 +151,7 @@ static bool dsp_read(u32 off, u8 size, u32* out) {
      ("task initialised") with a DSP interrupt, which runs the task's init
      callback in the game (for AX, the audio library). */
 static bool g_dsp_booted_once;
+static unsigned long long g_ax_frames, g_ai_dma_blocks;
 static u32 g_dsp_cpu_mail_hi;
 static u32 g_dsp_prev_mail;
 static unsigned g_dsp_mail_log;
@@ -146,7 +161,7 @@ static void dsp_send_to_cpu(u32 mail, bool interrupt) {
     g_dsp_mail_valid = true;
     if (interrupt)
         g_dsp_csr |= DSP_CSR_DSPINT;
-    if (g_dsp_mail_log < 64) {
+    if (g_dsp_mail_log < 64 && (mail != 0xDCD10001u || g_ax_frames < 2)) {
         g_dsp_mail_log++;
         printf("  dsp mail -> cpu 0x%08X%s\n", mail, interrupt ? " (interrupt)" : "");
     }
@@ -168,7 +183,8 @@ static void dsp_log_ucode(CPUState* cpu) {
 }
 
 static void dsp_receive_mail(CPUState* cpu, u32 mail) {
-    if (g_dsp_mail_log < 64) {
+    bool frame_mail = (mail & 0xFFFF0000u) == 0xBABE0000u || (g_dsp_prev_mail & 0xFFFF0000u) == 0xBABE0000u;
+    if (g_dsp_mail_log < 64 && (!frame_mail || g_ax_frames < 2)) {
         g_dsp_mail_log++;
         printf("  dsp mail <- cpu 0x%08X\n", mail);
     }
@@ -180,6 +196,15 @@ static void dsp_receive_mail(CPUState* cpu, u32 mail) {
         dsp_log_ucode(cpu);
         /* That was the task's entry point: the task is now running. */
         dsp_send_to_cpu(0xDCD10000u, true);
+    }
+    if ((g_dsp_prev_mail & 0xFFFF0000u) == 0xBABE0000u) {
+        /* AX: this mail is the address of the frame's command list (the one
+           before it, 0xBABE0180, announced it). The mixing itself isn't done
+           yet; reply "resume" so AX knows the frame is finished, as its DSP
+           program would after mixing. */
+        g_ax_frames++;
+        dsp_send_to_cpu(0xDCD10001u, true);
+        mail = 0;   /* an address, not a command: don't let it match anything */
     }
     g_dsp_prev_mail = mail;
 }
@@ -217,6 +242,14 @@ static bool dsp_write(CPUState* cpu, u32 off, u32 value, u8 size) {
     reg_set(off, value, size);
     if ((r == 0x28 && size == 4) || (r == 0x2A && size == 2))
         aram_dma(cpu);
+    if (r == 0x36 && size == 2) {
+        /* Audio DMA control: bit 15 starts streaming the output buffer to the
+           audio interface; the low bits are its length in 32-byte blocks. */
+        bool on = (value & 0x8000u) != 0;
+        if (on && !g_ai_dma_on)
+            g_ai_dma_next = cpu->timebase + ai_dma_period();
+        g_ai_dma_on = on;
+    }
     return true;
 }
 
@@ -628,6 +661,14 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
     reg_set(off, value, size);
 }
 
+void mmio_ai_dma_tick(CPUState* cpu) {
+    while (g_ai_dma_on && cpu->timebase >= g_ai_dma_next) {
+        g_dsp_csr |= DSP_CSR_AIDINT;
+        g_ai_dma_next += ai_dma_period();
+        g_ai_dma_blocks++;
+    }
+}
+
 /* ---------------------------------------------------------- interrupts --- */
 /* PI interrupt cause (0xCC003000) is computed from the devices' own status
    bits rather than stored, as on hardware. */
@@ -683,6 +724,7 @@ void mmio_install(CPUState* cpu) {
 }
 
 void mmio_report(void) {
+    printf("audio: %llu AI DMA buffers played, %llu AX frames\n", g_ai_dma_blocks, g_ax_frames);
     printf("hardware register accesses:");
     for (size_t i = 0; i < sizeof(g_devices) / sizeof(g_devices[0]); i++)
         if (g_devices[i].reads || g_devices[i].writes)

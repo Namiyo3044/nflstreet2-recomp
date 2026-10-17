@@ -23,4 +23,7 @@ void mmio_pe_token(u16 token, bool interrupt);
 /* Controller polling, once per video field. */
 void mmio_si_field(void);
 
+/* Audio DMA timing: raises the AI DMA interrupt as output buffers finish. */
+void mmio_ai_dma_tick(CPUState* cpu);
+
 #endif
