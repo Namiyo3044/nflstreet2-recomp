@@ -3,12 +3,16 @@
 #
 #   .\run.ps1 -Press "8:UP","9:A@0.15" -StopAt 15
 #   .\run.ps1 -Press "8:UP","9:A@0.15" -StopAt 15 -DumpEvery 240   (also save frames)
+#   .\run.ps1 -Press "8:UP","9:A@0.15" -StopAt 15 -XfbEvery 30     (TV frame buffer twice a second)
+#   .\run.ps1 -StopAt 7 -TraceAt 6                                  (log frame-pacing calls at 6 s)
 #
 # Afterwards just paste (Ctrl+V) into the chat. The full log is in run.txt.
 param(
     [string[]]$Press = @(),
     [double]$StopAt = 20,
     [int]$DumpEvery = 0,
+    [int]$XfbEvery = 0,
+    [double]$TraceAt = 0,
     [string]$Disc = "C:\nfls2\disc",
     [string]$Map = "C:\nfls2\symbols\main.map"
 )
@@ -21,7 +25,7 @@ if ($LASTEXITCODE -ne 0) { Write-Host "Build failed." -ForegroundColor Red; exit
 if (Test-Path frames) { Remove-Item frames\* -ErrorAction SilentlyContinue }
 
 $gameArgs = @($Disc, "--map", $Map, "--quiet", "--max-steps", "2000000000",
-              "--stop-at", $StopAt, "--dump-every", $DumpEvery)
+              "--stop-at", $StopAt, "--dump-every", $DumpEvery, "--xfb-every", $XfbEvery, "--trace-at", $TraceAt)
 foreach ($p in $Press) { $gameArgs += @("--press", $p) }
 
 Write-Host "Running until $StopAt s of game time..."
@@ -31,14 +35,17 @@ Write-Host "Running until $StopAt s of game time..."
 $log = Get-Content run.txt
 $summary = @()
 $summary += $log | Select-String -Pattern "pad:" | ForEach-Object { $_.Line }
-$frames = @($log | Select-String -Pattern "frame \d+ saved" | ForEach-Object { $_.Line })
-if ($frames.Count -gt 0) { $summary += $frames[0]; $summary += $frames[-1] }
+$summary += $log | Select-String -Pattern "trace:" | ForEach-Object { $_.Line }
+foreach ($pattern in @("^  frame \d+ saved", "^  tv frame")) {
+    $saved = @($log | Select-String -Pattern $pattern | ForEach-Object { $_.Line })
+    if ($saved.Count -gt 0) { $summary += $saved[0]; $summary += $saved[-1] }
+}
 $start = ($log | Select-String -Pattern "^=== stopped" | Select-Object -Last 1).LineNumber
 if ($start) { $summary += $log[($start - 1)..($log.Count - 1)] }
 else { $summary += $log | Select-Object -Last 60 }
 $summary | Set-Content summary.txt
 
-if ($DumpEvery -gt 0 -and (Test-Path frames)) {
+if (($DumpEvery -gt 0 -or $XfbEvery -gt 0) -and (Test-Path frames)) {
     Add-Type -AssemblyName System.Drawing
     Get-ChildItem frames\*.bmp | ForEach-Object {
         $img = [System.Drawing.Image]::FromFile($_.FullName)

@@ -267,7 +267,38 @@ static bool dsp_write(CPUState* cpu, u32 off, u32 value, u8 size) {
 
 static u16 g_pe_ctrl;
 
+/* Frame pacing. The game's only per-frame wait is GXDrawDone, which sleeps
+   until the GPU reports it has finished. Our GPU finishes instantly, so
+   without pacing the game draws hundreds of frames per video field. Real
+   hardware shows at most one new frame per field, so once a frame has been
+   copied to the display in this field, the next "finished" report is held
+   until the next field starts. */
+static bool g_pacing = true;
+static bool g_copied_this_field, g_finish_held;
+static unsigned long long g_finish_held_count;
+
+void mmio_set_frame_pacing(bool on) {
+    g_pacing = on;
+}
+
+void mmio_pe_display_copy(void) {
+    g_copied_this_field = true;
+}
+
+void mmio_pe_field(void) {
+    g_copied_this_field = false;
+    if (g_finish_held) {
+        g_finish_held = false;
+        g_pe_ctrl |= PE_FINISH_INT;
+    }
+}
+
 void mmio_pe_finish(void) {
+    if (g_pacing && g_copied_this_field) {
+        g_finish_held = true;
+        g_finish_held_count++;
+        return;
+    }
     g_pe_ctrl |= PE_FINISH_INT;
 }
 
@@ -609,6 +640,58 @@ static void warn_unmapped(const char* what, u32 ea, u8 size, u32 pc) {
                 what[0] == 'r' ? "from" : "to", ea, pc);
 }
 
+/* ------------------------------------------------- write-gather pipe --- */
+/* Writes to 0xCC008000 are gathered into 32-byte bursts and stored in RAM at
+   the CPU FIFO write pointer (PI 0x14), which advances and wraps between the
+   FIFO base (PI 0x0C) and end (PI 0x10). The GPU only sees the commands while
+   it is linked to that FIFO (CP control bit 4). Games unlink it to record
+   display lists into RAM (GXBeginDisplayList, GXRedirectWriteGatherPipe). */
+#define PI_FIFO_BASE 0x300Cu
+#define PI_FIFO_END  0x3010u
+#define PI_FIFO_WP   0x3014u
+#define CP_CTRL      0x0002u
+#define CP_CTRL_LINK 0x0010u
+static u8 g_burst[32];
+static u32 g_burst_len;
+static bool g_cp_ctrl_written;
+static unsigned long long g_pipe_to_gpu, g_pipe_recorded, g_link_changes;
+
+static bool gp_linked(void) {
+    return !g_cp_ctrl_written || (reg16(CP_CTRL) & CP_CTRL_LINK);
+}
+
+static void pipe_flush_burst(CPUState* cpu) {
+    u32 wp = reg_get(PI_FIFO_WP, 4);
+    u32 base = reg_get(PI_FIFO_BASE, 4) & 0x03FFFFE0u;
+    u32 end = reg_get(PI_FIFO_END, 4) & 0x03FFFFFFu;
+    g_burst_len = 0;
+    if (end <= base)
+        return;                       /* no CPU FIFO set up yet */
+    u32 addr = wp & 0x03FFFFE0u, wrap = wp & 0x04000000u;
+    if (addr + 32u <= cpu->ram_size)
+        memcpy(cpu->ram + addr, g_burst, 32);
+    addr += 32u;
+    if (addr >= end) {
+        addr = base;
+        wrap ^= 0x04000000u;
+    }
+    reg_set(PI_FIFO_WP, addr | wrap, 4);
+}
+
+static void pipe_write(CPUState* cpu, u32 value, u8 size) {
+    for (int i = size - 1; i >= 0; i--) {
+        g_burst[g_burst_len++] = (u8)(value >> (i * 8));
+        if (g_burst_len == 32)
+            pipe_flush_burst(cpu);
+    }
+    if (gp_linked()) {
+        gx_fifo_write(cpu, value, size);
+        g_pipe_to_gpu += size;
+    } else {
+        g_pipe_recorded += size;
+    }
+}
+
 static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
     if (in_vmem(ea, size)) {
         const u8* p = g_vmem + (ea - VMEM_BASE);
@@ -669,11 +752,20 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
     if (d)
         d->writes++;
 
-    if (d && strcmp(d->name, "WGPIPE") == 0) {
-        gx_fifo_write(cpu, value, size);   /* graphics command stream */
+    if (off >= 0x8000u) {
+        pipe_write(cpu, value, size);      /* graphics command stream */
         return;
     }
     log_access(true, ea, value, size);
+
+    if (off == CP_CTRL && size == 2) {
+        bool was = gp_linked();
+        g_cp_ctrl_written = true;
+        reg_set(off, value, size);
+        if (gp_linked() != was)
+            g_link_changes++;
+        return;
+    }
 
     if (off >= DSP && off < DSP + 0x200) {
         dsp_write(cpu, off, value, size);
@@ -740,6 +832,10 @@ u32 mmio_pi_cause(void) {
     return cause;
 }
 
+u32 mmio_reg(u32 off, u8 size) {
+    return reg_get(off, size);
+}
+
 u32 mmio_pi_mask(void) {
     return reg_get(0x3004u, 4);
 }
@@ -764,6 +860,10 @@ void mmio_install(CPUState* cpu) {
 
 void mmio_report(void) {
     printf("audio: %llu AI DMA buffers played, %llu AX frames\n", g_ai_dma_blocks, g_ax_frames);
+    printf("frame pacing: %s, %llu draw-done reports held to the next field\n",
+           g_pacing ? "on" : "off", g_finish_held_count);
+    printf("gather pipe: %llu bytes to the GPU, %llu bytes recorded to RAM, %llu link changes\n",
+           g_pipe_to_gpu, g_pipe_recorded, g_link_changes);
     printf("memory: virtual window 0x7E000000 r%llu/w%llu, unmapped accesses %llu\n",
            g_vmem_reads, g_vmem_writes, g_unmapped);
     printf("hardware register accesses:");

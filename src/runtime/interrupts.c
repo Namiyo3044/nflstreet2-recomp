@@ -10,6 +10,7 @@
  */
 #include "runtime/interrupts.h"
 #include "runtime/mmio.h"
+#include "gx/raster.h"
 
 #include <stdio.h>
 
@@ -84,8 +85,10 @@ void interrupts_poll(CPUState* cpu) {
         g_next_field += FIELD_TICKS;
         mmio_vi_raise(g_field ? 0u : 1u);
         mmio_si_field();
+        mmio_pe_field();
         g_field ^= 1u;
         g_fields++;
+        gx_raster_xfb_field(cpu, g_fields, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2));
     }
 
     mmio_ai_dma_tick(cpu);

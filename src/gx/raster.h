@@ -24,6 +24,17 @@ void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data);
 /* PE_COPY_EXECUTE (BP 0x52): copy to display or texture, optional clear. */
 void gx_raster_copy(u32 copy_cmd);
 
+/* TV frame buffer dumps: every `every_fields` video fields (0 = off), save
+   the frame buffer the video interface is showing, as xfb_<field>.bmp. */
+void gx_raster_config_xfb(u32 every_fields);
+
+/* Called once per video field with the VI top-field base (0x201C) and
+   picture configuration (0x2048) registers. */
+void gx_raster_xfb_field(CPUState* cpu, u64 field, u32 tfbl, u32 picture_cfg);
+
+/* Number of frames copied to the display so far. */
+u32 gx_raster_frames(void);
+
 void gx_raster_report(void);
 
 #endif

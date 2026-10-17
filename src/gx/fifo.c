@@ -145,9 +145,10 @@ static void write_bp(CPUState* cpu, u32 value) {
         mmio_pe_token((u16)data, true);
         break;
     case 0x52: /* PE_COPY_EXECUTE: copy the frame (to the display buffer or a texture) */
-        if (data & (1u << 14))
+        if (data & (1u << 14)) {
             g_stats.copies_xfb++;
-        else
+            mmio_pe_display_copy();
+        } else
             g_stats.copies_tex++;
         gx_raster_copy(data);
         break;

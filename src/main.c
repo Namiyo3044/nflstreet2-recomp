@@ -39,11 +39,46 @@ static u32* g_profile;
 static bool g_profiling;
 static unsigned long long g_profiled;
 
+/* --trace-at: from this much game time, log calls that matter for frame
+   pacing (video, OS timing and threads, GPU sync, the game's video module at
+   0x801CE000-0x801CF000) across a few displayed frames. */
+static double g_trace_at;
+static bool g_tracing;
+static u32 g_trace_lines, g_trace_frames_start;
+#define TRACE_MAX_LINES 3000
+#define TRACE_FRAMES 4
+
+static bool trace_wanted(u32 address, const char* name) {
+    if (address >= 0x801CE000u && address < 0x801CF000u)
+        return true;
+    static const char* const k_prefixes[] = {
+        "VI", "__VI", "OSSleep", "OSWakeup", "OSYield", "OSGetTime", "__OSGetSystemTime", "OSWaitSemaphore",
+        "OSSignalSemaphore", "OSWaitCond", "OSSignalCond", "OSReceiveMessage", "OSSendMessage",
+        "OSSetAlarm", "OSCancelAlarm", "OSGetTick", "GXDrawDone", "GXSetDrawDone", "GXWaitDrawDone",
+        "GXCopyDisp", "GXFlush", "GXSetDrawSync", "GXReadDrawSync", "GXSetDrawSyncCallback",
+        "GXSetDrawDoneCallback", "GXSetBreakPtCallback", "GXEnableBreakPt", "GXDisableBreakPt",
+        "GXSetCPUFifo", "GXSetGPFifo", "PADRead", "SelectThread", "OSResumeThread", "OSSuspendThread",
+    };
+    for (size_t i = 0; i < sizeof(k_prefixes) / sizeof(k_prefixes[0]); i++)
+        if (strncmp(name, k_prefixes[i], strlen(k_prefixes[i])) == 0)
+            return true;
+    return false;
+}
+
 /* Every dispatched call passes through here. Later this is where HLE
    replacements go; for now it only records where execution has been. */
 int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
-    (void)ctx;
     g_trace[g_trace_pos++ % TRACE_LEN] = address;
+
+    if (g_tracing && g_have_symbols && symbols_function_start(address) == address) {
+        const char* name = symbols_lookup(address, NULL);
+        if (trace_wanted(address, name)) {
+            printf("  trace: %-28s 0x%08X  lr 0x%08X  field %.0f  frame %u\n", name, address, ctx->lr,
+                   interrupts_game_seconds() * 60000.0 / 1001.0, gx_raster_frames());
+            if (++g_trace_lines >= TRACE_MAX_LINES)
+                g_tracing = false;
+        }
+    }
 
     if (g_profiling) {
         u32 start = g_have_symbols ? symbols_function_start(address) : 0;
@@ -147,6 +182,9 @@ static void usage(const char* argv0) {
             "         [--dump-every N (default 60, 0 = off)] [--dump-dir DIR (default frames)]\n"
             "         [--press SECONDS:BUTTON[+BUTTON][@HOLD]]...  e.g. --press 5.5:A --press 7:DOWN@0.2\n"
             "         [--stop-at SECONDS (stop at this much game time)]\n"
+            "         [--xfb-every FIELDS (also save the TV frame buffer every N video fields)]\n"
+            "         [--trace-at SECONDS (log frame-pacing calls for a few frames from then)]\n"
+            "         [--unpaced (let the game draw as many frames per video field as it likes)]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -159,6 +197,7 @@ int main(int argc, char** argv) {
     const char* dump_dir = "frames";
     u32 dump_every = 60;
     double stop_at = 0;
+    u32 xfb_every = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--map") == 0 && i + 1 < argc) {
@@ -177,6 +216,12 @@ int main(int argc, char** argv) {
                         argv[i], pad_button_names());
                 return 2;
             }
+        } else if (strcmp(argv[i], "--unpaced") == 0) {
+            mmio_set_frame_pacing(false);
+        } else if (strcmp(argv[i], "--trace-at") == 0 && i + 1 < argc) {
+            g_trace_at = strtod(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--xfb-every") == 0 && i + 1 < argc) {
+            xfb_every = (u32)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--stop-at") == 0 && i + 1 < argc) {
             stop_at = strtod(argv[++i], NULL);
         } else if (strcmp(argv[i], "--skip-hash") == 0) {
@@ -201,6 +246,7 @@ int main(int argc, char** argv) {
     g_seen = (u8*)calloc(GC_MAIN_RAM_SIZE >> 5, 1);
     g_profile = (u32*)calloc(GC_MAIN_RAM_SIZE >> 2, sizeof(u32));
     gx_raster_config(dump_dir, dump_every);
+    gx_raster_config_xfb(xfb_every);
 
     static CPUState cpu;
     if (!cpu_init(&cpu))
@@ -227,6 +273,16 @@ int main(int argc, char** argv) {
     unsigned long long steps = 0;
     while (steps < max_steps) {
         u32 pc = cpu.pc;
+        if (g_trace_at > 0 && !g_tracing && g_trace_lines == 0 && interrupts_game_seconds() >= g_trace_at) {
+            g_tracing = true;
+            g_trace_frames_start = gx_raster_frames();
+            printf("  trace: start at %.2f s, frame %u\n", interrupts_game_seconds(), g_trace_frames_start);
+        }
+        if (g_tracing && gx_raster_frames() >= g_trace_frames_start + TRACE_FRAMES) {
+            g_tracing = false;
+            g_trace_lines = TRACE_MAX_LINES;
+            printf("  trace: end at %.2f s, frame %u\n", interrupts_game_seconds(), gx_raster_frames());
+        }
         g_profiling = g_profile && (steps + PROFILE_STEPS >= max_steps ||
                                     (stop_at > 0 && interrupts_game_seconds() >= stop_at - 1.0));
         cpu.downcount = 0;

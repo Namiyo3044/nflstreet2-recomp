@@ -24,7 +24,8 @@ static u32 g_color[EFB_W * EFB_H];   /* 0xAARRGGBB */
 static u32 g_depth[EFB_W * EFB_H];   /* 24-bit, larger = farther */
 
 static char g_dir[512] = "frames";
-static u32 g_every;
+static u32 g_every;          /* render every Nth displayed frame */
+static bool g_save;          /* and save it as frame_N.bmp */
 static u32 g_frames;        /* frames copied to the display so far */
 static u32 g_dumped;
 static unsigned long long g_tris_drawn, g_tris_skipped;
@@ -36,12 +37,13 @@ void gx_raster_config(const char* dir, u32 every) {
         g_dir[sizeof(g_dir) - 1] = '\0';
     }
     g_every = every;
+    g_save = every != 0;
     if (every)
         make_dir(g_dir);
 }
 
 bool gx_raster_active(void) {
-    return g_every && g_dumped < MAX_DUMPS && ((g_frames + 1) % g_every) == 0;
+    return g_every && ((g_frames + 1) % g_every) == 0;
 }
 
 /* ------------------------------------------------------ vertex decode --- */
@@ -737,6 +739,54 @@ static void write_bmp(const char* path, u32 sx, u32 sy, u32 w, u32 h) {
     fclose(f);
 }
 
+/* EFB -> external frame buffer in RAM, as YUYV 4:2:2 (what the TV shows).
+   Destination BP 0x4B and stride BP 0x4D (both in 32-byte units). The number
+   of lines written follows the vertical scale (BP 0x4E, 8.8 fixed point;
+   copy command bit 10 says whether it is inverted), exactly as the hardware
+   does, so the copy never runs past the buffer the game allocated. */
+static u32 g_xfb_copy_log;
+
+static void copy_to_xfb(u32 cmd, u32 sx, u32 sy, u32 w, u32 h) {
+    if (!g_cpu)
+        return;
+    u32 dest = (gx_bp[0x4B] & 0x00FFFFFFu) << 5;
+    u32 stride = (gx_bp[0x4D] & 0x3FFu) << 5;
+    u32 yscale_reg = gx_bp[0x4E] & 0x1FFu;
+    bool invert = (cmd >> 10) & 1u;
+    double yscale = 1.0;
+    if (yscale_reg)
+        yscale = invert ? 256.0 / yscale_reg : yscale_reg / 256.0;
+    u32 lines = (u32)(h * yscale + 0.5);
+    if (lines > 1024)
+        lines = 1024;
+    if (w * 2u > stride)
+        w = stride / 2u;          /* a line never spills into the next one */
+    if (g_xfb_copy_log < 8) {
+        g_xfb_copy_log++;
+        printf("  xfb copy: %ux%u from (%u,%u) -> 0x%08X stride %u, yscale 0x%03X%s = %u lines, cmd 0x%06X\n",
+               w, h, sx, sy, dest, stride, yscale_reg, invert ? " (inverted)" : "", lines, cmd);
+    }
+    if (!w || !lines || dest >= g_cpu->ram_size || (u64)lines * stride > g_cpu->ram_size - dest)
+        return;
+    for (u32 y = 0; y < lines; y++) {
+        u32 srcy = sy + (u32)(y / yscale);
+        if (srcy >= EFB_H || srcy >= sy + h)
+            srcy = sy + h - 1 < EFB_H ? sy + h - 1 : EFB_H - 1;
+        u8* d = g_cpu->ram + dest + y * stride;
+        for (u32 x = 0; x + 1 < w; x += 2) {
+            u32 c0 = sx + x < EFB_W ? g_color[srcy * EFB_W + sx + x] : 0;
+            u32 c1 = sx + x + 1 < EFB_W ? g_color[srcy * EFB_W + sx + x + 1] : 0;
+            int r0 = (c0 >> 16) & 255, g0 = (c0 >> 8) & 255, b0 = c0 & 255;
+            int r1 = (c1 >> 16) & 255, g1 = (c1 >> 8) & 255, b1 = c1 & 255;
+            int r = (r0 + r1) / 2, g = (g0 + g1) / 2, b = (b0 + b1) / 2;
+            d[x * 2 + 0] = (u8)((66 * r0 + 129 * g0 + 25 * b0 + 128) / 256 + 16);
+            d[x * 2 + 1] = (u8)((-38 * r - 74 * g + 112 * b + 128) / 256 + 128);
+            d[x * 2 + 2] = (u8)((66 * r1 + 129 * g1 + 25 * b1 + 128) / 256 + 16);
+            d[x * 2 + 3] = (u8)((112 * r - 94 * g - 18 * b + 128) / 256 + 128);
+        }
+    }
+}
+
 void gx_raster_copy(u32 cmd) {
     bool to_xfb = (cmd >> 14) & 1u;
     bool clear = (cmd >> 11) & 1u;
@@ -745,11 +795,14 @@ void gx_raster_copy(u32 cmd) {
         if (gx_raster_active()) {
             u32 sx = gx_bp[0x49] & 0x3FFu, sy = (gx_bp[0x49] >> 10) & 0x3FFu;
             u32 w = (gx_bp[0x4A] & 0x3FFu) + 1, h = ((gx_bp[0x4A] >> 10) & 0x3FFu) + 1;
-            char path[600];
-            snprintf(path, sizeof(path), "%s/frame_%06u.bmp", g_dir, g_frames + 1);
-            write_bmp(path, sx, sy, w, h);
-            printf("  frame %u saved (game time %.2f s)\n", g_frames + 1, interrupts_game_seconds());
-            g_dumped++;
+            copy_to_xfb(cmd, sx, sy, w, h);
+            if (g_save && g_dumped < MAX_DUMPS) {
+                char path[600];
+                snprintf(path, sizeof(path), "%s/frame_%06u.bmp", g_dir, g_frames + 1);
+                write_bmp(path, sx, sy, w, h);
+                printf("  frame %u saved (game time %.2f s)\n", g_frames + 1, interrupts_game_seconds());
+                g_dumped++;
+            }
         }
         g_frames++;
         gx_tex_flush_cache();   /* texture data in RAM may change between frames */
@@ -765,6 +818,79 @@ void gx_raster_copy(u32 cmd) {
             g_depth[i] = z;
         }
     }
+}
+
+/* ------------------------------------------------ TV frame buffer dump --- */
+/* What the video interface is actually showing: the external frame buffer
+   (XFB) in RAM, YUYV 4:2:2, two bytes per pixel. Movie players and some
+   loading screens write it directly without going through the GPU, so these
+   dumps catch screens the EFB-copy dumps miss. */
+static u32 g_xfb_every, g_xfb_dumped;
+
+void gx_raster_config_xfb(u32 every_fields) {
+    g_xfb_every = every_fields;
+    if (every_fields)
+        make_dir(g_dir);
+    if (every_fields && !g_every)
+        g_every = 1;     /* render every frame so the TV buffer always has the GPU output */
+}
+
+static u8 clamp8(int v) { return (u8)(v < 0 ? 0 : v > 255 ? 255 : v); }
+
+void gx_raster_xfb_field(CPUState* cpu, u64 field, u32 tfbl, u32 picture_cfg) {
+    if (!g_xfb_every || g_xfb_dumped >= MAX_DUMPS || field % g_xfb_every)
+        return;
+    u32 addr = (tfbl & 0x10000000u) ? (tfbl & 0x00FFFFFFu) << 5 : (tfbl & 0x00FFFFFFu);
+    u32 width = ((picture_cfg >> 8) & 0x7Fu) * 16u;   /* WPL: width in 16-pixel units */
+    u32 stride = (picture_cfg & 0xFFu) * 32u;          /* STD is per field line; a frame line is half */
+    if (width == 0 || width > 720)
+        width = 640;
+    u32 line_bytes = width * 2u;
+    /* Interlaced: a field's stride skips every other line, so a frame line is stride / 2. */
+    if (stride >= line_bytes * 2u)
+        stride /= 2u;
+    if (stride < line_bytes)
+        stride = line_bytes;
+    u32 height = 480;
+    if (addr == 0 || addr + stride * height > cpu->ram_size)
+        return;
+
+    FILE* f;
+    char path[600];
+    snprintf(path, sizeof(path), "%s/xfb_%06llu.bmp", g_dir, (unsigned long long)field);
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    u32 row = (width * 3 + 3) & ~3u;
+    u32 size = 54 + row * height;
+    u8 hdr[54] = {'B', 'M'};
+    hdr[2] = (u8)size; hdr[3] = (u8)(size >> 8); hdr[4] = (u8)(size >> 16); hdr[5] = (u8)(size >> 24);
+    hdr[10] = 54; hdr[14] = 40;
+    hdr[18] = (u8)width; hdr[19] = (u8)(width >> 8);
+    hdr[22] = (u8)height; hdr[23] = (u8)(height >> 8);
+    hdr[26] = 1; hdr[28] = 24;
+    fwrite(hdr, 1, 54, f);
+    u8* line = (u8*)calloc(1, row);
+    for (u32 y = 0; y < height; y++) {
+        const u8* src = cpu->ram + addr + (height - 1 - y) * stride;
+        for (u32 x = 0; x + 1 < width; x += 2) {
+            int y0 = src[x * 2], u = src[x * 2 + 1] - 128, y1 = src[x * 2 + 2], v = src[x * 2 + 3] - 128;
+            int r = (int)(1.371f * v), g = (int)(-0.698f * v - 0.336f * u), b = (int)(1.732f * u);
+            u8* d = line + x * 3;
+            d[0] = clamp8(y0 + b); d[1] = clamp8(y0 + g); d[2] = clamp8(y0 + r);
+            d[3] = clamp8(y1 + b); d[4] = clamp8(y1 + g); d[5] = clamp8(y1 + r);
+        }
+        fwrite(line, 1, row, f);
+    }
+    free(line);
+    fclose(f);
+    g_xfb_dumped++;
+    printf("  tv frame (field %llu) saved from 0x%08X (game time %.2f s)\n", (unsigned long long)field,
+           addr, interrupts_game_seconds());
+}
+
+u32 gx_raster_frames(void) {
+    return g_frames;
 }
 
 void gx_raster_report(void) {
