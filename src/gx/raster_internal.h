@@ -65,6 +65,7 @@ typedef struct {
     u8 texcoord, chan;
     u8 tsw[4], rsw[4];
     const u32* texels;                 /* decoded texture (all mip levels); valid until the frame is drawn */
+    const GxHires* hires;              /* GPU: custom replacement to draw instead (never freed) */
     u32 tw, th, wrap_s, wrap_t;
     u32 levels;
     u32 lw[GX_TEX_MAX_LEVELS], lh[GX_TEX_MAX_LEVELS], loff[GX_TEX_MAX_LEVELS];

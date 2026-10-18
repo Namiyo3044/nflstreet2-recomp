@@ -372,8 +372,28 @@ void gx_tex_collect_garbage(void) {
     g_garbage_n = 0;
 }
 
+/* RAM ranges frame-buffer copies have written: textures there are the
+   game's own renders, never replaced or dumped (as in Dolphin). */
+#define COPY_RANGES 64
+static u32 g_copy_lo[COPY_RANGES], g_copy_hi[COPY_RANGES], g_copy_n, g_copy_next;
+
+static bool copy_written(u32 addr, u32 size) {
+    for (u32 i = 0; i < g_copy_n; i++)
+        if (addr < g_copy_hi[i] && g_copy_lo[i] < addr + size) return true;
+    return false;
+}
+
 void gx_tex_invalidate(u32 addr, u32 size) {
     addr &= 0x01FFFFFFu;
+    bool known = false;
+    for (u32 i = 0; i < g_copy_n && !known; i++)
+        known = g_copy_lo[i] == addr && g_copy_hi[i] == addr + size;
+    if (!known) {
+        g_copy_lo[g_copy_next] = addr;
+        g_copy_hi[g_copy_next] = addr + size;
+        g_copy_next = (g_copy_next + 1) % COPY_RANGES;
+        if (g_copy_n < COPY_RANGES) g_copy_n++;
+    }
     for (u32 n = 0; n < g_cache_count; n++) {
         CacheEntry* e = &g_cache[n];
         if (e->addr & 0x80000000u)
@@ -392,6 +412,7 @@ void gx_tex_flush_cache(void) {
 void gx_tex_report(void) {
     printf("textures: %u cached, %llu decodes, %llu cache hits (%llu versions of a texture kept side by side, "
            "%llu switches between them)\n", g_cache_count, g_decodes, g_hits, g_variants, g_variant_hits);
+    hires_report();
 }
 
 /* Lays out the mip chain: level l is (w >> l) x (h >> l), at least 1x1,
@@ -457,6 +478,31 @@ static void index_rebuild(void) {
     g_index_ready = true;
 }
 
+/* Looks up a custom replacement for a freshly decoded texture (hashed the
+   way Dolphin does: level 0 as it sits in RAM, or in TMEM when preloaded). */
+static void attach_hires(CacheEntry* e, const u8* src, bool preloaded, u32 even, u32 mode0) {
+    e->tex.hires = NULL;
+    e->tex.hires_entry = NULL;
+    if (!hires_active())
+        return;
+    u32 fmt = e->fmt, w = e->w, h = e->h;
+    u32 size0 = gx_tex_size(fmt, w, h);
+    if (!preloaded && copy_written(e->addr, size0))
+        return;
+    const u8* data = src;
+    if (preloaded && fmt == FMT_RGBA8)
+        data = even + size0 <= TMEM_SIZE ? g_tmem + even : NULL;
+    if (!data)
+        return;
+    bool paletted = fmt == FMT_C4 || fmt == FMT_C8 || fmt == FMT_C14X2;
+    const u8* tlut = paletted && e->tlut_addr + tlut_bytes(fmt) <= TMEM_SIZE ? g_tmem + e->tlut_addr : NULL;
+    if (paletted && !tlut)
+        return;
+    bool mipmaps = ((mode0 >> 5) & 3u) != 0;
+    e->tex.hires_entry = hires_find(fmt, w, h, mipmaps, data, size0, tlut, e->data);
+    e->tex.hires = hires_ready(e->tex.hires_entry);
+}
+
 static const GxTexture* tex_get(CPUState* cpu, u32 map) {
     /* Register sets for maps 0-3 and 4-7 live 0x20 apart. */
     u32 bank = map < 4 ? 0u : 0x20u, i = map & 3u;
@@ -479,8 +525,8 @@ static const GxTexture* tex_get(CPUState* cpu, u32 map) {
     /* Mip levels: only when the minification filter uses them; the count
        comes from the maximum LOD (4.4 fixed point) and the texture size. */
     u32 levels = 1;
-    u32 min_filter = (mode0 >> 5) & 7u;
-    if (min_filter >= 2 && min_filter <= 5) {
+    u32 min_filter = gx_tex_min_filter(mode0);
+    if (min_filter >= 2) {
         u32 max_lod = ((mode1 >> 8) & 0xFFu) >> 4;
         u32 n = 1, m = w > h ? w : h;
         while ((m >> n) && n < GX_TEX_MAX_LEVELS) n++;
@@ -566,6 +612,8 @@ static const GxTexture* tex_get(CPUState* cpu, u32 map) {
             e->tex.texels = fresh;
             e->hash = hash_sampled(src, size);
             e->full_hash = size > 16384u ? hash_bytes(src, size) : 0;
+            e->tex.hires = NULL;           /* drawn by the GPU: never replaced */
+            e->tex.hires_entry = NULL;
             g_decodes++;
             return &e->tex;
         } else {
@@ -640,6 +688,7 @@ static const GxTexture* tex_get(CPUState* cpu, u32 map) {
         e->full_hash = !preloaded && size > 16384u ? hash_bytes(src, size) : 0;
         e->tlut_hash = tsh;
         g_decodes++;
+        attach_hires(e, src, preloaded, even, mode0);
         return &e->tex;
     }
 
@@ -682,13 +731,16 @@ new_entry:
     e->tex.texels = e->data;
     last_hit[map & 7u] = slot;
     g_decodes++;
+    attach_hires(e, src, preloaded, even, mode0);
     return &e->tex;
 #undef SRC
 }
 
 const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
     int prev = prof_enter(PROF_GX_TEXTURE);
-    const GxTexture* t = tex_get(cpu, map);
+    GxTexture* t = (GxTexture*)tex_get(cpu, map);
+    if (t && t->hires_entry && !t->hires)
+        t->hires = hires_ready(t->hires_entry);   /* finished loading in the background */
     prof_leave(prev);
     return t;
 }

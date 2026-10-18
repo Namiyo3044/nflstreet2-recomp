@@ -5,6 +5,9 @@
 #   .\play.ps1 -Res 2          (graphics card's internal resolution, N x 640x528; default 4)
 #   .\play.ps1 -Debug          (extra diagnostics: call counts, file/stream logs, profile at exit; a little slower)
 #   .\play.ps1 -Software       (the old CPU renderer instead of the graphics card)
+#   .\play.ps1 -Textures D:\pack (custom textures in Dolphin's format; default C:\nfls2\textures, used if it exists)
+#   .\play.ps1 -NoTextures     (the game's own textures only)
+#   .\play.ps1 -DumpTextures   (save every texture the game uses to C:\nfls2\dump\textures, with Dolphin's names)
 #   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
 #   .\play.ps1 -ShowTHX        (keep the THX intro; it is skipped by default)
@@ -28,6 +31,9 @@ param(
     [string]$MemCard = "C:\nfls2\saves\MemoryCardA.raw",
     [switch]$NoMemCard,
     [switch]$NoText,
+    [string]$Textures = "C:\nfls2\textures",
+    [switch]$NoTextures,
+    [switch]$DumpTextures,
     [string[]]$Press = @(),
     [string]$Disc = "C:\nfls2\disc",
     [string]$Map = "C:\nfls2\symbols\main.map"
@@ -83,6 +89,11 @@ if (-not $ShowTHX) { $gameArgs += "--skip-thx" }
 if ($NoText) { $gameArgs += @("--no-text") }
 if (-not $Software) { $gameArgs += @("--gpu", "--res", $Res) }
 if ($Debug) { $gameArgs += @("--debug") }
+if (-not $NoTextures -and (Test-Path $Textures)) { $gameArgs += @("--textures", $Textures) }
+if ($DumpTextures) {
+    New-Item -ItemType Directory -Force -Path "C:\nfls2\dump\textures" | Out-Null
+    $gameArgs += @("--dump-textures", "C:\nfls2\dump\textures")
+}
 if (-not $NoMemCard) {
     New-Item -ItemType Directory -Force -Path (Split-Path $MemCard) | Out-Null
     $gameArgs += @("--memcard", $MemCard)
@@ -96,7 +107,7 @@ $start = ($log | Select-String -Pattern "^=== stopped" | Select-Object -Last 1).
 if ($start) { $report = $log[($start - 1)..($log.Count - 1)] } else { $report = $log | Select-Object -Last 80 }
 # Slow stretches (the window logs a perf line each second the game runs below full speed).
 $perf = @($log | Select-String -Pattern "^perf:|^audio:" | ForEach-Object { $_.Line })
-$gpuLines = @($log | Select-String -Pattern "^gpu:" | ForEach-Object { $_.Line })
+$gpuLines = @($log | Select-String -Pattern "^gpu:|^custom textures:" | ForEach-Object { $_.Line })
 $startup = @($log | Select-String -Pattern "^startup:" | ForEach-Object { $_.Line })
 $cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
 $txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })

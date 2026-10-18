@@ -738,6 +738,7 @@ static void snapshot_state(RenderState* ds) {
                 u32 mode0 = gx_bp[(texmap < 4 ? 0x80u : 0xA0u) + (texmap & 3u)];
                 u32 mode1 = gx_bp[(texmap < 4 ? 0x84u : 0xA4u) + (texmap & 3u)];
                 s->texels = tex->texels;
+                s->hires = g_gpu ? tex->hires : NULL;
                 s->tw = tex->width;
                 s->th = tex->height;
                 s->wrap_s = mode0 & 3u;
@@ -747,7 +748,7 @@ static void snapshot_state(RenderState* ds) {
                 memcpy(s->lh, tex->lh, sizeof(s->lh));
                 memcpy(s->loff, tex->off, sizeof(s->loff));
                 s->mag_linear = (mode0 >> 4) & 1u;
-                s->min_filter = (u8)((mode0 >> 5) & 7u);
+                s->min_filter = (u8)gx_tex_min_filter(mode0);
                 s->lod_bias = (float)(s8)((mode0 >> 9) & 0xFFu) / 32.0f;
                 s->min_lod = (float)(mode1 & 0xFFu) / 16.0f;
                 s->max_lod = (float)((mode1 >> 8) & 0xFFu) / 16.0f;

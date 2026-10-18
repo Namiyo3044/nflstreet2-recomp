@@ -27,7 +27,7 @@ static GLuint g_fbo, g_color_tex, g_depth_tex;           /* the frame buffer at 
 static GLuint g_fbo_small, g_color_small, g_depth_small; /* native size, for read-back when scaled */
 static GLuint g_samplers[16];
 static GLint g_ubo_align = 256;
-static unsigned long long g_draw_calls, g_lists, g_readbacks, g_uploads;
+static unsigned long long g_draw_calls, g_lists, g_readbacks, g_uploads, g_hires_uploads;
 
 /* ------------------------------------------------------------ shaders --- */
 static const char* k_vs =
@@ -325,18 +325,38 @@ void glr_texture_freed(const u32* texels) {
 }
 
 static GLuint stage_texture(const Stage* s) {
-    TexSlot* slot = tex_find(s->texels, true);
+    const GxHires* hi = s->hires;
+    TexSlot* slot = tex_find(hi ? hi->texels : s->texels, true);
     if (!slot) return 0;
     if (slot->tex) return slot->tex;
     GLuint t;
     G(glGenTextures)(1, &t);
     G(glBindTexture)(GL_TEXTURE_2D, t);
     G(glPixelStorei)(GL_UNPACK_ALIGNMENT, 4);
-    for (u32 l = 0; l < s->levels; l++)
-        G(glTexImage2D)(GL_TEXTURE_2D, (GLint)l, GL_RGBA8, (GLsizei)s->lw[l], (GLsizei)s->lh[l], 0, GL_BGRA,
-                        GL_UNSIGNED_INT_8_8_8_8_REV, s->texels + s->loff[l]);
+    GLint max_level;
+    if (hi) {
+        /* A custom texture: its own mip files, or a mip chain made here when
+           the game's texture has one. */
+        for (u32 l = 0; l < hi->levels; l++)
+            G(glTexImage2D)(GL_TEXTURE_2D, (GLint)l, GL_RGBA8, (GLsizei)hi->lw[l], (GLsizei)hi->lh[l], 0, GL_BGRA,
+                            GL_UNSIGNED_INT_8_8_8_8_REV, hi->texels + hi->off[l]);
+        max_level = (GLint)hi->levels - 1;
+        if (hi->levels == 1 && s->levels > 1) {
+            u32 m = hi->w > hi->h ? hi->w : hi->h;
+            max_level = 0;
+            while (m >> (max_level + 1)) max_level++;
+            G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, max_level);
+            G(glGenerateMipmap)(GL_TEXTURE_2D);
+        }
+        g_hires_uploads++;
+    } else {
+        for (u32 l = 0; l < s->levels; l++)
+            G(glTexImage2D)(GL_TEXTURE_2D, (GLint)l, GL_RGBA8, (GLsizei)s->lw[l], (GLsizei)s->lh[l], 0, GL_BGRA,
+                            GL_UNSIGNED_INT_8_8_8_8_REV, s->texels + s->loff[l]);
+        max_level = (GLint)(s->levels ? s->levels - 1 : 0);
+    }
     G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-    G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, (GLint)(s->levels ? s->levels - 1 : 0));
+    G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, max_level);
     slot->tex = t;
     g_uploads++;
     return t;
@@ -355,7 +375,9 @@ static void set_sampler(int unit, const Stage* s) {
                                    GL_NEAREST_MIPMAP_LINEAR, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR, GL_LINEAR};
     SamplerState n = {k_min[s->min_filter & 7], s->mag_linear ? GL_LINEAR : GL_NEAREST, wrap_mode(s->wrap_s),
                       wrap_mode(s->wrap_t), s->lod_bias, s->min_lod, s->max_lod, true};
-    if (s->levels <= 1) {              /* no mipmaps: plain nearest / linear */
+    if (s->hires && (s->hires->levels > 1 || s->levels > 1)) {
+        n.maxl = 1000.0f;              /* a custom texture has more levels than the game's (as Dolphin does) */
+    } else if (s->levels <= 1) {       /* no mipmaps: plain nearest / linear */
         n.min = (n.min == GL_NEAREST || n.min == GL_NEAREST_MIPMAP_NEAREST || n.min == GL_NEAREST_MIPMAP_LINEAR)
                     ? GL_NEAREST : GL_LINEAR;
     }
@@ -1067,4 +1089,6 @@ void glr_report(void) {
     printf("gpu: %llu frames' lists drawn in %llu draw calls, %llu textures uploaded (%u on the GPU now), %llu "
            "read-backs, %llu TV-buffer copies kept on the GPU, %llu texture copies made on the GPU\n",
            g_lists, g_draw_calls, g_uploads, g_tex_n, g_readbacks, g_xfb_gpu_copies, g_tex_copies_gpu);
+    if (g_hires_uploads)
+        printf("gpu: %llu custom textures uploaded\n", g_hires_uploads);
 }

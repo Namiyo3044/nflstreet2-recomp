@@ -153,6 +153,7 @@ typedef struct __GLsync* GLsync;
     X(glTexImage2D, void, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*)) \
     X(glTexSubImage2D, void, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void*)) \
     X(glTexParameteri, void, (GLenum, GLenum, GLint)) \
+    X(glGenerateMipmap, void, (GLenum)) \
     X(glGenSamplers, void, (GLsizei, GLuint*)) \
     X(glBindSampler, void, (GLuint, GLuint)) \
     X(glSamplerParameteri, void, (GLuint, GLenum, GLint)) \

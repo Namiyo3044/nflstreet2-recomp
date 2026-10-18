@@ -16,6 +16,7 @@
 #include "gx/gl_min.h"
 
 #include <dlfcn.h>
+#include <unistd.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -186,7 +187,8 @@ static void tev_modulate(int stage, bool tex) {
 
 static void texture(u32 map, u32 addr, u32 w, u32 h, u32 min_filter, bool mag_linear, u32 wrap, u32 max_lod16) {
     u32 bank = map < 4 ? 0u : 0x20u, i = map & 3u;
-    bp(0x80 + bank + i, wrap | (wrap << 2) | ((mag_linear ? 1u : 0) << 4) | (min_filter << 5));
+    static const u32 k_hw[6] = {0, 4, 1, 5, 2, 6};   /* GX API filter -> register value */
+    bp(0x80 + bank + i, wrap | (wrap << 2) | ((mag_linear ? 1u : 0) << 4) | (k_hw[min_filter] << 5));
     bp(0x84 + bank + i, (max_lod16 & 0xFFu) << 8);
     bp(0x88 + bank + i, (w - 1) | ((h - 1) << 10) | (6u << 20));   /* RGBA8 */
     bp(0x8C + bank + i, 0);
@@ -530,7 +532,11 @@ int main(int argc, char** argv) {
         float m[12] = {c, 0, -sn, -(c * tx - sn * tz), 0, 1, 0, -ty, sn, 0, c, -(sn * tx + c * tz)};
         gx_raster_set_free_camera(true, m);
     }
-    for (size_t i = 0; i < sizeof(k_scenes) / sizeof(k_scenes[0]); i++) {
+    if (getenv("HIRES")) hires_init(getenv("HIRES"));            /* tests: custom textures */
+    if (getenv("HIRES_DUMP")) hires_set_dump_dir(getenv("HIRES_DUMP"));
+    for (size_t i = 0; i < sizeof(k_scenes) / sizeof(k_scenes[0]); i++)
+      for (int pass = getenv("HIRES") ? 0 : 1; pass < 2; pass++) {   /* custom textures load in the background */
+        if (pass == 1 && getenv("HIRES")) usleep(300000);
         memset(gx_bp, 0, sizeof(gx_bp));
         gx_bp[0xFE] = 0x00FFFFFFu;
         memset(gx_xf_reg, 0, sizeof(gx_xf_reg));
@@ -560,7 +566,7 @@ int main(int argc, char** argv) {
             fwrite(g_cpu.ram + XFB_ADDR, 1, 640 * 480 * 2, f);
             fclose(f);
         }
-    }
+      }
     gx_raster_report();
     return 0;
 }

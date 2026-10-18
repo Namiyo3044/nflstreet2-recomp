@@ -2,6 +2,7 @@
 #define NFLS2_GX_TEXTURE_H
 
 #include "cpu/cpu.h"
+#include "gx/hires.h"
 
 /* GameCube texture decoding.
  *
@@ -19,7 +20,18 @@ typedef struct {
     u32 levels;            /* mip levels decoded (1 = no mipmaps) */
     u32 lw[GX_TEX_MAX_LEVELS], lh[GX_TEX_MAX_LEVELS];
     u32 off[GX_TEX_MAX_LEVELS];  /* texel offset of each level in texels */
+    const GxHires* hires;  /* custom replacement, once loaded (GPU renderer only) */
+    HiresEntry* hires_entry;
 } GxTexture;
+
+/* Texture register mode 0 stores the minification filter as a mip mode
+   (bits 5-6: none, nearest, linear) and a linear bit (bit 7). Converted to
+   the GX API's numbering: 0 NEAR, 1 LINEAR, 2 NEAR_MIP_NEAR, 3 LIN_MIP_NEAR,
+   4 NEAR_MIP_LIN, 5 LIN_MIP_LIN. */
+static inline u32 gx_tex_min_filter(u32 mode0) {
+    static const u8 k[8] = {0, 2, 4, 4, 1, 3, 5, 5};
+    return k[(mode0 >> 5) & 7u];
+}
 
 /* BP 0x60-0x63: preload a texture from RAM into TMEM (GXPreLoadEntireTexture).
    Textures marked as preloaded are then read from TMEM, not RAM. */

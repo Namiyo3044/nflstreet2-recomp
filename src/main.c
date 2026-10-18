@@ -13,6 +13,7 @@
 #include "runtime/pad.h"
 #include "gx/fifo.h"
 #include "gx/raster.h"
+#include "gx/hires.h"
 #include "audio/ax_hle.h"
 #include "runtime/mmio.h"
 #include "runtime/symbols.h"
@@ -513,6 +514,7 @@ static void usage(const char* argv0) {
             "         [--text FILE (game text replacements, default text-replacements.txt) | --no-text]\n"
             "         [--aspect auto|4:3|16:9 (screen shape; auto follows the game's widescreen option)]\n"
             "         [--gpu (draw with the graphics card) [--res N (its internal resolution, N x 640x528)]]\n"
+            "         [--textures DIR (custom textures, Dolphin format)] [--dump-textures DIR]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -525,6 +527,8 @@ int main(int argc, char** argv) {
     bool want_window = false;
     int window_scale = 2;
     int gpu_scale = 0;                 /* 0 = software renderer */
+    const char* textures_dir = NULL;
+    const char* dump_textures_dir = NULL;
     int aspect_mode = 0;
     bool idle_skip = true;
     const char* memcard_path = NULL;
@@ -591,6 +595,10 @@ int main(int argc, char** argv) {
             xfb_every = (u32)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--stop-at") == 0 && i + 1 < argc) {
             stop_at = strtod(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--textures") == 0 && i + 1 < argc) {
+            textures_dir = argv[++i];
+        } else if (strcmp(argv[i], "--dump-textures") == 0 && i + 1 < argc) {
+            dump_textures_dir = argv[++i];
         } else if (strcmp(argv[i], "--skip-hash") == 0) {
             skip_hash = true;
         } else if (argv[i][0] != '-' && !disc_dir) {
@@ -620,6 +628,13 @@ int main(int argc, char** argv) {
         g_dvd_open = symbols_address("DVDOpen");
         g_dvd_path = symbols_address("DVDConvertPathToEntrynum");
     }
+    if (textures_dir) {
+        if (gpu_scale)
+            hires_init(textures_dir);
+        else
+            printf("custom textures: only used with the graphics card renderer (not with --software)\n");
+    }
+    hires_set_dump_dir(dump_textures_dir);
     gx_raster_config(dump_dir, dump_every);
     gx_raster_config_xfb(xfb_every);
     if (draw_log)
