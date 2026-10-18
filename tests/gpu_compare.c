@@ -552,6 +552,12 @@ int main(int argc, char** argv) {
             static u32 px[640 * 480], flipped[640 * 480];
             gx_raster_present_gpu(&g_cpu, 0x10000000u | (XFB_ADDR >> 5), (40u << 8) | 80u, 240u << 4, 640, 480,
                                   4.0f / 3.0f, NULL);
+            if (getenv("OVERLAY")) {   /* tests: a half-transparent red block in the top left quarter */
+                static u32 ov[640 * 480];
+                for (int y = 0; y < 480; y++)
+                    for (int x = 0; x < 640; x++) ov[y * 640 + x] = (x < 320 && y < 240) ? 0x80800000u : 0;
+                glr_present_overlay(ov, 640, 480, true);
+            }
             glr_glBindFramebuffer(GL_FRAMEBUFFER, shot_fbo);
             glr_glReadPixels(0, 0, 640, 480, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, px);
             for (int y = 0; y < 480; y++) memcpy(flipped + y * 640, px + (479 - y) * 640, 640 * 4);

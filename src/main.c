@@ -14,6 +14,7 @@
 #include "gx/fifo.h"
 #include "gx/raster.h"
 #include "gx/hires.h"
+#include "platform/settings.h"
 #include "audio/ax_hle.h"
 #include "runtime/mmio.h"
 #include "runtime/symbols.h"
@@ -514,6 +515,7 @@ static void usage(const char* argv0) {
             "         [--text FILE (game text replacements, default text-replacements.txt) | --no-text]\n"
             "         [--aspect auto|4:3|16:9 (screen shape; auto follows the game's widescreen option)]\n"
             "         [--gpu (draw with the graphics card) [--res N (its internal resolution, N x 640x528)]]\n"
+            "         [--settings FILE (saved video settings; switches override them)] [--software]\n"
             "         [--textures DIR (custom textures, Dolphin format)] [--dump-textures DIR]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
@@ -530,6 +532,7 @@ int main(int argc, char** argv) {
     const char* textures_dir = NULL;
     const char* dump_textures_dir = NULL;
     int aspect_mode = 0;
+    bool have_settings = false;
     bool idle_skip = true;
     const char* memcard_path = NULL;
     const char* text_path = "text-replacements.txt";
@@ -540,8 +543,21 @@ int main(int argc, char** argv) {
     u32 xfb_every = 0;
     bool draw_log = false;
 
+    /* Saved settings first (the video menu's); switches below override them. */
+    for (int i = 1; i + 1 < argc; i++)
+        if (strcmp(argv[i], "--settings") == 0) {
+            settings_load(argv[i + 1]);
+            window_scale = g_settings.window_size;
+            gpu_scale = g_settings.renderer == 0 ? g_settings.resolution : 0;
+            aspect_mode = g_settings.screen_shape;
+            have_settings = true;
+        }
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--map") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--settings") == 0 && i + 1 < argc) {
+            i++;
+        } else if (strcmp(argv[i], "--software") == 0) {
+            gpu_scale = 0;
+        } else if (strcmp(argv[i], "--map") == 0 && i + 1 < argc) {
             map_path = argv[++i];
         } else if (strcmp(argv[i], "--max-steps") == 0 && i + 1 < argc) {
             max_steps = strtoull(argv[++i], NULL, 10);
@@ -562,7 +578,7 @@ int main(int argc, char** argv) {
             const char* a = argv[++i];
             aspect_mode = strcmp(a, "4:3") == 0 ? 1 : strcmp(a, "16:9") == 0 ? 2 : 0;
         } else if (strcmp(argv[i], "--gpu") == 0) {
-            if (!gpu_scale) gpu_scale = 1;
+            if (!gpu_scale) gpu_scale = have_settings ? g_settings.resolution : 1;
         } else if (strcmp(argv[i], "--res") == 0 && i + 1 < argc) {
             gpu_scale = atoi(argv[++i]);
             if (gpu_scale < 1) gpu_scale = 1;
@@ -629,8 +645,10 @@ int main(int argc, char** argv) {
         g_dvd_path = symbols_address("DVDConvertPathToEntrynum");
     }
     if (textures_dir) {
-        if (gpu_scale)
+        if (gpu_scale) {
             hires_init(textures_dir);
+            hires_set_enabled(g_settings.custom_textures != 0);
+        }
         else
             printf("custom textures: only used with the graphics card renderer (not with --software)\n");
     }

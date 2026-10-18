@@ -2,6 +2,7 @@
 #include "gx/raster.h"
 #include "gx/state.h"
 #include "gx/texture.h"
+#include "gx/hires.h"
 #include "gx/raster_internal.h"
 #include "gx/raster_gl.h"
 #include "runtime/interrupts.h"
@@ -738,7 +739,7 @@ static void snapshot_state(RenderState* ds) {
                 u32 mode0 = gx_bp[(texmap < 4 ? 0x80u : 0xA0u) + (texmap & 3u)];
                 u32 mode1 = gx_bp[(texmap < 4 ? 0x84u : 0xA4u) + (texmap & 3u)];
                 s->texels = tex->texels;
-                s->hires = g_gpu ? tex->hires : NULL;
+                s->hires = g_gpu && hires_enabled() ? tex->hires : NULL;
                 s->tw = tex->width;
                 s->th = tex->height;
                 s->wrap_s = mode0 & 3u;

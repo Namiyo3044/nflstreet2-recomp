@@ -1083,6 +1083,63 @@ void glr_present(const GlrPicture* pic, unsigned target_fbo, int win_w, int win_
     }
 }
 
+/* The port's own menu over the picture: a window-sized premultiplied
+   0xAARRGGBB picture, uploaded only when it changed. */
+static GLuint g_oprog, g_otex;
+static int g_ow, g_oh;
+
+void glr_present_overlay(const u32* px, int w, int h, bool dirty) {
+    if (!g_pready || !px || w <= 0 || h <= 0)
+        return;
+    if (!g_oprog) {
+        static const char* fs =
+            "#version 330 core\n"
+            "in vec2 v_uv;\n"
+            "out vec4 o_color;\n"
+            "uniform sampler2D u_tex;\n"
+            "void main() { o_color = texture(u_tex, v_uv); }\n";
+        GLuint v = compile(GL_VERTEX_SHADER, k_pvs), f = compile(GL_FRAGMENT_SHADER, fs);
+        if (!v || !f) return;
+        g_oprog = G(glCreateProgram)();
+        G(glAttachShader)(g_oprog, v);
+        G(glAttachShader)(g_oprog, f);
+        G(glBindFragDataLocation)(g_oprog, 0, "o_color");
+        G(glLinkProgram)(g_oprog);
+        G(glDeleteShader)(v);
+        G(glDeleteShader)(f);
+        G(glUseProgram)(g_oprog);
+        G(glUniform1i)(G(glGetUniformLocation)(g_oprog, "u_tex"), 0);
+    }
+    G(glActiveTexture)(GL_TEXTURE0);
+    if (!g_otex || w != g_ow || h != g_oh) {
+        if (g_otex) G(glDeleteTextures)(1, &g_otex);
+        g_otex = make_tex(GL_RGBA8, GL_BGRA, GL_UNSIGNED_BYTE, w, h);
+        g_ow = w;
+        g_oh = h;
+        dirty = true;
+    }
+    G(glBindTexture)(GL_TEXTURE_2D, g_otex);
+    G(glBindSampler)(0, 0);
+    if (dirty) {
+        G(glPixelStorei)(GL_UNPACK_ALIGNMENT, 4);
+        G(glTexSubImage2D)(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, px);
+    }
+    G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    G(glViewport)(0, 0, w, h);
+    G(glDisable)(GL_SCISSOR_TEST);
+    G(glEnable)(GL_BLEND);
+    G(glBlendEquationSeparate)(GL_FUNC_ADD, GL_FUNC_ADD);
+    G(glBlendFuncSeparate)(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    float v[16] = {-1, 1, 0, 0, 1, 1, 1, 0, -1, -1, 0, 1, 1, -1, 1, 1};   /* row 0 of the picture at the top */
+    G(glUseProgram)(g_oprog);
+    G(glBindVertexArray)(g_pvao);
+    G(glBindBuffer)(GL_ARRAY_BUFFER, g_pvbo);
+    G(glBufferData)(GL_ARRAY_BUFFER, sizeof(v), v, GL_STREAM_DRAW);
+    G(glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
+    G(glDisable)(GL_BLEND);
+}
+
 void glr_report(void) {
     if (!g_ready)
         return;

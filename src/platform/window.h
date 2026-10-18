@@ -14,6 +14,8 @@
  *   Tab (hold) = fast-forward
  *   F9 = screen shape: auto (follows the game's widescreen option) / 4:3 / 16:9
  *   F12 = draw log of the next two frames (drawlog.txt, drawlog-short.txt)
+ *   F1 (or the controller's Back / View button) = video menu (game paused)
+ *   F6 = memory search for a setting (see window.c)
  */
 
 /* Opens the window (scale = initial size as a multiple of 640x480).

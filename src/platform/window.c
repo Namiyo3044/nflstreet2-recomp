@@ -5,11 +5,15 @@
 #include "runtime/interrupts.h"
 #include "runtime/mmio.h"
 #include "runtime/pad.h"
+#include "platform/settings.h"
+#include "platform/menu.h"
+#include "gx/hires.h"
 
 #include <SDL3/SDL.h>
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define TEX_W 720
@@ -23,6 +27,8 @@ static SDL_AudioStream* g_audio;
 static u32 g_audio_rate;
 static bool g_quit;
 static bool g_fullscreen;
+static int g_gpu_scale;                /* 0 = software renderer */
+static bool g_gpu;                     /* GPU mode is running */
 static u32 g_pixels[TEX_W * TEX_H];
 static u32 g_shown_w = 640, g_shown_h = 480;
 
@@ -235,8 +241,6 @@ static void update_aspect(bool announce) {
    3.3 contexts share textures: one on a small hidden window, used by the
    renderer's GPU thread to draw; one on the game window, used here to show
    the finished frames. */
-static int g_gpu_scale;                /* 0 = software renderer */
-static bool g_gpu;                     /* GPU mode is running */
 static SDL_Window* g_gl_window;
 static SDL_GLContext g_gl_ctx, g_present_ctx;
 
@@ -340,10 +344,14 @@ bool window_open(int scale) {
         SDL_SetTextureScaleMode(g_texture, SDL_SCALEMODE_LINEAR);
     }
     printf("window: %s, keyboard: arrows=stick X=A Z=B C=X S=Y D=Z Q/W=L/R Enter=START, Esc quits, "
-           "Tab fast-forward, F7 free camera, F9 screen shape (auto/4:3/16:9), F10 screenshot, F11 fullscreen, F12 draw log\n",
+           "Tab fast-forward, F1 video menu, F7 free camera, F9 screen shape (auto/4:3/16:9), F10 screenshot, F11 fullscreen, F12 draw log\n",
            g_gpu ? "picture from the graphics card" : SDL_GetRendererName(g_renderer));
     open_audio();
     update_aspect(true);
+    if (g_settings.fullscreen) {
+        g_fullscreen = true;
+        SDL_SetWindowFullscreen(g_window, true);
+    }
     g_base_ns = g_stat_ns = SDL_GetTicksNS();
     return true;
 }
@@ -496,15 +504,142 @@ static void freecam_update(void) {
     gx_raster_set_free_camera(true, m);
 }
 
+/* ------------------------------------------------------- RAM search --- */
+/* F6: finds where in memory the game keeps a setting. Press F6, change the
+   setting in the game's menu, press F6 again, change it back, F6, and so on:
+   each press keeps only the bytes that switch between the same two values in
+   step with the setting. Shift+F6 starts over. Results go to the log
+   ("ramsearch:" lines). */
+static CPUState* g_cpu_ref;
+static u8 *g_rs_a, *g_rs_b, *g_rs_cand;
+static int g_rs_step;
+
+static void ram_search(bool restart) {
+    CPUState* cpu = g_cpu_ref;
+    if (!cpu || !cpu->ram) return;
+    u32 n = cpu->ram_size;
+    if (restart || !g_rs_a) {
+        free(g_rs_a); free(g_rs_b); free(g_rs_cand);
+        g_rs_a = (u8*)malloc(n);
+        g_rs_b = (u8*)malloc(n);
+        g_rs_cand = (u8*)malloc(n);
+        g_rs_step = 0;
+        if (!g_rs_a || !g_rs_b || !g_rs_cand) return;
+        if (restart) { printf("ramsearch: started over\n"); return; }
+    }
+    const u8* ram = cpu->ram;
+    u32 count = 0;
+    if (g_rs_step == 0) {
+        memcpy(g_rs_a, ram, n);
+        printf("ramsearch: snapshot 1 taken; change the setting, then press F6 again\n");
+    } else if (g_rs_step == 1) {
+        memcpy(g_rs_b, ram, n);
+        for (u32 i = 0; i < n; i++) count += (g_rs_cand[i] = g_rs_a[i] != g_rs_b[i]);
+    } else {
+        const u8* want = (g_rs_step & 1) ? g_rs_b : g_rs_a;
+        for (u32 i = 0; i < n; i++) {
+            if (g_rs_cand[i] && ram[i] != want[i]) g_rs_cand[i] = 0;
+            count += g_rs_cand[i];
+        }
+    }
+    if (g_rs_step > 0) {
+        printf("ramsearch: snapshot %d: %u bytes still match%s\n", g_rs_step + 1, count,
+               count > 64 ? "; change the setting again and press F6" : "");
+        if (count <= 64)
+            for (u32 i = 0; i < n; i++)
+                if (g_rs_cand[i])
+                    printf("ramsearch:   0x%08X: %u <-> %u\n", 0x80000000u | i, g_rs_a[i], g_rs_b[i]);
+    }
+    g_rs_step++;
+}
+
+/* ------------------------------------------------------ settings menu --- */
+static void set_window_size(void) {
+    if (g_fullscreen) return;
+    if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MAXIMIZED) SDL_RestoreWindow(g_window);
+    int s = g_settings.window_size;
+    SDL_SetWindowSize(g_window, (int)(480.0f * (float)s * g_aspect + 0.5f), 480 * s);
+    SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+}
+
+static void apply_settings(unsigned ch) {
+    if (ch & (1u << MI_SHAPE)) {
+        g_aspect_mode = g_settings.screen_shape;
+        update_aspect(true);
+    }
+    if (ch & (1u << MI_DISPLAY)) {
+        g_fullscreen = g_settings.fullscreen != 0;
+        SDL_SetWindowFullscreen(g_window, g_fullscreen);
+    }
+    if (ch & (1u << MI_WINSIZE))
+        set_window_size();
+    if (ch & (1u << MI_TEXTURES))
+        hires_set_enabled(g_settings.custom_textures != 0);
+}
+
+static void open_menu(void) {
+    MenuInfo mi = {g_gpu, g_gpu_scale, hires_file_count() > 0};
+    menu_open(&mi);
+}
+
+/* Keys and controller buttons while the menu is open. */
+static void menu_event(const SDL_Event* e) {
+    static int axis_dir[2];
+    if (e->type == SDL_EVENT_KEY_DOWN) {
+        switch (e->key.key) {
+        case SDLK_UP: menu_action(MENU_UP); break;
+        case SDLK_DOWN: menu_action(MENU_DOWN); break;
+        case SDLK_LEFT: menu_action(MENU_LEFT); break;
+        case SDLK_RIGHT: menu_action(MENU_RIGHT); break;
+        case SDLK_RETURN: case SDLK_SPACE: case SDLK_X: if (!e->key.repeat) menu_action(MENU_OK); break;
+        case SDLK_ESCAPE: case SDLK_F1: case SDLK_BACKSPACE: case SDLK_Z:
+            if (!e->key.repeat) menu_action(MENU_BACK);
+            break;
+        default: break;
+        }
+    } else if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        switch (e->gbutton.button) {
+        case SDL_GAMEPAD_BUTTON_DPAD_UP: menu_action(MENU_UP); break;
+        case SDL_GAMEPAD_BUTTON_DPAD_DOWN: menu_action(MENU_DOWN); break;
+        case SDL_GAMEPAD_BUTTON_DPAD_LEFT: menu_action(MENU_LEFT); break;
+        case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: menu_action(MENU_RIGHT); break;
+        case SDL_GAMEPAD_BUTTON_SOUTH: menu_action(MENU_OK); break;
+        case SDL_GAMEPAD_BUTTON_EAST: case SDL_GAMEPAD_BUTTON_BACK: case SDL_GAMEPAD_BUTTON_START:
+            menu_action(MENU_BACK);
+            break;
+        default: break;
+        }
+    } else if (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+               (e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX || e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY)) {
+        int i = e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY;
+        int d = e->gaxis.value > 20000 ? 1 : e->gaxis.value < -20000 ? -1 : 0;
+        if (d && d != axis_dir[i])
+            menu_action(i ? (d < 0 ? MENU_UP : MENU_DOWN) : (d < 0 ? MENU_LEFT : MENU_RIGHT));
+        axis_dir[i] = d;
+    }
+}
+
 static void poll_events(void) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
+        if (menu_is_open() && (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+                               e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION)) {
+            menu_event(&e);
+            continue;
+        }
         switch (e.type) {
         case SDL_EVENT_QUIT:
             g_quit = true;
             break;
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+            if (e.gbutton.button == SDL_GAMEPAD_BUTTON_BACK) open_menu();
+            break;
         case SDL_EVENT_KEY_DOWN:
-            if (e.key.key == SDLK_ESCAPE) {
+            if (e.key.key == SDLK_F1 && !e.key.repeat) {
+                open_menu();
+            } else if (e.key.key == SDLK_F6 && !e.key.repeat) {
+                ram_search((e.key.mod & SDL_KMOD_SHIFT) != 0);
+            } else if (e.key.key == SDLK_ESCAPE) {
                 g_quit = true;
             } else if (e.key.key == SDLK_F7 && !e.key.repeat) {
                 freecam_toggle();
@@ -520,9 +655,13 @@ static void poll_events(void) {
                 static const int k_next[] = {1, 2, 0};   /* auto -> 4:3 -> 16:9 -> auto */
                 g_aspect_mode = k_next[g_aspect_mode];
                 update_aspect(true);
+                g_settings.screen_shape = g_aspect_mode;
+                settings_save();
             } else if (e.key.key == SDLK_F11 && !e.key.repeat) {
                 g_fullscreen = !g_fullscreen;
                 SDL_SetWindowFullscreen(g_window, g_fullscreen);
+                g_settings.fullscreen = g_fullscreen;
+                settings_save();
             }
             break;
         case SDL_EVENT_MOUSE_WHEEL:
@@ -624,7 +763,14 @@ static void present_gpu(CPUState* cpu) {
         shot = path;
         g_shot_pending = false;
     }
-    gx_raster_present_gpu(cpu, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2), mmio_reg(0x2000, 2), ww, wh, g_aspect, shot);
+    gx_raster_present_gpu(cpu, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2), mmio_reg(0x2000, 2), ww, wh, g_aspect,
+                          menu_is_open() ? NULL : shot);
+    if (menu_is_open()) {
+        bool dirty;
+        const uint32_t* px = menu_draw(ww, wh, &dirty);
+        glr_present_overlay(px, ww, wh, dirty);
+        if (shot) g_shot_pending = true;   /* screenshots are of the game, not the menu */
+    }
     SDL_GL_SwapWindow(g_window);
 }
 
@@ -673,6 +819,24 @@ static void present(CPUState* cpu) {
     SDL_FRect src = {0, 0, (float)g_shown_w, (float)g_shown_h};
     SDL_FRect dst = {((float)ww - dw) * 0.5f, ((float)wh - dh) * 0.5f, dw, dh};
     SDL_RenderTexture(g_renderer, g_texture, &src, &dst);
+    if (menu_is_open()) {
+        static SDL_Texture* overlay;
+        static int ow, oh;
+        bool dirty;
+        const uint32_t* px = menu_draw(ww, wh, &dirty);
+        if (px && (!overlay || ow != ww || oh != wh)) {
+            if (overlay) SDL_DestroyTexture(overlay);
+            overlay = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, ww, wh);
+            if (overlay) SDL_SetTextureBlendMode(overlay, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
+            ow = ww;
+            oh = wh;
+            dirty = true;
+        }
+        if (px && overlay) {
+            if (dirty) SDL_UpdateTexture(overlay, NULL, px, ww * 4);
+            SDL_RenderTexture(g_renderer, overlay, NULL, NULL);
+        }
+    }
     SDL_RenderPresent(g_renderer);
 }
 
@@ -738,9 +902,39 @@ static void pace_and_stats(void) {
     }
 }
 
+/* The game stands still while the menu is open: the last picture stays up
+   under it, the sound pauses, and real-time pacing restarts afterwards. */
+static void menu_loop(CPUState* cpu) {
+    printf("window: video menu open\n");
+    if (g_audio) SDL_PauseAudioStreamDevice(g_audio);
+    PadLive idle = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
+    pad_set_live(&idle);
+    while (menu_is_open() && !g_quit) {
+        poll_events();
+        apply_settings(menu_take_changes());
+        present(cpu);
+        SDL_Delay(15);
+    }
+    apply_settings(menu_take_changes());
+    settings_save();
+    if (g_audio) SDL_ResumeAudioStreamDevice(g_audio);
+    Uint64 now = SDL_GetTicksNS();
+    g_base_ns = g_stat_ns = now;
+    g_base_field = g_field;
+    g_stat_fields = 0;
+    g_frames_at_stat = gx_raster_frames();
+    g_slept_ns = g_present_ns = 0;
+    printf("window: video menu closed\n");
+}
+
 void window_field(CPUState* cpu) {
     g_field++;
+    g_cpu_ref = cpu;
     poll_events();
+    if (menu_is_open()) {
+        menu_loop(cpu);
+        return;
+    }
     read_input();
     const bool* keys = SDL_GetKeyboardState(NULL);
     g_turbo_key = keys && keys[SDL_SCANCODE_TAB];

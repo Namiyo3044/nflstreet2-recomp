@@ -1,8 +1,9 @@
 # Builds the port and plays the game in a window at real-time speed.
 #
-#   .\play.ps1                 (window at 2x, 1280x960)
-#   .\play.ps1 -Scale 3        (bigger window)
-#   .\play.ps1 -Res 2          (graphics card's internal resolution, N x 640x528; default 4)
+#   .\play.ps1                 (with the settings from the video menu, F1 in the game window; saved in C:\nfls2\settings.ini)
+#   The switches below override those settings for one run:
+#   .\play.ps1 -Scale 3        (window size, N x 640x480)
+#   .\play.ps1 -Res 2          (graphics card's internal resolution, N x 640x528)
 #   .\play.ps1 -Debug          (extra diagnostics: call counts, file/stream logs, profile at exit; a little slower)
 #   .\play.ps1 -Software       (the old CPU renderer instead of the graphics card)
 #   .\play.ps1 -Textures D:\pack (custom textures in Dolphin's format; default C:\nfls2\textures, used if it exists)
@@ -11,17 +12,18 @@
 #   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
 #   .\play.ps1 -ShowTHX        (keep the THX intro; it is skipped by default)
-#   .\play.ps1 -Aspect 16:9    (screen shape: auto (default, follows the game's widescreen option), 4:3, 16:9)
+#   .\play.ps1 -Aspect 16:9    (screen shape: auto (follows the game's widescreen option), 4:3, 16:9)
 #
 # Keyboard: arrows = stick, X = A, Z = B, C = X, S = Y, D = Z, Q / W = L / R,
 #           Enter = START, I J K L = C-stick, T F G H = D-pad
-#           Esc = quit, Tab (hold) = fast-forward, F9 = screen shape (auto / 4:3 / 16:9), F10 = screenshot (shot_NNN.bmp), F11 = fullscreen,
+#           Esc = quit, F1 (or the controller's Back / View button) = video menu, Tab (hold) = fast-forward, F9 = screen shape (auto / 4:3 / 16:9), F10 = screenshot (shot_NNN.bmp), F11 = fullscreen,
 #           F12 = draw log of two frames (drawlog.txt, drawlog-short.txt).
 #           A USB/XInput controller also works.
 # The log (and the end-of-run report) goes to play.txt.
 param(
     [int]$Scale = 2,
     [string]$Aspect = "auto",
+    [string]$Settings = "C:\nfls2\settings.ini",
     [switch]$GPU,                      # the default now; kept so older commands still work
     [switch]$Software,
     [switch]$Debug,
@@ -82,12 +84,17 @@ if (-not (Get-Command cmake -ErrorAction SilentlyContinue) -or $env:VSCMD_ARG_TG
 cmake --build build
 if ($LASTEXITCODE -ne 0) { Write-Host "Build failed." -ForegroundColor Red; exit 1 }
 
-$gameArgs = @($Disc, "--map", $Map, "--quiet", "--window", "--scale", $Scale, "--aspect", $Aspect, "--dump-every", "0")
+New-Item -ItemType Directory -Force -Path (Split-Path $Settings) | Out-Null
+$gameArgs = @($Disc, "--map", $Map, "--quiet", "--window", "--dump-every", "0", "--settings", $Settings)
+if ($PSBoundParameters.ContainsKey("Scale")) { $gameArgs += @("--scale", $Scale) }
+if ($PSBoundParameters.ContainsKey("Aspect")) { $gameArgs += @("--aspect", $Aspect) }
 foreach ($p in $Press) { $gameArgs += @("--press", $p) }
 if ($NoIdleSkip) { $gameArgs += "--no-idle-skip" }
 if (-not $ShowTHX) { $gameArgs += "--skip-thx" }
 if ($NoText) { $gameArgs += @("--no-text") }
-if (-not $Software) { $gameArgs += @("--gpu", "--res", $Res) }
+if ($Software) { $gameArgs += @("--software") }
+elseif ($PSBoundParameters.ContainsKey("Res")) { $gameArgs += @("--gpu", "--res", $Res) }
+elseif ($GPU) { $gameArgs += @("--gpu") }
 if ($Debug) { $gameArgs += @("--debug") }
 if (-not $NoTextures -and (Test-Path $Textures)) { $gameArgs += @("--textures", $Textures) }
 if ($DumpTextures) {
@@ -111,6 +118,8 @@ $gpuLines = @($log | Select-String -Pattern "^gpu:|^custom textures:" | ForEach-
 $startup = @($log | Select-String -Pattern "^startup:" | ForEach-Object { $_.Line })
 $cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
 $txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })
+$rs = @($log | Select-String -Pattern "^ramsearch:" | ForEach-Object { $_.Line })
+if ($rs.Count -gt 0) { $report = @("memory search ($($rs.Count) lines):") + ($rs | Select-Object -Last 150) + $report }
 if ($txt.Count -gt 0) { $report = @("text search ($($txt.Count) lines):") + ($txt | Select-Object -Last 500) + $report }
 if ($cbl.Count -gt 0) { $report = @("sound callback list ($($cbl.Count) lines, last 40):") + ($cbl | Select-Object -Last 40) + $report }
 if ($perf.Count -gt 0) { $report = @("slow seconds: $($perf.Count) (last 20 shown)") + ($perf | Select-Object -Last 20) + $report }

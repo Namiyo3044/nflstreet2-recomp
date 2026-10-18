@@ -70,6 +70,10 @@ bool glr_present_init(void);
 void glr_present(const GlrPicture* pic, unsigned target_fbo, int win_w, int win_h, float aspect,
                  const char* shot_path);
 
+/* After glr_present: draws a window-sized picture (0xAARRGGBB, premultiplied
+   alpha, top row first) over it; dirty = it changed since the last call. */
+void glr_present_overlay(const u32* px, int w, int h, bool dirty);
+
 /* Tests: glr_present draws into this frame buffer when given target 0. */
 void glr_set_present_fbo(unsigned fbo);
 

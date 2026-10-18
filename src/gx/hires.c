@@ -284,6 +284,11 @@ void hires_set_dump_dir(const char* dir) {
 
 bool hires_active(void) { return g_active; }
 
+static volatile bool g_enabled = true;
+void hires_set_enabled(bool on) { g_enabled = on; }
+bool hires_enabled(void) { return g_enabled; }
+unsigned hires_file_count(void) { return g_files; }
+
 /* ------------------------------------------------------------- loader --- */
 static gx_mutex g_mx;
 static gx_cond g_cv;

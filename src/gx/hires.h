@@ -36,6 +36,11 @@ void hires_set_dump_dir(const char* dir);
 
 bool hires_active(void);
 
+/* Custom textures on or off (on by default); files found in the folder. */
+void hires_set_enabled(bool on);
+bool hires_enabled(void);
+unsigned hires_file_count(void);
+
 /* Looks up the replacement for a texture, starting its load if needed.
    data / size: the texture's level 0 bytes; tlut: its palette in TMEM
    (paletted formats, else NULL). mipmaps: the sampler uses mip levels.

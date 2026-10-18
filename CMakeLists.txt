@@ -83,6 +83,7 @@ endif()
 
 add_executable(nfls2
     src/main.c
+    src/platform/settings.c
     src/audio/ax_hle.c
     src/gx/fifo.c
     src/gx/hires.c
@@ -105,7 +106,7 @@ add_executable(nfls2
     src/runtime/symbols.c)
 target_link_libraries(nfls2 PRIVATE nfls2_game)
 if(NFLS2_WINDOW)
-    target_sources(nfls2 PRIVATE src/platform/window.c)
+    target_sources(nfls2 PRIVATE src/platform/window.c src/platform/menu.c)
     target_compile_definitions(nfls2 PRIVATE NFLS2_HAVE_WINDOW)
     if(TARGET SDL3::SDL3-static)
         target_link_libraries(nfls2 PRIVATE SDL3::SDL3-static)
