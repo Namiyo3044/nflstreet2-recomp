@@ -108,6 +108,11 @@ void interrupts_poll(CPUState* cpu) {
         take_external_interrupt(cpu);
 }
 
+u64 interrupts_next_event(void) {
+    u64 a = g_next_field, b = mmio_next_event();
+    return a < b ? a : b;
+}
+
 double interrupts_game_seconds(void) {
     return (double)g_fields * 1001.0 / 60000.0;
 }

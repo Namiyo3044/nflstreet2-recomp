@@ -1,12 +1,16 @@
+#include "runtime/prof.h"
 #include "platform/window.h"
 #include "gx/raster.h"
+#include "gx/raster_gl.h"
 #include "runtime/interrupts.h"
 #include "runtime/mmio.h"
 #include "runtime/pad.h"
 
 #include <SDL3/SDL.h>
 
+#include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #define TEX_W 720
 #define TEX_H 576
@@ -15,6 +19,8 @@ static SDL_Window* g_window;
 static SDL_Renderer* g_renderer;
 static SDL_Texture* g_texture;
 static SDL_Gamepad* g_pad;
+static SDL_AudioStream* g_audio;
+static u32 g_audio_rate;
 static bool g_quit;
 static bool g_fullscreen;
 static u32 g_pixels[TEX_W * TEX_H];
@@ -25,36 +31,319 @@ static Uint64 g_base_ns;               /* wall time of field g_base_field */
 static u64 g_base_field;
 static u64 g_field;
 static Uint64 g_stat_ns;
+static Uint64 g_slept_ns, g_present_ns;   /* this second: pacing sleep, picture output */
 static u64 g_stat_fields;
 static u32 g_frames_at_stat;
 
 #define FIELD_NS (1001000000.0 / 60.0) /* NTSC: 59.94 fields per second */
 
+/* Audio: finished audio-interface buffers (16-bit big-endian, right then
+   left) are converted to native left/right and queued to SDL. If the queue
+   runs more than ~150 ms ahead (the game ran fast for a moment), the buffer
+   is dropped so sound stays in step with the picture. */
+/* Fast-forward: no waiting for real time, few pictures shown, no sound.
+   On while Tab is held, and set by the game side to skip the intro movies. */
+static bool g_turbo_forced, g_turbo_key;
+
+void window_set_turbo(bool on) {
+    if (on != g_turbo_forced)
+        printf("window: fast-forward %s\n", on ? "on (skipping the THX intro)" : "off");
+    g_turbo_forced = on;
+}
+
+static bool turbo(void) {
+    return g_turbo_forced || g_turbo_key;
+}
+
+static unsigned g_audio_underruns, g_audio_sec_underruns, g_audio_sec_buffers, g_audio_sec_dropped;
+static int g_audio_sec_min_queue = 1 << 30;
+
+static void audio_sink(const u8* samples, u32 frames, u32 rate) {
+    if (!g_audio || !frames || turbo())
+        return;
+    if (rate != g_audio_rate) {
+        SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, (int)rate};
+        SDL_SetAudioStreamFormat(g_audio, &spec, NULL);
+        g_audio_rate = rate;
+    }
+    /* The game makes its sound in bursts: a whole video field's worth
+       (three 5 ms buffers) arrives within a few milliseconds and then nothing
+       until the next field. Keep a cushion of about 50 ms queued so the
+       sound card never runs dry between bursts; if it does (the game fell
+       behind), rebuild the cushion with a little silence. Over 200 ms
+       queued (the game ran ahead), drop the buffer to stay in sync. */
+    int bytes_per_ms = (int)(rate * 4u / 1000u);
+    int queued = SDL_GetAudioStreamQueued(g_audio);
+    g_audio_sec_buffers++;
+    if (queued < g_audio_sec_min_queue) g_audio_sec_min_queue = queued;
+    if (queued > bytes_per_ms * 200) {
+        g_audio_sec_dropped++;
+        return;
+    }
+    /* When the game runs a little slow it makes sound slightly slower than
+       real time. Rather than let the queue run dry (a gap), play slightly
+       slower as the queue gets low, by up to 5% (a barely audible pitch
+       drop), and back at normal speed once it refills. */
+    {
+        static float ratio = 1.0f;
+        float fill = (float)queued / (float)(bytes_per_ms * 50);      /* 1 = at the 50 ms target */
+        float want = fill >= 1.0f ? 1.0f : 0.95f + 0.05f * fill;
+        ratio += (want - ratio) * 0.05f;                                  /* glide, no sudden pitch jumps */
+        SDL_SetAudioStreamFrequencyRatio(g_audio, ratio);
+    }
+    /* Ran dry: rebuild the cushion with silence. The silence starts with a
+       short fade from the last sample played, and the sound that follows
+       fades back in, so the gap doesn't click. */
+    static s16 last_l, last_r;
+    static u32 fade_in;                /* frames of the coming sound still fading in */
+    const u32 fade = rate / 333u;      /* about 3 ms */
+    if (queued < bytes_per_ms * 4) {
+        s16 sil[2 * 800];
+        int want = (bytes_per_ms * 50 - queued) / 4;   /* frames */
+        u32 done = 0;
+        while (want > 0) {
+            int n = want > 800 ? 800 : want;
+            for (int i = 0; i < n; i++, done++) {
+                float g = done < fade ? 1.0f - (float)done / (float)fade : 0.0f;
+                sil[i * 2] = (s16)(last_l * g);
+                sil[i * 2 + 1] = (s16)(last_r * g);
+            }
+            SDL_PutAudioStreamData(g_audio, sil, n * 4);
+            want -= n;
+        }
+        fade_in = fade;
+        g_audio_underruns++;
+        g_audio_sec_underruns++;
+    }
+    s16 buf[2 * 4096];
+    while (frames) {
+        u32 n = frames > 4096 ? 4096 : frames;
+        for (u32 i = 0; i < n; i++) {
+            const u8* p = samples + i * 4;
+            s16 r = (s16)((p[0] << 8) | p[1]);
+            s16 l = (s16)((p[2] << 8) | p[3]);
+            if (fade_in) {
+                float g = 1.0f - (float)fade_in / (float)fade;
+                l = (s16)(l * g);
+                r = (s16)(r * g);
+                fade_in--;
+            }
+            buf[i * 2] = l;
+            buf[i * 2 + 1] = r;
+            last_l = l;
+            last_r = r;
+        }
+        SDL_PutAudioStreamData(g_audio, buf, (int)(n * 4));
+        samples += n * 4;
+        frames -= n;
+    }
+}
+
+static void open_audio(void) {
+    SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, 32000};
+    g_audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!g_audio) {
+        printf("window: no audio (%s)\n", SDL_GetError());
+        return;
+    }
+    g_audio_rate = 32000;
+    SDL_ResumeAudioStreamDevice(g_audio);
+    mmio_set_audio_sink(audio_sink);
+    printf("window: audio on\n");
+}
+
+/* Screen shape: 0 = follow the game's widescreen option, 1 = always 4:3,
+   2 = always 16:9. F9 cycles. */
+static int g_aspect_mode;
+static float g_aspect = 4.0f / 3.0f;
+static char g_title_shape[32] = "4:3 (auto)";
+static char g_title_stats[64] = "";
+
+static char g_title_cam[48] = "";
+
+static void set_title(void) {
+    char title[192];
+    snprintf(title, sizeof(title), "NFL Street 2%s%s  -  %s%s", g_title_stats[0] ? "  -  " : "", g_title_stats,
+             g_title_shape, g_title_cam);
+    SDL_SetWindowTitle(g_window, title);
+}
+
+void window_set_aspect_mode(int mode) {
+    g_aspect_mode = mode < 0 || mode > 2 ? 0 : mode;
+}
+
+/* The game's widescreen setting is only visible once it draws 3D (the title
+   screen), so in auto mode the last shape it was seen using is remembered
+   in a small file and used from the start of the next run: the intro movies
+   and loading screens then already show at that shape. */
+#define SHAPE_FILE "nfls2-screen.txt"
+static int g_saved_wide = -1;          /* -1 unknown, 0 4:3, 1 16:9 */
+/* The boot screens (memory card check, loading) draw some 3D at 4:3 whatever
+   the setting; detection is only believed from the NFL Street 2 intro on. */
+static bool g_shape_trusted;
+
+void window_trust_screen_shape(void) {
+    g_shape_trusted = true;
+    gx_raster_widescreen_reset();      /* what the boot screens showed doesn't count */
+}
+
+static void load_saved_shape(void) {
+    FILE* f = fopen(SHAPE_FILE, "r");
+    if (!f)
+        return;
+    char buf[32] = {0};
+    if (fgets(buf, sizeof(buf), f))
+        g_saved_wide = strncmp(buf, "16:9", 4) == 0 ? 1 : strncmp(buf, "4:3", 3) == 0 ? 0 : -1;
+    fclose(f);
+}
+
+static void save_shape(int wide) {
+    if (wide == g_saved_wide)
+        return;
+    g_saved_wide = wide;
+    FILE* f = fopen(SHAPE_FILE, "w");
+    if (f) {
+        fputs(wide ? "16:9\n" : "4:3\n", f);
+        fclose(f);
+    }
+}
+
+static void update_aspect(bool announce) {
+    int detected = g_shape_trusted || g_saved_wide < 0 ? gx_raster_widescreen() : -1;
+    if (g_aspect_mode == 0 && detected >= 0 && g_shape_trusted)
+        save_shape(detected);
+    int game_wide = detected >= 0 ? detected : g_saved_wide == 1;
+    int wide = g_aspect_mode == 2 || (g_aspect_mode == 0 && game_wide == 1);
+    float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+    if (aspect == g_aspect && !announce)
+        return;
+    bool changed = aspect != g_aspect;
+    g_aspect = aspect;
+    static const char* const k_mode[] = {"auto", "fixed", "fixed"};
+    snprintf(g_title_shape, sizeof(g_title_shape), "%s (%s)", wide ? "16:9" : "4:3", k_mode[g_aspect_mode]);
+    set_title();
+    printf("window: screen shape %s (%s)\n", wide ? "16:9" : "4:3", k_mode[g_aspect_mode]);
+    /* A plain window follows the new shape: same height, new width. */
+    if (changed && !g_fullscreen && !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_MAXIMIZED)) {
+        int w, h;
+        SDL_GetWindowSize(g_window, &w, &h);
+        SDL_SetWindowSize(g_window, (int)((float)h * aspect + 0.5f), h);
+    }
+}
+
+/* Graphics-card rendering (window_set_gpu before window_open). Two OpenGL
+   3.3 contexts share textures: one on a small hidden window, used by the
+   renderer's GPU thread to draw; one on the game window, used here to show
+   the finished frames. */
+static int g_gpu_scale;                /* 0 = software renderer */
+static bool g_gpu;                     /* GPU mode is running */
+static SDL_Window* g_gl_window;
+static SDL_GLContext g_gl_ctx, g_present_ctx;
+
+void window_set_gpu(int scale) {
+    g_gpu_scale = scale;
+}
+
+static void gl_make_current(void) {
+    if (SDL_GL_GetCurrentContext() != g_gl_ctx)
+        SDL_GL_MakeCurrent(g_gl_window, g_gl_ctx);
+}
+
+static void* gl_getproc(const char* name) {
+    return (void*)SDL_GL_GetProcAddress(name);
+}
+
+static void gpu_teardown(void) {
+    if (g_present_ctx) SDL_GL_DestroyContext(g_present_ctx);
+    if (g_gl_ctx) SDL_GL_DestroyContext(g_gl_ctx);
+    if (g_gl_window) SDL_DestroyWindow(g_gl_window);
+    g_present_ctx = g_gl_ctx = NULL;
+    g_gl_window = NULL;
+}
+
+/* Sets up both contexts and the renderer's GPU backend; g_window must have
+   been created with SDL_WINDOW_OPENGL. */
+static bool gpu_setup(void) {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+    g_gl_window = SDL_CreateWindow("NFL Street 2 (GPU)", 64, 64, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    if (!g_gl_window) {
+        printf("gpu: couldn't make the OpenGL window: %s\n", SDL_GetError());
+        return false;
+    }
+    g_gl_ctx = SDL_GL_CreateContext(g_gl_window);
+    if (!g_gl_ctx) {
+        printf("gpu: no OpenGL 3.3 context: %s\n", SDL_GetError());
+        return false;
+    }
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);   /* g_gl_ctx is current */
+    g_present_ctx = SDL_GL_CreateContext(g_window);
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+    if (!g_present_ctx) {
+        printf("gpu: no OpenGL context for the window: %s\n", SDL_GetError());
+        return false;
+    }
+    SDL_GL_MakeCurrent(g_gl_window, g_gl_ctx);
+    if (!gx_raster_use_gpu(gl_getproc, g_gpu_scale, gl_make_current))
+        return false;
+    /* From here the GPU thread owns g_gl_ctx; this thread keeps the window's. */
+    SDL_GL_MakeCurrent(g_window, g_present_ctx);
+    SDL_GL_SetSwapInterval(0);         /* pacing is done against the game's own clock */
+    if (!glr_present_init())
+        return false;
+    gx_raster_present_from_gpu(true);
+    return true;
+}
+
 bool window_open(int scale) {
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         fprintf(stderr, "error: SDL_Init failed: %s\n", SDL_GetError());
         return false;
     }
     if (scale < 1) scale = 1;
-    g_window = SDL_CreateWindow("NFL Street 2", 640 * scale, 480 * scale, SDL_WINDOW_RESIZABLE);
+    load_saved_shape();
+    bool start_wide = g_aspect_mode == 2 || (g_aspect_mode == 0 && g_saved_wide == 1);
+    int win_w = start_wide ? 853 * scale : 640 * scale, win_h = 480 * scale;
+    if (g_gpu_scale > 0) {
+        g_window = SDL_CreateWindow("NFL Street 2", win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
+        if (g_window && gpu_setup()) {
+            g_gpu = true;
+        } else {
+            printf("gpu: falling back to the software renderer\n");
+            gpu_teardown();
+            if (g_window) SDL_DestroyWindow(g_window);
+            g_window = NULL;
+        }
+    }
+    if (!g_window)
+        g_window = SDL_CreateWindow("NFL Street 2", win_w, win_h, SDL_WINDOW_RESIZABLE);
+    if (start_wide)
+        g_aspect = 16.0f / 9.0f;
     if (!g_window) {
         fprintf(stderr, "error: couldn't create the window: %s\n", SDL_GetError());
         return false;
     }
-    g_renderer = SDL_CreateRenderer(g_window, NULL);
-    if (!g_renderer) {
-        fprintf(stderr, "error: couldn't create a renderer: %s\n", SDL_GetError());
-        return false;
+    if (!g_gpu) {
+        g_renderer = SDL_CreateRenderer(g_window, NULL);
+        if (!g_renderer) {
+            fprintf(stderr, "error: couldn't create a renderer: %s\n", SDL_GetError());
+            return false;
+        }
+        SDL_SetRenderVSync(g_renderer, 0); /* pacing is done against the game's own clock */
+        g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, TEX_W, TEX_H);
+        if (!g_texture) {
+            fprintf(stderr, "error: couldn't create a texture: %s\n", SDL_GetError());
+            return false;
+        }
+        SDL_SetTextureScaleMode(g_texture, SDL_SCALEMODE_LINEAR);
     }
-    SDL_SetRenderVSync(g_renderer, 0); /* pacing is done against the game's own clock */
-    g_texture = SDL_CreateTexture(g_renderer, SDL_PIXELFORMAT_XRGB8888, SDL_TEXTUREACCESS_STREAMING, TEX_W, TEX_H);
-    if (!g_texture) {
-        fprintf(stderr, "error: couldn't create a texture: %s\n", SDL_GetError());
-        return false;
-    }
-    SDL_SetTextureScaleMode(g_texture, SDL_SCALEMODE_LINEAR);
-    printf("window: %s renderer, keyboard: arrows=stick X=A Z=B C=X S=Y D=Z Q/W=L/R Enter=START, Esc quits, F11 fullscreen\n",
-           SDL_GetRendererName(g_renderer));
+    printf("window: %s, keyboard: arrows=stick X=A Z=B C=X S=Y D=Z Q/W=L/R Enter=START, Esc quits, "
+           "Tab fast-forward, F7 free camera, F9 screen shape (auto/4:3/16:9), F10 screenshot, F11 fullscreen, F12 draw log\n",
+           g_gpu ? "picture from the graphics card" : SDL_GetRendererName(g_renderer));
+    open_audio();
+    update_aspect(true);
     g_base_ns = g_stat_ns = SDL_GetTicksNS();
     return true;
 }
@@ -64,15 +353,51 @@ bool window_quit_requested(void) {
 }
 
 void window_close(void) {
+    printf("window: sound card ran dry %u times (each refilled with 50 ms of silence)\n", g_audio_underruns);
+    mmio_set_audio_sink(NULL);
+    if (g_audio) SDL_DestroyAudioStream(g_audio);
+    g_audio = NULL;
     if (g_pad) SDL_CloseGamepad(g_pad);
     if (g_texture) SDL_DestroyTexture(g_texture);
     if (g_renderer) SDL_DestroyRenderer(g_renderer);
+    gx_raster_sync();
+    gpu_teardown();
     if (g_window) SDL_DestroyWindow(g_window);
     SDL_Quit();
     g_pad = NULL;
     g_texture = NULL;
     g_renderer = NULL;
     g_window = NULL;
+}
+
+/* Saves what is on screen (the last presented TV picture) as shot_NNN.bmp. */
+static void save_screenshot(void) {
+    static int n;
+    char path[64];
+    snprintf(path, sizeof(path), "shot_%03d.bmp", ++n);
+    FILE* f = fopen(path, "wb");
+    if (!f)
+        return;
+    u32 w = g_shown_w, h = g_shown_h, row = (w * 3 + 3) & ~3u, size = 54 + row * h;
+    u8 hdr[54] = {'B', 'M'};
+    hdr[2] = (u8)size; hdr[3] = (u8)(size >> 8); hdr[4] = (u8)(size >> 16); hdr[5] = (u8)(size >> 24);
+    hdr[10] = 54; hdr[14] = 40;
+    hdr[18] = (u8)w; hdr[19] = (u8)(w >> 8);
+    hdr[22] = (u8)h; hdr[23] = (u8)(h >> 8);
+    hdr[26] = 1; hdr[28] = 24;
+    fwrite(hdr, 1, 54, f);
+    u8 line[TEX_W * 3 + 4] = {0};
+    for (u32 y = 0; y < h; y++) {
+        const u32* src = g_pixels + (h - 1 - y) * w;
+        for (u32 x = 0; x < w; x++) {
+            line[x * 3] = (u8)src[x];
+            line[x * 3 + 1] = (u8)(src[x] >> 8);
+            line[x * 3 + 2] = (u8)(src[x] >> 16);
+        }
+        fwrite(line, 1, row, f);
+    }
+    fclose(f);
+    printf("window: screenshot saved to %s\n", path);
 }
 
 /* ------------------------------------------------------------- input --- */
@@ -82,6 +407,93 @@ static u8 axis_to_gc(Sint16 v, bool invert) {
     if (invert) x = -x;
     int r = 128 + x;
     return (u8)(r < 0 ? 0 : r > 255 ? 255 : r);
+}
+
+static bool g_text_search;
+static bool g_shot_pending;            /* GPU mode: save the next picture shown */
+
+bool window_take_text_search(void) {
+    bool r = g_text_search;
+    g_text_search = false;
+    return r;
+}
+
+/* ------------------------------------------------------- free camera --- */
+/* F7: fly the camera around the 3D scene (debug, like Dolphin's free look).
+   While it is on, keys and the controller move the camera instead of
+   playing: W/S forward/back, A/D sideways, Q/E down/up, arrows or the mouse
+   with the right button held to look around, Shift faster, mouse wheel to
+   change the speed, R back to the game's camera. */
+static bool g_freecam;
+static float g_cam_pos[3], g_cam_yaw, g_cam_pitch, g_cam_speed = 0.5f;
+static int g_cam_wheel;
+
+static void freecam_title(void) {
+    if (g_freecam)
+        snprintf(g_title_cam, sizeof(g_title_cam), "  -  FREE CAMERA (F7), speed %.3g", g_cam_speed);
+    else
+        g_title_cam[0] = 0;
+    set_title();
+}
+
+static void freecam_toggle(void) {
+    g_freecam = !g_freecam;
+    if (!g_freecam)
+        gx_raster_set_free_camera(false, NULL);
+    printf("window: free camera %s\n", g_freecam ? "on (W/S/A/D/Q/E move, arrows or right mouse look, R reset, F7 off)"
+                                                  : "off");
+    freecam_title();
+}
+
+static void freecam_update(void) {
+    const bool* k = SDL_GetKeyboardState(NULL);
+    float dx = 0, dy = 0;
+    SDL_MouseButtonFlags b = SDL_GetRelativeMouseState(&dx, &dy);
+    if (g_cam_wheel) {
+        g_cam_speed *= powf(1.25f, (float)g_cam_wheel);
+        if (g_cam_speed < 0.001f) g_cam_speed = 0.001f;
+        if (g_cam_speed > 1000.0f) g_cam_speed = 1000.0f;
+        g_cam_wheel = 0;
+        freecam_title();
+    }
+    if (k[SDL_SCANCODE_R]) {
+        g_cam_pos[0] = g_cam_pos[1] = g_cam_pos[2] = 0;
+        g_cam_yaw = g_cam_pitch = 0;
+    }
+    if (b & SDL_BUTTON_RMASK) {
+        g_cam_yaw -= dx * 0.004f;
+        g_cam_pitch -= dy * 0.004f;
+    }
+    if (k[SDL_SCANCODE_LEFT]) g_cam_yaw += 0.03f;
+    if (k[SDL_SCANCODE_RIGHT]) g_cam_yaw -= 0.03f;
+    if (k[SDL_SCANCODE_UP]) g_cam_pitch += 0.03f;
+    if (k[SDL_SCANCODE_DOWN]) g_cam_pitch -= 0.03f;
+    if (g_cam_pitch > 1.55f) g_cam_pitch = 1.55f;
+    if (g_cam_pitch < -1.55f) g_cam_pitch = -1.55f;
+
+    /* Orientation in the game camera's view space (looking down -z, y up). */
+    float cy = cosf(g_cam_yaw), sy = sinf(g_cam_yaw), cp = cosf(g_cam_pitch), sp = sinf(g_cam_pitch);
+    float R[3][3] = {{cy, sy * sp, sy * cp}, {0, cp, -sp}, {-sy, cy * sp, cy * cp}};
+    float fwd[3] = {-R[0][2], -R[1][2], -R[2][2]}, right[3] = {R[0][0], R[1][0], R[2][0]};
+    float v = g_cam_speed * ((k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT]) ? 5.0f : 1.0f);
+    for (int i = 0; i < 3; i++) {
+        if (k[SDL_SCANCODE_W]) g_cam_pos[i] += fwd[i] * v;
+        if (k[SDL_SCANCODE_S]) g_cam_pos[i] -= fwd[i] * v;
+        if (k[SDL_SCANCODE_D]) g_cam_pos[i] += right[i] * v;
+        if (k[SDL_SCANCODE_A]) g_cam_pos[i] -= right[i] * v;
+    }
+    if (k[SDL_SCANCODE_E]) g_cam_pos[1] += v;
+    if (k[SDL_SCANCODE_Q]) g_cam_pos[1] -= v;
+
+    /* view = R^T (p - pos) */
+    float m[12];
+    for (int r = 0; r < 3; r++) {
+        m[r * 4 + 0] = R[0][r];
+        m[r * 4 + 1] = R[1][r];
+        m[r * 4 + 2] = R[2][r];
+        m[r * 4 + 3] = -(R[0][r] * g_cam_pos[0] + R[1][r] * g_cam_pos[1] + R[2][r] * g_cam_pos[2]);
+    }
+    gx_raster_set_free_camera(true, m);
 }
 
 static void poll_events(void) {
@@ -94,10 +506,27 @@ static void poll_events(void) {
         case SDL_EVENT_KEY_DOWN:
             if (e.key.key == SDLK_ESCAPE) {
                 g_quit = true;
+            } else if (e.key.key == SDLK_F7 && !e.key.repeat) {
+                freecam_toggle();
+            } else if (e.key.key == SDLK_F8 && !e.key.repeat) {
+                g_text_search = true;
+            } else if (e.key.key == SDLK_F10 && !e.key.repeat) {
+                if (g_gpu) g_shot_pending = true;
+                else save_screenshot();
+            } else if (e.key.key == SDLK_F12 && !e.key.repeat) {
+                gx_raster_draw_log(interrupts_game_seconds(), 2);
+                printf("window: logging the next two frames to drawlog.txt and drawlog-short.txt\n");
+            } else if (e.key.key == SDLK_F9 && !e.key.repeat) {
+                static const int k_next[] = {1, 2, 0};   /* auto -> 4:3 -> 16:9 -> auto */
+                g_aspect_mode = k_next[g_aspect_mode];
+                update_aspect(true);
             } else if (e.key.key == SDLK_F11 && !e.key.repeat) {
                 g_fullscreen = !g_fullscreen;
                 SDL_SetWindowFullscreen(g_window, g_fullscreen);
             }
+            break;
+        case SDL_EVENT_MOUSE_WHEEL:
+            if (g_freecam) g_cam_wheel += e.wheel.y > 0 ? 1 : e.wheel.y < 0 ? -1 : 0;
             break;
         case SDL_EVENT_GAMEPAD_ADDED:
             if (!g_pad) {
@@ -120,6 +549,12 @@ static void poll_events(void) {
 }
 
 static void read_input(void) {
+    if (g_freecam) {                   /* the keys fly the camera; the game sees nothing pressed */
+        PadLive idle = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
+        pad_set_live(&idle);
+        freecam_update();
+        return;
+    }
     PadLive p = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
     const bool* k = SDL_GetKeyboardState(NULL);
 
@@ -175,12 +610,50 @@ static void read_input(void) {
 }
 
 /* ------------------------------------------------------------ output --- */
+static void present_gpu(CPUState* cpu) {
+    update_aspect(false);
+    int ww = 0, wh = 0;
+    SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
+    if (ww <= 0 || wh <= 0)
+        return;                        /* minimised */
+    char path[64];
+    const char* shot = NULL;
+    if (g_shot_pending) {
+        static int n;
+        snprintf(path, sizeof(path), "shot_%03d.bmp", ++n);
+        shot = path;
+        g_shot_pending = false;
+    }
+    gx_raster_present_gpu(cpu, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2), mmio_reg(0x2000, 2), ww, wh, g_aspect, shot);
+    SDL_GL_SwapWindow(g_window);
+}
+
 static void present(CPUState* cpu) {
+    if (g_gpu) {
+        present_gpu(cpu);
+        return;
+    }
     u32 w, h;
     if (gx_raster_xfb_rgb(cpu, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2), mmio_reg(0x2000, 2), g_pixels, TEX_W,
                           TEX_H, &w, &h)) {
         SDL_Rect r = {0, 0, (int)w, (int)h};
         SDL_UpdateTexture(g_texture, &r, g_pixels, (int)(w * 4));
+        /* Smooth scaling blends each pixel with its neighbours, so along the
+           bottom and right edges it also reads the texture just outside the
+           picture, which was never written (the strip of colour noise along
+           the bottom). Repeat the last row and column there. */
+        static u32 edge[TEX_W > TEX_H ? TEX_W + 1 : TEX_H + 1];
+        if (h < TEX_H) {
+            memcpy(edge, g_pixels + (size_t)(h - 1) * w, w * 4);
+            edge[w] = edge[w - 1];
+            SDL_Rect row = {0, (int)h, (int)(w < TEX_W ? w + 1 : w), 1};
+            SDL_UpdateTexture(g_texture, &row, edge, (int)(TEX_W * 4));
+        }
+        if (w < TEX_W) {
+            for (u32 y = 0; y < h; y++) edge[y] = g_pixels[(size_t)y * w + w - 1];
+            SDL_Rect col = {(int)w, 0, 1, (int)h};
+            SDL_UpdateTexture(g_texture, &col, edge, 4);
+        }
         if (w != g_shown_w || h != g_shown_h) {
             g_shown_w = w;
             g_shown_h = h;
@@ -189,10 +662,12 @@ static void present(CPUState* cpu) {
     SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
     SDL_RenderClear(g_renderer);
 
-    /* Scale to fit the window, keeping the 4:3 TV shape. */
+    /* Scale to fit the window, keeping the TV shape: 4:3, or 16:9 when the
+       game draws for a widescreen TV (the picture is stretched sideways). */
+    update_aspect(false);
     int ww, wh;
     SDL_GetRenderOutputSize(g_renderer, &ww, &wh);
-    float aspect = 4.0f / 3.0f;
+    float aspect = g_aspect;
     float dw = (float)ww, dh = (float)ww / aspect;
     if (dh > (float)wh) { dh = (float)wh; dw = dh * aspect; }
     SDL_FRect src = {0, 0, (float)g_shown_w, (float)g_shown_h};
@@ -204,8 +679,16 @@ static void present(CPUState* cpu) {
 static void pace_and_stats(void) {
     Uint64 now = SDL_GetTicksNS();
     double target = (double)g_base_ns + (double)(g_field - g_base_field) * FIELD_NS;
-    if ((double)now < target) {
+    if (turbo()) {
+        /* Fast-forward: run flat out, and restart the clock so normal speed
+           resumes smoothly afterwards instead of trying to catch up. */
+        g_base_ns = now;
+        g_base_field = g_field;
+    } else if ((double)now < target) {
+        int prev = prof_enter(PROF_SLEEP);
         SDL_DelayNS((Uint64)(target - (double)now));
+        prof_leave(prev);
+        g_slept_ns += SDL_GetTicksNS() - now;
     } else if ((double)now > target + 100000000.0) {
         /* More than 0.1 s behind: don't try to catch up, just carry on from now. */
         g_base_ns = now;
@@ -219,9 +702,36 @@ static void pace_and_stats(void) {
         u32 frames = gx_raster_frames();
         double fps = (double)(frames - g_frames_at_stat) / secs;
         double speed = (double)g_stat_fields * (FIELD_NS * 1e-9) / secs * 100.0;
-        char title[128];
-        snprintf(title, sizeof(title), "NFL Street 2 - %.0f fps - %.0f%% speed", fps, speed);
-        SDL_SetWindowTitle(g_window, title);
+        snprintf(g_title_stats, sizeof(g_title_stats), "%.0f fps - %.0f%% speed", fps, speed);
+        set_title();
+        /* When the game falls behind real time, log where the second went. */
+        double wait, draw_avg, draw_max;
+        u32 tris;
+        gx_raster_take_perf(&wait, &draw_avg, &draw_max, &tris);
+        unsigned samples[PROF_COUNT];
+        unsigned total = prof_take(samples);
+        if (speed < 95.0) {
+            double slept = (double)g_slept_ns * 1e-9, shown = (double)g_present_ns * 1e-9;
+            double game = secs - slept - shown - wait;
+            printf("perf: %5.1f s game time, %3.0f%% speed, %2.0f fps | per second: game code %3.0f ms, waiting for "
+                   "renderer %3.0f ms, showing %2.0f ms | frame draw avg %4.1f ms, worst %4.1f ms, %u triangles/frame\n",
+                   interrupts_game_seconds(), speed, fps, game / secs * 1000.0, wait / secs * 1000.0,
+                   shown / secs * 1000.0, draw_avg * 1000.0, draw_max * 1000.0, tris);
+            if (total) {
+                printf("perf:   game thread:");
+                for (int c = 0; c < PROF_COUNT; c++)
+                    if (samples[c] * 100u >= total)
+                        printf(" %s %u%%", prof_name(c), samples[c] * 100u / total);
+                printf("\n");
+            }
+        }
+        if (g_audio_sec_underruns || g_audio_sec_dropped)
+            printf("audio: %5.1f s game time, %u buffers this second, ran dry %u times, dropped %u, lowest queue %.1f ms\n",
+                   interrupts_game_seconds(), g_audio_sec_buffers, g_audio_sec_underruns, g_audio_sec_dropped,
+                   (double)g_audio_sec_min_queue / (g_audio_rate * 4.0 / 1000.0));
+        g_audio_sec_underruns = g_audio_sec_buffers = g_audio_sec_dropped = 0;
+        g_audio_sec_min_queue = 1 << 30;
+        g_slept_ns = g_present_ns = 0;
         g_stat_ns = now;
         g_stat_fields = 0;
         g_frames_at_stat = frames;
@@ -232,6 +742,15 @@ void window_field(CPUState* cpu) {
     g_field++;
     poll_events();
     read_input();
-    present(cpu);
+    const bool* keys = SDL_GetKeyboardState(NULL);
+    g_turbo_key = keys && keys[SDL_SCANCODE_TAB];
+    Uint64 t0 = SDL_GetTicksNS();
+    int prev = prof_enter(PROF_PRESENT);
+    /* Fast-forward: show one field in eight; while skipping the THX intro,
+       nothing at all (the last picture stays up). */
+    if (!turbo() || (!g_turbo_forced && (g_field & 7u) == 0))
+        present(cpu);
+    prof_leave(prev);
+    g_present_ns += SDL_GetTicksNS() - t0;
     pace_and_stats();
 }

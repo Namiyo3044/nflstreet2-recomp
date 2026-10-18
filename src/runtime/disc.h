@@ -21,4 +21,13 @@ const uint8_t* disc_fst(size_t* size);
 
 void disc_report(void);
 
+/* Game-time source for the per-file read log. */
+void disc_set_clock(double (*clock)(void));
+
+/* Each file the game read: how often, how much, and when. */
+void disc_report_files(void);
+
+/* The file holding a disc offset (and the offset within it), or NULL. */
+const char* disc_file_at(uint64_t offset, uint64_t* file_offset);
+
 #endif

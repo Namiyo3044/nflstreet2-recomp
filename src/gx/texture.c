@@ -1,3 +1,4 @@
+#include "runtime/prof.h"
 #include "gx/texture.h"
 #include "gx/state.h"
 
@@ -178,6 +179,60 @@ bool gx_tex_decode(const u8* src, u32 fmt, u32 w, u32 h, const u8* tlut, u32 tlu
     return true;
 }
 
+/* Bumped on every write to TMEM (palette loads and texture preloads). A
+   texture that reads TMEM is re-checked on its next use, even within a frame
+   (games reload a palette between two draws of the same texture, e.g.
+   outline then fill). */
+static u32 g_tlut_generation = 1;
+
+/* Change stamps for TMEM in 512-byte blocks: every preload or palette load
+   takes a new stamp and marks the blocks it wrote. A cached texture can then
+   tell whether its palette or preloaded data was touched without re-hashing. */
+#define TMEM_BLOCK 512u
+static u32 g_tmem_stamp = 1;
+static u32 g_tmem_block[TMEM_SIZE / TMEM_BLOCK];
+
+static void tmem_mark(u32 addr, u32 bytes) {
+    if (!bytes || addr >= TMEM_SIZE)
+        return;
+    u32 end = addr + bytes > TMEM_SIZE ? TMEM_SIZE : addr + bytes;
+    for (u32 b = addr / TMEM_BLOCK; b <= (end - 1) / TMEM_BLOCK; b++)
+        g_tmem_block[b] = g_tmem_stamp;
+}
+
+static u32 tmem_region_stamp(u32 addr, u32 bytes) {
+    if (!bytes || addr >= TMEM_SIZE)
+        return 0;
+    u32 end = addr + bytes > TMEM_SIZE ? TMEM_SIZE : addr + bytes;
+    u32 m = 0;
+    for (u32 b = addr / TMEM_BLOCK; b <= (end - 1) / TMEM_BLOCK; b++)
+        if (g_tmem_block[b] > m) m = g_tmem_block[b];
+    return m;
+}
+
+void gx_tex_preload(CPUState* cpu) {
+    u32 src = (gx_bp[0x60] << 5) & 0x01FFFFE0u;
+    u32 even = (gx_bp[0x61] & 0x7FFFu) * 32u, odd = (gx_bp[0x62] & 0x7FFFu) * 32u;
+    u32 lines = gx_bp[0x63] & 0x7FFFu, type = (gx_bp[0x63] >> 15) & 3u;
+    g_tmem_stamp++;
+    if (type == 3) {   /* RGBA8: 64-byte tiles split into AR (even bank) and GB (odd bank) halves */
+        tmem_mark(even, lines * 32u);
+        tmem_mark(odd, lines * 32u);
+        for (u32 i = 0; i < lines; i++, src += 64, even += 32, odd += 32) {
+            if (src + 64 > cpu->ram_size || even + 32 > TMEM_SIZE || odd + 32 > TMEM_SIZE)
+                break;
+            memcpy(g_tmem + even, cpu->ram + src, 32);
+            memcpy(g_tmem + odd, cpu->ram + src + 32, 32);
+        }
+    } else {
+        u32 bytes = lines * 32u;
+        tmem_mark(even, bytes);
+        if (src < cpu->ram_size && bytes <= cpu->ram_size - src && even + bytes <= TMEM_SIZE)
+            memcpy(g_tmem + even, cpu->ram + src, bytes);
+    }
+    g_tlut_generation++;
+}
+
 void gx_tex_load_tlut(CPUState* cpu, u32 src_reg, u32 dest_reg) {
     u32 src = (src_reg << 5) & 0x01FFFFE0u;
     u32 tmem = (dest_reg & 0x3FFu) << 9;
@@ -185,6 +240,9 @@ void gx_tex_load_tlut(CPUState* cpu, u32 src_reg, u32 dest_reg) {
     if (src >= cpu->ram_size || bytes > cpu->ram_size - src || tmem + bytes > TMEM_SIZE)
         return;
     memcpy(g_tmem + tmem, cpu->ram + src, bytes);
+    g_tmem_stamp++;
+    tmem_mark(tmem, bytes);
+    g_tlut_generation++;               /* paletted textures re-check their palette on next use */
 }
 
 /* ------------------------------------------------------------- cache --- */
@@ -193,18 +251,38 @@ void gx_tex_load_tlut(CPUState* cpu, u32 src_reg, u32 dest_reg) {
    decoded again if they changed. Least recently used entries are dropped
    when the cache is full. */
 typedef struct {
-    u32 addr, fmt, w, h, tlut_addr, tlut_fmt;
-    u64 hash;
+    u32 addr, fmt, w, h, tlut_addr, tlut_fmt, levels;
+    u64 hash;                          /* texture bytes (sampled for big RAM textures) */
+    u64 full_hash;                     /* all the bytes, for big RAM textures */
+    u64 tlut_hash;                     /* palette bytes (paletted formats) */
+    u32 tlut_gen;                      /* g_tlut_generation when last checked */
+    u32 pal_stamp, data_stamp;
+    bool overwritten;                  /* RAM rewritten by a frame-buffer copy: decode again in place */         /* TMEM stamps when palette / preloaded data were last checked */
     u32 checked_frame, used_frame;
     GxTexture tex;
     u32* data;
 } CacheEntry;
 
-#define CACHE_MAX 1024
+#define CACHE_MAX 2048
 static CacheEntry g_cache[CACHE_MAX];
 static u32 g_cache_count;
 static u32 g_frame = 1;
-static unsigned long long g_decodes, g_hits;
+
+/* Index from a texture's key to its cache entry (open addressing). Rebuilt
+   whenever an entry is created or replaced. */
+#define INDEX_SIZE 4096u
+static int g_index[INDEX_SIZE];
+static bool g_index_ready;
+
+static u32 key_hash(u32 addr, u32 fmt, u32 w, u32 h, u32 tlut_addr, u32 tlut_fmt, u32 levels) {
+    u32 k = addr * 2654435761u;
+    k ^= (fmt | (tlut_fmt << 4) | (levels << 8)) * 2246822519u;
+    k ^= (w | (h << 11)) * 3266489917u;
+    k ^= tlut_addr * 668265263u;
+    k ^= k >> 15;
+    return k & (INDEX_SIZE - 1u);
+}
+static unsigned long long g_decodes, g_hits, g_variants, g_variant_hits;
 
 static u64 hash_bytes(const u8* p, u32 n) {
     u64 h = 0x9E3779B97F4A7C15ull ^ n;
@@ -220,24 +298,44 @@ static u64 hash_bytes(const u8* p, u32 n) {
     return h;
 }
 
+/* Big textures in RAM are checked once a frame by sampling: 32-byte pieces
+   spread over the whole texture plus its start and end, about 8 KB in all.
+   Every 32 frames each one gets a full hash, so a change the samples miss
+   still shows within about half a second. */
+static u64 hash_sampled(const u8* p, u32 n) {
+    if (n <= 16384u)
+        return hash_bytes(p, n);
+    u64 h = 0x9E3779B97F4A7C15ull ^ n;
+    const u32 pieces = 192;
+    u32 step = (n - 32u) / pieces;
+    for (u32 k = 0; k < pieces; k++) {
+        u64 w[4];
+        memcpy(w, p + k * step, 32);
+        for (int j = 0; j < 4; j++) { h = (h ^ w[j]) * 0xFF51AFD7ED558CCDull; h ^= h >> 29; }
+    }
+    h ^= hash_bytes(p, 1024) * 3u;
+    h ^= hash_bytes(p + n - 1024, 1024) * 5u;
+    return h;
+}
+
 static u32 tlut_bytes(u32 fmt) {
     return fmt == FMT_C4 ? 16u * 2u : fmt == FMT_C8 ? 256u * 2u : 16384u * 2u;
 }
 
-static u64 entry_hash(CPUState* cpu, u32 addr, u32 size, bool paletted, u32 fmt, u32 tlut_addr) {
-    u64 h = hash_bytes(cpu->ram + addr, size);
-    if (paletted) {
-        u32 n = tlut_bytes(fmt);
-        if (tlut_addr + n <= TMEM_SIZE)
-            h ^= hash_bytes(g_tmem + tlut_addr, n) * 31u;
-    }
-    return h;
+static u64 palette_hash(u32 fmt, u32 tlut_addr) {
+    u32 n = tlut_bytes(fmt);
+    return tlut_addr + n <= TMEM_SIZE ? hash_bytes(g_tmem + tlut_addr, n) : 0;
 }
+
 
 /* Decoded buffers that were replaced or evicted while a frame that uses them
    may still be drawing; freed by gx_tex_collect_garbage() once it is done. */
-static u32** g_garbage;
+/* Two stages: buffers retired while recording the current frame may still be
+   used by that frame's draws, so they wait one more frame before being freed. */
+static u32** g_garbage;                /* retired during the frame being recorded */
 static u32 g_garbage_n, g_garbage_cap;
+static u32** g_garbage_old;            /* retired during the previous frame */
+static u32 g_garbage_old_n, g_garbage_old_cap;
 
 static void retire(u32* data) {
     if (!data)
@@ -254,10 +352,36 @@ static void retire(u32* data) {
     g_garbage[g_garbage_n++] = data;
 }
 
+static void (*g_free_hook)(const u32* texels);
+
+void gx_tex_set_free_hook(void (*hook)(const u32* texels)) {
+    g_free_hook = hook;
+}
+
 void gx_tex_collect_garbage(void) {
-    for (u32 i = 0; i < g_garbage_n; i++)
-        free(g_garbage[i]);
+    /* Called when the previous frame has been drawn and the one just recorded
+       is about to be: the older stage is no longer used by anything. */
+    for (u32 i = 0; i < g_garbage_old_n; i++) {
+        if (g_free_hook)
+            g_free_hook(g_garbage_old[i]);
+        free(g_garbage_old[i]);
+    }
+    u32** t = g_garbage_old; g_garbage_old = g_garbage; g_garbage = t;
+    u32 tc = g_garbage_old_cap; g_garbage_old_cap = g_garbage_cap; g_garbage_cap = tc;
+    g_garbage_old_n = g_garbage_n;
     g_garbage_n = 0;
+}
+
+void gx_tex_invalidate(u32 addr, u32 size) {
+    addr &= 0x01FFFFFFu;
+    for (u32 n = 0; n < g_cache_count; n++) {
+        CacheEntry* e = &g_cache[n];
+        if (e->addr & 0x80000000u)
+            continue;                  /* TMEM-preloaded or unused */
+        u32 bytes = e->tex.width && e->tex.height ? gx_tex_size(e->fmt, e->w, e->h) : 0;
+        if (e->addr < addr + size && addr < e->addr + bytes)
+            e->overwritten = true;
+    }
 }
 
 /* Called once per displayed frame: starts a new validation round. */
@@ -266,15 +390,84 @@ void gx_tex_flush_cache(void) {
 }
 
 void gx_tex_report(void) {
-    printf("textures: %u cached, %llu decodes, %llu cache hits\n", g_cache_count, g_decodes, g_hits);
+    printf("textures: %u cached, %llu decodes, %llu cache hits (%llu versions of a texture kept side by side, "
+           "%llu switches between them)\n", g_cache_count, g_decodes, g_hits, g_variants, g_variant_hits);
 }
 
-const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
+/* Lays out the mip chain: level l is (w >> l) x (h >> l), at least 1x1,
+   stored in RAM right after level l-1. Returns the bytes in RAM and fills the
+   level sizes and decoded offsets; *texels gets the decoded total. */
+static u32 mip_layout(u32 fmt, u32 w, u32 h, u32 levels, GxTexture* t, u32* texels) {
+    u32 bytes = 0, total = 0;
+    for (u32 l = 0; l < levels; l++) {
+        u32 lw = w >> l, lh = h >> l;
+        if (!lw) lw = 1;
+        if (!lh) lh = 1;
+        t->lw[l] = lw;
+        t->lh[l] = lh;
+        t->off[l] = total;
+        total += lw * lh;
+        bytes += gx_tex_size(fmt, lw, lh);
+    }
+    *texels = total;
+    return bytes;
+}
+
+static bool decode_levels(const u8* base, u32 fmt, const GxTexture* t, const u8* tlut, u32 tlut_fmt, u32* out) {
+    u32 src = 0;
+    for (u32 l = 0; l < t->levels; l++) {
+        if (!gx_tex_decode(base + src, fmt, t->lw[l], t->lh[l], tlut, tlut_fmt, out + t->off[l]))
+            return false;
+        src += gx_tex_size(fmt, t->lw[l], t->lh[l]);
+    }
+    return true;
+}
+
+/* Preloaded RGBA8 lives in two TMEM banks; rebuild the RAM tile layout
+   (32 bytes AR, then 32 bytes GB, per tile) so the normal decoder can read it. */
+static u8* g_rgba8_scratch;
+static u32 g_rgba8_scratch_size;
+
+static const u8* rgba8_from_tmem(u32 even, u32 odd, u32 size) {
+    if (size > g_rgba8_scratch_size) {
+        u8* p = (u8*)realloc(g_rgba8_scratch, size);
+        if (!p) return NULL;
+        g_rgba8_scratch = p;
+        g_rgba8_scratch_size = size;
+    }
+    for (u32 i = 0; i * 64 < size; i++) {
+        u32 e = even + i * 32, o = odd + i * 32;
+        if (e + 32 > TMEM_SIZE || o + 32 > TMEM_SIZE) return NULL;
+        memcpy(g_rgba8_scratch + i * 64, g_tmem + e, 32);
+        memcpy(g_rgba8_scratch + i * 64 + 32, g_tmem + o, 32);
+    }
+    return g_rgba8_scratch;
+}
+
+static void index_rebuild(void) {
+    for (u32 i = 0; i < INDEX_SIZE; i++) g_index[i] = -1;
+    for (u32 n = 0; n < g_cache_count; n++) {
+        const CacheEntry* c = &g_cache[n];
+        if (c->addr == 0xFFFFFFFFu)
+            continue;
+        u32 k = key_hash(c->addr, c->fmt, c->w, c->h, c->tlut_addr, c->tlut_fmt, c->levels);
+        while (g_index[k] >= 0) k = (k + 1u) & (INDEX_SIZE - 1u);
+        g_index[k] = (int)n;
+    }
+    g_index_ready = true;
+}
+
+static const GxTexture* tex_get(CPUState* cpu, u32 map) {
     /* Register sets for maps 0-3 and 4-7 live 0x20 apart. */
     u32 bank = map < 4 ? 0u : 0x20u, i = map & 3u;
+    u32 mode0 = gx_bp[0x80 + bank + i];
+    u32 mode1 = gx_bp[0x84 + bank + i];
     u32 image0 = gx_bp[0x88 + bank + i];
+    u32 image1 = gx_bp[0x8C + bank + i];
+    u32 image2 = gx_bp[0x90 + bank + i];
     u32 image3 = gx_bp[0x94 + bank + i];
     u32 tlut = gx_bp[0x98 + bank + i];
+    bool preloaded = (image1 >> 21) & 1u;      /* read from TMEM, not RAM */
 
     u32 w = (image0 & 0x3FFu) + 1, h = ((image0 >> 10) & 0x3FFu) + 1;
     u32 fmt = (image0 >> 20) & 0xFu;
@@ -282,56 +475,177 @@ const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
     bool paletted = fmt == FMT_C4 || fmt == FMT_C8 || fmt == FMT_C14X2;
     u32 tlut_addr = paletted ? (tlut & 0x3FFu) << 9 : 0;
     u32 tlut_fmt = paletted ? (tlut >> 10) & 3u : 0;
-    u32 size = gx_tex_size(fmt, w, h);
-    if (addr >= cpu->ram_size || size > cpu->ram_size - addr)
-        return NULL;
 
+    /* Mip levels: only when the minification filter uses them; the count
+       comes from the maximum LOD (4.4 fixed point) and the texture size. */
+    u32 levels = 1;
+    u32 min_filter = (mode0 >> 5) & 7u;
+    if (min_filter >= 2 && min_filter <= 5) {
+        u32 max_lod = ((mode1 >> 8) & 0xFFu) >> 4;
+        u32 n = 1, m = w > h ? w : h;
+        while ((m >> n) && n < GX_TEX_MAX_LEVELS) n++;
+        levels = max_lod + 1 < n ? max_lod + 1 : n;
+    }
+
+    GxTexture layout;
+    u32 texel_count;
+    layout.levels = levels;
+    u32 size = mip_layout(fmt, w, h, levels, &layout, &texel_count);
+    u32 even = 0, odd = 0;
+    if (preloaded) {
+        even = (image1 & 0x7FFFu) * 32u;
+        odd = (image2 & 0x7FFFu) * 32u;
+        addr = 0x80000000u | even;             /* cache key: TMEM, not a RAM address */
+        if (fmt == FMT_RGBA8 ? (even + size / 2 > TMEM_SIZE || odd + size / 2 > TMEM_SIZE) : even + size > TMEM_SIZE)
+            return NULL;
+    } else if (addr >= cpu->ram_size || size > cpu->ram_size - addr) {
+        return NULL;
+    }
+    u32 pal_bytes = paletted ? tlut_bytes(fmt) : 0;
+
+    /* Find the entry: the one this map used last time, else the index. */
     static u32 last_hit[8] = {0};
     CacheEntry* e = NULL;
+    u32 slot_found = 0;
+#define SAME(c) ((c)->addr == addr && (c)->fmt == fmt && (c)->w == w && (c)->h == h && \
+                 (c)->tlut_addr == tlut_addr && (c)->tlut_fmt == tlut_fmt && (c)->levels == levels)
     CacheEntry* c = &g_cache[last_hit[map & 7u]];
-    if (last_hit[map & 7u] < g_cache_count && c->addr == addr && c->fmt == fmt && c->w == w && c->h == h &&
-        c->tlut_addr == tlut_addr && c->tlut_fmt == tlut_fmt) {
+    if (last_hit[map & 7u] < g_cache_count && SAME(c)) {
         e = c;
+        slot_found = last_hit[map & 7u];
     } else {
-        for (u32 k = 0; k < g_cache_count; k++) {
-            c = &g_cache[k];
-            if (c->addr == addr && c->fmt == fmt && c->w == w && c->h == h &&
-                c->tlut_addr == tlut_addr && c->tlut_fmt == tlut_fmt) {
+        if (!g_index_ready)
+            index_rebuild();
+        for (u32 k = key_hash(addr, fmt, w, h, tlut_addr, tlut_fmt, levels), n = 0; n < INDEX_SIZE;
+             k = (k + 1u) & (INDEX_SIZE - 1u), n++) {
+            int idx = g_index[k];
+            if (idx < 0)
+                break;
+            c = &g_cache[idx];
+            if (SAME(c)) {
                 e = c;
-                last_hit[map & 7u] = k;
+                slot_found = (u32)idx;
+                last_hit[map & 7u] = (u32)idx;
                 break;
             }
         }
     }
+#undef SAME
+
+    /* The texture's bytes, fetched only when they have to be hashed or decoded. */
+    const u8* src = NULL;
+#define SRC() (src ? src : (src = preloaded ? (fmt == FMT_RGBA8 ? rgba8_from_tmem(even, odd, size) : g_tmem + even) \
+                                         : cpu->ram + addr))
 
     if (e) {
         e->used_frame = g_frame;
-        if (e->checked_frame == g_frame) {
+        bool data_ok, pal_ok;
+        u64 hsh = e->hash, tsh = e->tlut_hash;
+        if (preloaded) {
+            /* Preloaded data changes only through TMEM loads. */
+            u32 st = fmt == FMT_RGBA8 ? tmem_region_stamp(even, size / 2) : tmem_region_stamp(even, size);
+            if (fmt == FMT_RGBA8) { u32 st2 = tmem_region_stamp(odd, size / 2); if (st2 > st) st = st2; }
+            data_ok = st <= e->data_stamp;
+            if (!data_ok) {
+                if (!SRC()) return NULL;
+                hsh = hash_bytes(src, size);
+                e->data_stamp = g_tmem_stamp;
+            }
+        } else if (e->overwritten) {
+            /* Rewritten by a frame-buffer copy: decode again into this entry. */
+            e->overwritten = false;
+            e->checked_frame = g_frame;
+            if (!SRC()) return NULL;
+            u32* fresh = (u32*)malloc((size_t)texel_count * 4);
+            if (!fresh || !decode_levels(src, fmt, &e->tex, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, fresh)) {
+                free(fresh);
+                return NULL;
+            }
+            retire(e->data);
+            e->data = fresh;
+            e->tex.texels = fresh;
+            e->hash = hash_sampled(src, size);
+            e->full_hash = size > 16384u ? hash_bytes(src, size) : 0;
+            g_decodes++;
+            return &e->tex;
+        } else {
+            data_ok = e->checked_frame == g_frame;
+            if (!data_ok) {
+                /* Sampled hash every frame; the full hash every 32nd frame
+                   (staggered across entries). */
+                if (!SRC()) return NULL;
+                hsh = hash_sampled(src, size);
+                if (hsh == e->hash && ((g_frame + slot_found) & 31u) == 0 && size > 16384u &&
+                    hash_bytes(src, size) != e->full_hash)
+                    hsh = ~e->hash;            /* the samples missed a change */
+                e->checked_frame = g_frame;
+            }
+        }
+        if (paletted) {
+            pal_ok = tmem_region_stamp(tlut_addr, pal_bytes) <= e->pal_stamp;
+            if (!pal_ok) {
+                tsh = palette_hash(fmt, tlut_addr);
+                e->pal_stamp = g_tmem_stamp;
+            }
+        } else {
+            pal_ok = true;
+        }
+        if ((data_ok && pal_ok) || (hsh == e->hash && tsh == e->tlut_hash)) {
             g_hits++;
             return &e->tex;
         }
-        u64 hsh = entry_hash(cpu, addr, size, paletted, fmt, tlut_addr);
-        e->checked_frame = g_frame;
-        if (hsh == e->hash) {
-            g_hits++;
-            return &e->tex;
+        /* Different contents under the same address: often the same texture
+           drawn with another palette (team colours loaded into one palette
+           slot), or one buffer reused for several images. Keep each version
+           as its own entry instead of decoding again on every switch. */
+        bool sampled_only_change = !preloaded && hsh == ~e->hash;
+        if (!sampled_only_change) {
+            if (!g_index_ready)
+                index_rebuild();
+            for (u32 k = key_hash(addr, fmt, w, h, tlut_addr, tlut_fmt, levels), n = 0; n < INDEX_SIZE;
+                 k = (k + 1u) & (INDEX_SIZE - 1u), n++) {
+                int idx = g_index[k];
+                if (idx < 0)
+                    break;
+                CacheEntry* v = &g_cache[idx];
+                if (v == e || v->addr != addr || v->fmt != fmt || v->w != w || v->h != h ||
+                    v->tlut_addr != tlut_addr || v->tlut_fmt != tlut_fmt || v->levels != levels)
+                    continue;
+                if (v->hash == hsh && v->tlut_hash == tsh) {
+                    v->used_frame = v->checked_frame = g_frame;
+                    v->pal_stamp = v->data_stamp = g_tmem_stamp;
+                    last_hit[map & 7u] = (u32)idx;
+                    g_hits++;
+                    g_variant_hits++;
+                    return &v->tex;
+                }
+            }
+            if (g_cache_count < CACHE_MAX) {
+                g_variants++;
+                goto new_entry;
+            }
         }
         /* Changed: decode into a new buffer; the old one may still be in use
            by the frame being drawn. */
-        u32* fresh = (u32*)malloc((size_t)w * h * 4);
-        if (!fresh || !gx_tex_decode(cpu->ram + addr, fmt, w, h, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, fresh)) {
+        if (!SRC()) return NULL;
+        u32* fresh = (u32*)malloc((size_t)texel_count * 4);
+        if (!fresh || !decode_levels(src, fmt, &e->tex, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, fresh)) {
             free(fresh);
             return NULL;
         }
         retire(e->data);
         e->data = fresh;
         e->tex.texels = fresh;
-        e->hash = hsh;
+        e->hash = preloaded ? hsh : hash_sampled(src, size);
+        e->full_hash = !preloaded && size > 16384u ? hash_bytes(src, size) : 0;
+        e->tlut_hash = tsh;
         g_decodes++;
         return &e->tex;
     }
 
+new_entry:
     /* New entry: take a free slot, or the least recently used one. */
+    if (!SRC()) return NULL;
     u32 slot = g_cache_count;
     if (slot >= CACHE_MAX) {
         slot = 0;
@@ -346,21 +660,35 @@ const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
     }
     e = &g_cache[slot];
     memset(e, 0, sizeof(*e));
-    e->data = (u32*)malloc((size_t)w * h * 4);
-    if (!e->data || !gx_tex_decode(cpu->ram + addr, fmt, w, h, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, e->data)) {
-        free(e->data);             /* never handed out */
-        e->data = NULL;
-        e->addr = 0xFFFFFFFFu;       /* matches nothing; reused later */
-        return NULL;
-    }
-    e->addr = addr; e->fmt = fmt; e->w = w; e->h = h;
-    e->tlut_addr = tlut_addr; e->tlut_fmt = tlut_fmt;
-    e->hash = entry_hash(cpu, addr, size, paletted, fmt, tlut_addr);
-    e->checked_frame = e->used_frame = g_frame;
+    g_index_ready = false;
+    e->tex = layout;
     e->tex.width = w;
     e->tex.height = h;
+    e->data = (u32*)malloc((size_t)texel_count * 4);
+    if (!e->data || !decode_levels(src, fmt, &e->tex, paletted ? g_tmem + tlut_addr : NULL, tlut_fmt, e->data)) {
+        free(e->data);             /* never handed out */
+        e->data = NULL;
+        e->addr = 0xFFFFFFFFu;     /* matches nothing; reused later */
+        return NULL;
+    }
+    e->addr = addr; e->fmt = fmt; e->w = w; e->h = h; e->levels = levels;
+    e->tlut_addr = tlut_addr; e->tlut_fmt = tlut_fmt;
+    e->hash = preloaded ? hash_bytes(src, size) : hash_sampled(src, size);
+    e->full_hash = !preloaded && size > 16384u ? hash_bytes(src, size) : 0;
+    e->tlut_hash = paletted ? palette_hash(fmt, tlut_addr) : 0;
+    e->checked_frame = e->used_frame = g_frame;
+    e->tlut_gen = g_tlut_generation;
+    e->pal_stamp = e->data_stamp = g_tmem_stamp;
     e->tex.texels = e->data;
     last_hit[map & 7u] = slot;
     g_decodes++;
     return &e->tex;
+#undef SRC
+}
+
+const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
+    int prev = prof_enter(PROF_GX_TEXTURE);
+    const GxTexture* t = tex_get(cpu, map);
+    prof_leave(prev);
+    return t;
 }

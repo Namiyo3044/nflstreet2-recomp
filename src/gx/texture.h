@@ -11,16 +11,25 @@
  * again only when their bytes in RAM (or their colour table) change.
  */
 
+#define GX_TEX_MAX_LEVELS 11
+
 typedef struct {
-    u32 width, height;
-    const u32* texels;     /* width*height, 0xAARRGGBB */
+    u32 width, height;     /* level 0 */
+    const u32* texels;     /* all levels one after another, 0xAARRGGBB */
+    u32 levels;            /* mip levels decoded (1 = no mipmaps) */
+    u32 lw[GX_TEX_MAX_LEVELS], lh[GX_TEX_MAX_LEVELS];
+    u32 off[GX_TEX_MAX_LEVELS];  /* texel offset of each level in texels */
 } GxTexture;
+
+/* BP 0x60-0x63: preload a texture from RAM into TMEM (GXPreLoadEntireTexture).
+   Textures marked as preloaded are then read from TMEM, not RAM. */
+void gx_tex_preload(CPUState* cpu);
 
 /* BP 0x64/0x65: copy a colour table from RAM into TMEM. */
 void gx_tex_load_tlut(CPUState* cpu, u32 src_reg, u32 dest_reg);
 
-/* The texture currently bound to texture map 0-7, decoded (NULL if it can't
-   be read). */
+/* The texture currently bound to texture map 0-7, decoded with its mip
+   levels when its filter uses them (NULL if it can't be read). */
 const GxTexture* gx_tex_get(CPUState* cpu, u32 map);
 
 /* Called once per displayed frame: each cached texture is re-checked against
@@ -31,6 +40,10 @@ void gx_tex_flush_cache(void);
    frame that may use them is still being drawn. */
 void gx_tex_collect_garbage(void);
 
+/* Called with each decoded buffer just before it is freed (the GPU backend
+   drops its copy). */
+void gx_tex_set_free_hook(void (*hook)(const u32* texels));
+
 /* Prints cache statistics. */
 void gx_tex_report(void);
 
@@ -40,5 +53,9 @@ bool gx_tex_decode(const u8* src, u32 fmt, u32 w, u32 h, const u8* tlut, u32 tlu
 
 /* Bytes a texture of this format and size occupies in RAM. */
 u32 gx_tex_size(u32 fmt, u32 w, u32 h);
+
+/* The GPU wrote texture data to RAM (a frame-buffer copy): cached textures
+   overlapping [addr, addr + size) are decoded again on their next use. */
+void gx_tex_invalidate(u32 addr, u32 size);
 
 #endif

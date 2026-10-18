@@ -56,6 +56,47 @@ void gx_raster_sync(void);
 /* Number of frames copied to the display so far. */
 u32 gx_raster_frames(void);
 
+/* Whether the game is drawing for a 16:9 screen (its widescreen option):
+   1 = yes, 0 = no (4:3), -1 = not known yet (no 3D drawn so far). */
+int gx_raster_widescreen(void);
+
+/* Forget what was detected so far (start detecting afresh). */
+void gx_raster_widescreen_reset(void);
+
+/* RAM at addr was written outside the GPU's frame-buffer copies (the
+   redirected gather pipe, as movie players use). */
+void gx_raster_note_ram_write(u32 addr);
+
+/* Renderer timing since the last call: seconds the game waited for the
+   drawing threads, average and worst time to draw a frame, triangles per frame. */
+void gx_raster_take_perf(double* wait_s, double* draw_avg_s, double* draw_max_s, u32* tris_per_frame);
+
+/* Draw with the graphics card from now on (OpenGL 3.3). The context must be
+   current on this thread for the call, and released afterwards: drawing
+   happens on the renderer's own GPU thread, which calls make_current before
+   each batch of GL work. scale: internal resolution as a multiple of the
+   GameCube's. Returns false (the software renderer stays) if the GPU setup
+   fails. */
+bool gx_raster_use_gpu(void* (*getproc)(const char*), int scale, void (*make_current)(void));
+
+/* GPU mode: the window shows frames from the GPU (call once the presenting
+   context is set up), so copies to the TV buffer aren't written to RAM. */
+void gx_raster_present_from_gpu(bool on);
+
+/* GPU mode: draws the picture the TV shows into the current context's window
+   (win_w x win_h pixels, TV shape `aspect`), from the GPU's copy of the
+   frame or from RAM; saves a screenshot if shot_path is set. */
+void gx_raster_present_gpu(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, int win_w, int win_h, float aspect,
+                           const char* shot_path);
+
+/* The command stream wrote n words to transform unit address addr
+   (0x000-0x7FF memory, 0x1000-0x10FF registers), after updating gx_xf_*. */
+void gx_raster_xf_write(u32 addr, const u32* values, u32 n);
+
+/* Free camera (debug): m is a 3x4 row-major matrix applied to view-space
+   positions of 3D draws before projection (on = false: the game's camera). */
+void gx_raster_set_free_camera(bool on, const float m[12]);
+
 void gx_raster_report(void);
 
 #endif

@@ -1,3 +1,6 @@
+#include "runtime/prof.h"
+#include "gx/raster.h"
+#include "runtime/exi.h"
 #include "mmio.h"
 #include "gx/fifo.h"
 #include "runtime/disc.h"
@@ -85,6 +88,26 @@ static u16 g_dsp_csr = DSP_CSR_HALT;
    AI DMA interrupt. AX mixes one 5 ms frame per interrupt. */
 static bool g_ai_dma_on;
 static u64 g_ai_dma_next;
+static u32 g_ai_dma_addr, g_ai_dma_bytes;   /* the buffer currently playing (latched at its start) */
+static MmioAudioSink g_audio_sink;
+static unsigned long long g_audio_frames_out;
+
+void mmio_set_audio_sink(MmioAudioSink sink) {
+    g_audio_sink = sink;
+}
+
+const u8* mmio_aram(u32* size) {
+    *size = ARAM_SIZE;
+    return g_aram;
+}
+
+/* Latches the buffer the audio DMA plays next: start address (DSP 0x30/0x32)
+   and length in 32-byte blocks (DSP 0x36). */
+static void ai_dma_latch(void) {
+    g_ai_dma_addr = ((reg16(DSP + 0x30) & 0x03FFu) << 16 | reg16(DSP + 0x32)) & 0x01FFFFE0u;
+    u32 blocks = reg16(DSP + 0x36) & 0x7FFFu;
+    g_ai_dma_bytes = (blocks ? blocks : 0x14) * 32u;
+}
 
 static u64 ai_dma_period(void) {
     u32 blocks = reg16(DSP + 0x36) & 0x7FFFu;
@@ -248,8 +271,10 @@ static bool dsp_write(CPUState* cpu, u32 off, u32 value, u8 size) {
         /* Audio DMA control: bit 15 starts streaming the output buffer to the
            audio interface; the low bits are its length in 32-byte blocks. */
         bool on = (value & 0x8000u) != 0;
-        if (on && !g_ai_dma_on)
+        if (on && !g_ai_dma_on) {
             g_ai_dma_next = cpu->timebase + ai_dma_period();
+            ai_dma_latch();
+        }
         g_ai_dma_on = on;
     }
     return true;
@@ -309,6 +334,30 @@ void mmio_pe_token(u16 token, bool interrupt) {
 }
 
 /* ----------------------------------------------------------------- DI --- */
+/* Where RAM contents came from: the last few thousand disc reads, so a
+   search of memory can say which file a piece of data was loaded from. */
+#define DISC_LOG 4096
+static struct { u32 ram, len; u64 disc; } g_disc_log[DISC_LOG];
+static u32 g_disc_log_pos;
+
+static void note_disc_read(u32 ram, u32 len, u64 disc) {
+    g_disc_log[g_disc_log_pos % DISC_LOG].ram = ram;
+    g_disc_log[g_disc_log_pos % DISC_LOG].len = len;
+    g_disc_log[g_disc_log_pos % DISC_LOG].disc = disc;
+    g_disc_log_pos++;
+}
+
+const char* mmio_ram_source(u32 ram, u64* file_offset) {
+    u32 n = g_disc_log_pos < DISC_LOG ? g_disc_log_pos : DISC_LOG;
+    for (u32 k = 1; k <= n; k++) {                    /* newest first */
+        u32 i = (g_disc_log_pos - k) % DISC_LOG;
+        if (ram >= g_disc_log[i].ram && ram - g_disc_log[i].ram < g_disc_log[i].len)
+            return disc_file_at(g_disc_log[i].disc + (ram - g_disc_log[i].ram), file_offset);
+    }
+    return NULL;
+}
+
+
 /* Disc interface: commands complete instantly, reading from the virtual disc
    built from the extracted disc folder (runtime/disc.c). */
 #define DI 0x6000u
@@ -338,9 +387,17 @@ static bool di_interrupt_pending(void) {
            ((g_di_cvr & 0x4u) && (g_di_cvr & 0x2u));
 }
 
+static unsigned long long g_di_cmd_count[256];
+static u32 g_di_stream_log;
+
 static void di_execute(CPUState* cpu) {
     u32 cmd0 = reg_get(DI_CMD0, 4);
     u32 cmd = cmd0 >> 24;
+    g_di_cmd_count[cmd]++;
+    if (cmd >= 0xE1 && cmd <= 0xE4 && g_di_stream_log < 16) {
+        g_di_stream_log++;
+        printf("  disc audio stream command 0x%08X 0x%08X 0x%08X\n", cmd0, reg_get(DI_CMD1, 4), reg_get(DI_CMD2, 4));
+    }
     u32 cr = reg_get(DI_CR, 4);
     bool dma = (cr & 2u) != 0;
     u32 mar = reg_get(DI_MAR, 4) & 0x01FFFFE0u;
@@ -356,8 +413,10 @@ static void di_execute(CPUState* cpu) {
                    0x80000000u | mar);
         }
         if (dma) {
-            if (mar + n <= cpu->ram_size)
+            if (mar + n <= cpu->ram_size) {
                 disc_read(offset, cpu->ram + mar, n);
+                note_disc_read(mar, n, offset);
+            }
             set16(DI_LENGTH, 0);
             reg_set(DI_LENGTH, 0, 4);
         } else {
@@ -595,19 +654,7 @@ static void ai_write_control(CPUState* cpu, u32 value) {
 }
 
 /* ---------------------------------------------------------------- EXI --- */
-/* Transfers complete the moment they start; no devices answer yet, so SRAM
-   and the RTC read as zero and memory cards are absent. */
-static bool exi_write(u32 off, u32 value, u8 size) {
-    u32 r = (off - 0x6800u) % 0x14u;
-    u32 ch = (off - 0x6800u) / 0x14u;
-    if (ch < 3 && r == 0x0C && (value & 1u)) {
-        reg_set(off, value & ~1u, size);              /* TSTART clears */
-        u32 csr = 0x6800u + ch * 0x14u;
-        reg_set(csr, reg_get(csr, 4) | 0x8u, 4);      /* TCINT: transfer complete */
-        return true;
-    }
-    return false;
-}
+/* Memory cards and the IPL chip (RTC, SRAM): runtime/exi.c. */
 
 /* --------------------------------------------------------------- glue --- */
 static void log_access(bool write, u32 addr, u32 value, u8 size) {
@@ -628,16 +675,62 @@ static void log_access(bool write, u32 addr, u32 value, u8 size) {
 #define VMEM_BASE 0x7E000000u
 #define VMEM_SIZE 0x02000000u
 static u8* g_vmem;
+
+const u8* mmio_vmem(u32* size) {
+    *size = 0x02000000u;
+    return g_vmem;
+}
 static unsigned long long g_vmem_reads, g_vmem_writes, g_unmapped;
 
 static bool in_vmem(u32 ea, u8 size) {
     return ea >= VMEM_BASE && ea - VMEM_BASE <= VMEM_SIZE - size;
 }
 
+/* Unmapped accesses, grouped by 1 MB region, with the first address and the
+   code that touched it (for the report). */
+#define UNMAPPED_REGIONS 16
+static struct { u32 region, first_ea, first_pc; unsigned long long reads, writes; } g_unmapped_by[UNMAPPED_REGIONS];
+
 static void warn_unmapped(const char* what, u32 ea, u8 size, u32 pc) {
     if (g_unmapped++ < 16)
         fprintf(stderr, "warn: %s%u %s unmapped 0x%08X (pc 0x%08X)\n", what, size * 8,
                 what[0] == 'r' ? "from" : "to", ea, pc);
+    u32 region = ea >> 20;
+    for (int i = 0; i < UNMAPPED_REGIONS; i++) {
+        if (g_unmapped_by[i].reads + g_unmapped_by[i].writes == 0) {
+            g_unmapped_by[i].region = region;
+            g_unmapped_by[i].first_ea = ea;
+            g_unmapped_by[i].first_pc = pc;
+        }
+        if (g_unmapped_by[i].region == region) {
+            if (what[0] == 'r') g_unmapped_by[i].reads++;
+            else g_unmapped_by[i].writes++;
+            return;
+        }
+    }
+}
+
+/* Locked cache: with HID2[LCE] the CPU turns half of its data cache into
+   16 KB of fast scratch memory at 0xE0000000. Games fill and drain it with
+   the CPU's cache DMA (SPRs DMAU/DMAL) and use it for vertex skinning and
+   other bulk maths. Backed here with plain memory (256 KB, mirrored, as
+   Dolphin does). */
+#define L1_BASE 0xE0000000u
+#define L1_MASK 0x0003FFFFu
+static u8 g_l1[L1_MASK + 1];
+static unsigned long long g_l1_reads, g_l1_writes, g_l1_dma_in, g_l1_dma_out;
+
+void mmio_locked_cache_dma(CPUState* cpu, u32 mem_addr, u32 cache_addr, u32 bytes, bool load) {
+    u32 m = mem_addr & 0x01FFFFE0u;
+    for (u32 i = 0; i < bytes; i += 32) {
+        u32 c = (cache_addr + i) & L1_MASK & ~31u;
+        if (m + i + 32 > cpu->ram_size)
+            break;
+        if (load) memcpy(g_l1 + c, cpu->ram + m + i, 32);
+        else memcpy(cpu->ram + m + i, g_l1 + c, 32);
+    }
+    if (load) g_l1_dma_in += bytes;
+    else g_l1_dma_out += bytes;
 }
 
 /* ------------------------------------------------- write-gather pipe --- */
@@ -672,6 +765,8 @@ static void pipe_flush_burst(CPUState* cpu) {
     u32 addr = wp & 0x03FFFFE0u, wrap = wp & 0x04000000u;
     if (addr + 32u <= cpu->ram_size)
         memcpy(cpu->ram + addr, g_burst, 32);
+    if (g_cp_ctrl_written && !(reg16(CP_CTRL) & CP_CTRL_LINK))
+        gx_raster_note_ram_write(addr);   /* redirected pipe: e.g. a movie frame into a TV buffer */
     addr += 32u;
     if (addr >= end) {
         addr = base;
@@ -702,7 +797,28 @@ static void pipe_write(CPUState* cpu, u32 value, u8 size) {
     }
 }
 
+/* Direct entry for graphics command writes from the game code's inline
+   memory path (fastmem.h): skips the address decoding of external_write. */
+void mmio_pipe_write(CPUState* cpu, u32 value, u8 size) {
+    static Device* wg;
+    if (!wg)
+        wg = device_for(0xCC008000u);
+    wg->writes++;
+    int prev = prof_enter(PROF_GX_FIFO);
+    pipe_write(cpu, value, size);
+    prof_leave(prev);
+}
+
 static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
+    if ((ea & 0xF0000000u) == L1_BASE) {
+        int prev = prof_enter(PROF_MEM);
+        u64 v = 0;
+        for (u8 i = 0; i < size; i++)
+            v = (v << 8) | g_l1[(ea + i) & L1_MASK];
+        g_l1_reads++;
+        prof_leave(prev);
+        return v;
+    }
     if (in_vmem(ea, size)) {
         const u8* p = g_vmem + (ea - VMEM_BASE);
         u64 v = 0;
@@ -727,6 +843,8 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         value = ai_sample_count(cpu);
     else if (off >= DI && off < DI + 0x40 && di_read(off, size, &value))
         ;
+    else if (off >= 0x6800u && off < 0x6800u + 3 * 0x14u && exi_read(off, size, &value))
+        ;
     else if (off >= SI && off < SI + 0x40 && si_read(off, size, &value))
         ;
     else if (off == 0x0000u && size == 2)
@@ -744,6 +862,16 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
 
 static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
     u32 value = (u32)value64;
+    if ((ea & 0xF0000000u) == L1_BASE) {
+        int prev = prof_enter(PROF_MEM);
+        for (int i = size - 1; i >= 0; i--) {
+            g_l1[(ea + (u32)i) & L1_MASK] = (u8)value64;
+            value64 >>= 8;
+        }
+        g_l1_writes++;
+        prof_leave(prev);
+        return;
+    }
     if (in_vmem(ea, size)) {
         u8* p = g_vmem + (ea - VMEM_BASE);
         for (int i = size - 1; i >= 0; i--) {
@@ -763,7 +891,9 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
         d->writes++;
 
     if (off >= 0x8000u) {
+        int prev = prof_enter(PROF_GX_FIFO);
         pipe_write(cpu, value, size);      /* graphics command stream */
+        prof_leave(prev);
         return;
     }
     log_access(true, ea, value, size);
@@ -781,7 +911,7 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
         dsp_write(cpu, off, value, size);
         return;
     }
-    if (off >= 0x6800u && off < 0x6800u + 3 * 0x14u && exi_write(off, value, size))
+    if (off >= 0x6800u && off < 0x6800u + 3 * 0x14u && exi_write(cpu, off, value, size))
         return;
     if (off == AI && size == 4) {
         ai_write_control(cpu, value);
@@ -800,8 +930,20 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
     reg_set(off, value, size);
 }
 
+u64 mmio_next_event(void) {
+    return g_ai_dma_on ? g_ai_dma_next : ~0ull;
+}
+
 void mmio_ai_dma_tick(CPUState* cpu) {
     while (g_ai_dma_on && cpu->timebase >= g_ai_dma_next) {
+        /* The buffer that just finished playing goes to the speakers (16-bit
+           big-endian stereo, right then left, 32 kHz); then the next one,
+           which the game has set up in the meantime, starts. */
+        if (g_audio_sink && g_ai_dma_addr + g_ai_dma_bytes <= cpu->ram_size) {
+            g_audio_sink(cpu->ram + g_ai_dma_addr, g_ai_dma_bytes / 4u, 32000u);
+            g_audio_frames_out += g_ai_dma_bytes / 4u;
+        }
+        ai_dma_latch();
         g_dsp_csr |= DSP_CSR_AIDINT;
         g_ai_dma_next += ai_dma_period();
         g_ai_dma_blocks++;
@@ -835,6 +977,8 @@ u32 mmio_pi_cause(void) {
         cause |= 0x00000004u;   /* DI */
     if (si_interrupt_pending())
         cause |= 0x00000008u;   /* SI */
+    if (exi_interrupt_pending())
+        cause |= 0x00000010u;   /* EXI */
     if ((g_pe_ctrl & PE_TOKEN_INT) && (g_pe_ctrl & PE_TOKEN_EN))
         cause |= 0x00000200u;   /* PE token */
     if ((g_pe_ctrl & PE_FINISH_INT) && (g_pe_ctrl & PE_FINISH_EN))
@@ -864,18 +1008,33 @@ void mmio_install(CPUState* cpu) {
     if (!g_vmem)
         g_vmem = (u8*)calloc(1, VMEM_SIZE);
     set16(DSP + 0x0A, DSP_CSR_HALT);
+    exi_init();
     cpu->external_read = external_read;
     cpu->external_write = external_write;
 }
 
 void mmio_report(void) {
-    printf("audio: %llu AI DMA buffers played, %llu AX frames\n", g_ai_dma_blocks, g_ax_frames);
+    printf("disc commands:");
+    for (int c = 0; c < 256; c++)
+        if (g_di_cmd_count[c])
+            printf(" %02X x%llu", c, g_di_cmd_count[c]);
+    printf("  (A8 read, E1 audio stream play, E2 stream status, E4 stream buffer config)\n");
+    printf("audio interface: control 0x%08X, stream volume 0x%08X\n", reg_get(AI, 4), reg_get(AI + 4, 4));
+    printf("audio: %llu AI DMA buffers played (last from 0x%08X), %llu AX frames, %llu samples sent to the speakers\n",
+           g_ai_dma_blocks, g_ai_dma_addr, g_ax_frames, g_audio_frames_out);
     printf("frame pacing: %s, %llu draw-done reports held to the next field\n",
            g_pacing ? "on" : "off", g_finish_held_count);
     printf("gather pipe: %llu bytes to the GPU, %llu bytes recorded to RAM, %llu link changes\n",
            g_pipe_to_gpu, g_pipe_recorded, g_link_changes);
     printf("memory: virtual window 0x7E000000 r%llu/w%llu, unmapped accesses %llu\n",
            g_vmem_reads, g_vmem_writes, g_unmapped);
+    printf("locked cache (0xE0000000): r%llu/w%llu, DMA %llu KB in, %llu KB out\n", g_l1_reads, g_l1_writes,
+           g_l1_dma_in / 1024, g_l1_dma_out / 1024);
+    for (int i = 0; i < UNMAPPED_REGIONS; i++)
+        if (g_unmapped_by[i].reads + g_unmapped_by[i].writes)
+            printf("  unmapped 0x%03X00000: r%llu/w%llu, first 0x%08X from pc 0x%08X\n", g_unmapped_by[i].region,
+                   g_unmapped_by[i].reads, g_unmapped_by[i].writes, g_unmapped_by[i].first_ea,
+                   g_unmapped_by[i].first_pc);
     printf("hardware register accesses:");
     for (size_t i = 0; i < sizeof(g_devices) / sizeof(g_devices[0]); i++)
         if (g_devices[i].reads || g_devices[i].writes)

@@ -2,13 +2,32 @@
 #
 #   .\play.ps1                 (window at 2x, 1280x960)
 #   .\play.ps1 -Scale 3        (bigger window)
+#   .\play.ps1 -Res 2          (graphics card's internal resolution, N x 640x528; default 4)
+#   .\play.ps1 -Debug          (extra diagnostics: call counts, file/stream logs, profile at exit; a little slower)
+#   .\play.ps1 -Software       (the old CPU renderer instead of the graphics card)
+#   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
+#   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
+#   .\play.ps1 -ShowTHX        (keep the THX intro; it is skipped by default)
+#   .\play.ps1 -Aspect 16:9    (screen shape: auto (default, follows the game's widescreen option), 4:3, 16:9)
 #
 # Keyboard: arrows = stick, X = A, Z = B, C = X, S = Y, D = Z, Q / W = L / R,
 #           Enter = START, I J K L = C-stick, T F G H = D-pad
-#           Esc = quit, F11 = fullscreen.   A USB/XInput controller also works.
+#           Esc = quit, Tab (hold) = fast-forward, F9 = screen shape (auto / 4:3 / 16:9), F10 = screenshot (shot_NNN.bmp), F11 = fullscreen,
+#           F12 = draw log of two frames (drawlog.txt, drawlog-short.txt).
+#           A USB/XInput controller also works.
 # The log (and the end-of-run report) goes to play.txt.
 param(
     [int]$Scale = 2,
+    [string]$Aspect = "auto",
+    [switch]$GPU,                      # the default now; kept so older commands still work
+    [switch]$Software,
+    [switch]$Debug,
+    [int]$Res = 4,
+    [switch]$NoIdleSkip,
+    [switch]$ShowTHX,
+    [string]$MemCard = "C:\nfls2\saves\MemoryCardA.raw",
+    [switch]$NoMemCard,
+    [switch]$NoText,
     [string[]]$Press = @(),
     [string]$Disc = "C:\nfls2\disc",
     [string]$Map = "C:\nfls2\symbols\main.map"
@@ -16,12 +35,75 @@ param(
 $ErrorActionPreference = "Continue"
 Set-Location $PSScriptRoot
 
+# Build tools: a plain PowerShell window doesn't have CMake on its PATH, and the
+# "Developer PowerShell for VS" shortcut sets up 32-bit (x86) libraries, which
+# can't link the 64-bit game. Unless a 64-bit Visual Studio environment is
+# already loaded, load one from the Visual Studio install that has the C++
+# build tools (vcvars64.bat), and take over its settings.
+if (-not (Get-Command cmake -ErrorAction SilentlyContinue) -or $env:VSCMD_ARG_TGT_ARCH -ne "x64") {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    $vcvars = $null
+    # Prefer the Visual Studio the build folder was set up with.
+    $cache = Join-Path $PSScriptRoot "build\CMakeCache.txt"
+    if (Test-Path $cache) {
+        $line = Select-String -Path $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.*)\\Common7\\' | Select-Object -First 1
+        if (-not $line) { $line = Select-String -Path $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.*)/Common7/' | Select-Object -First 1 }
+        if ($line) {
+            $bat = Join-Path $line.Matches[0].Groups[1].Value "VC\Auxiliary\Build\vcvars64.bat"
+            if (Test-Path $bat) { $vcvars = $bat }
+        }
+    }
+    if (-not $vcvars -and (Test-Path $vswhere)) {
+        $installs = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        foreach ($vs in $installs) {
+            $bat = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+            if (Test-Path $bat) { $vcvars = $bat }
+        }
+    }
+    if ($vcvars) {
+        Write-Host "Loading the Visual Studio build tools (64-bit) from $vcvars"
+        $vars = cmd /c "set LIB=& set LIBPATH=& set INCLUDE=& call `"$vcvars`" >nul 2>&1 & set"
+        foreach ($line in $vars) {
+            if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
+        }
+    }
+    if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+        Write-Host "CMake not found. Open 'x64 Native Tools Command Prompt for VS 2022' from the Start menu, type powershell, and run this again." -ForegroundColor Red
+        exit 1
+    }
+}
+
 cmake --build build
 if ($LASTEXITCODE -ne 0) { Write-Host "Build failed." -ForegroundColor Red; exit 1 }
 
-$gameArgs = @($Disc, "--map", $Map, "--quiet", "--window", "--scale", $Scale, "--dump-every", "0")
+$gameArgs = @($Disc, "--map", $Map, "--quiet", "--window", "--scale", $Scale, "--aspect", $Aspect, "--dump-every", "0")
 foreach ($p in $Press) { $gameArgs += @("--press", $p) }
+if ($NoIdleSkip) { $gameArgs += "--no-idle-skip" }
+if (-not $ShowTHX) { $gameArgs += "--skip-thx" }
+if ($NoText) { $gameArgs += @("--no-text") }
+if (-not $Software) { $gameArgs += @("--gpu", "--res", $Res) }
+if ($Debug) { $gameArgs += @("--debug") }
+if (-not $NoMemCard) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $MemCard) | Out-Null
+    $gameArgs += @("--memcard", $MemCard)
+}
 
 Write-Host "Starting the game window... (Esc to quit)"
 & .\build\nfls2.exe @gameArgs *> play.txt
-Write-Host "Game closed. Log: play.txt" -ForegroundColor Green
+# Copy the end-of-run report (where the game stopped and why) to the clipboard.
+$log = Get-Content play.txt
+$start = ($log | Select-String -Pattern "^=== stopped" | Select-Object -Last 1).LineNumber
+if ($start) { $report = $log[($start - 1)..($log.Count - 1)] } else { $report = $log | Select-Object -Last 80 }
+# Slow stretches (the window logs a perf line each second the game runs below full speed).
+$perf = @($log | Select-String -Pattern "^perf:|^audio:" | ForEach-Object { $_.Line })
+$gpuLines = @($log | Select-String -Pattern "^gpu:" | ForEach-Object { $_.Line })
+$startup = @($log | Select-String -Pattern "^startup:" | ForEach-Object { $_.Line })
+$cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
+$txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })
+if ($txt.Count -gt 0) { $report = @("text search ($($txt.Count) lines):") + ($txt | Select-Object -Last 500) + $report }
+if ($cbl.Count -gt 0) { $report = @("sound callback list ($($cbl.Count) lines, last 40):") + ($cbl | Select-Object -Last 40) + $report }
+if ($perf.Count -gt 0) { $report = @("slow seconds: $($perf.Count) (last 20 shown)") + ($perf | Select-Object -Last 20) + $report }
+if ($startup.Count -gt 0) { $report = $startup + $report }
+if ($gpuLines.Count -gt 0) { $report = ($gpuLines | Select-Object -First 30) + $report }
+$report -join "`r`n" | Set-Clipboard
+Write-Host "Game closed. Report copied to the clipboard (full log: play.txt)" -ForegroundColor Green

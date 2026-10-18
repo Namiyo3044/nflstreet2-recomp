@@ -75,3 +75,20 @@ uint32_t symbols_function_start(uint32_t addr) {
     const Symbol* s = find(addr);
     return s ? s->start : 0;
 }
+
+uint32_t symbols_address(const char* name) {
+    for (size_t i = 0; i < g_count; i++)
+        if (strcmp(g_syms[i].name, name) == 0)
+            return g_syms[i].start;
+    return 0;
+}
+
+void symbols_each(void (*fn)(uint32_t start, const char* name, void* user), void* user) {
+    for (size_t i = 0; i < g_count; i++)
+        fn(g_syms[i].start, g_syms[i].name, user);
+}
+
+uint32_t symbols_function_end(uint32_t addr) {
+    const Symbol* s = find(addr);
+    return s ? s->start + s->size : 0;
+}

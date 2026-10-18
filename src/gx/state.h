@@ -24,6 +24,11 @@ extern u32 gx_xf_reg[0x100];
 extern s16 gx_tev_reg[4][4];
 extern u8 gx_tev_konst[4][4];
 
+/* Bumped whenever something the renderer's state snapshot reads may have
+   changed (BP and XF register writes, a new frame), so consecutive draws
+   with nothing changed in between can reuse the last snapshot. */
+extern u32 gx_state_serial;
+
 static inline float gx_f32(u32 bits) {
     union { u32 u; float f; } v;
     v.u = bits;

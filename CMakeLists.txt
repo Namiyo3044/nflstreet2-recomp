@@ -49,6 +49,9 @@ target_link_libraries(gekko_cpu PUBLIC nfls2_settings)
 set(NFLS2_GAME_OPT "-O1" CACHE STRING "Optimisation flag for the recompiled game code")
 add_library(nfls2_game STATIC ${NFLS2_CHUNKS})
 target_link_libraries(nfls2_game PUBLIC gekko_cpu)
+# Inline fast paths for guest memory access (src/runtime/fastmem.h).
+target_include_directories(nfls2_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_definitions(nfls2_game PRIVATE "DOLRECOMP_CPU_HEADER=\"runtime/fastmem.h\"")
 if(CMAKE_C_COMPILER_ID STREQUAL "Clang" AND CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     # clang-cl: /clang: passes the GCC-style flag through (/O1 would mean "minimise size").
     target_compile_options(nfls2_game PRIVATE /w "/clang:${NFLS2_GAME_OPT}")
@@ -83,14 +86,20 @@ add_executable(nfls2
     src/audio/ax_hle.c
     src/gx/fifo.c
     src/gx/raster.c
+    src/gx/raster_gl.c
     src/gx/texture.c
     src/runtime/disc.c
     src/runtime/dol.c
+    src/runtime/exi.c
     src/runtime/hle_cpu.c
     src/runtime/hle_exceptions.c
+    src/runtime/interp.c
+    src/runtime/textscan.c
+    src/runtime/textpatch.c
     src/runtime/interrupts.c
     src/runtime/mmio.c
     src/runtime/pad.c
+    src/runtime/prof.c
     src/runtime/sha1.c
     src/runtime/symbols.c)
 target_link_libraries(nfls2 PRIVATE nfls2_game)

@@ -9,6 +9,9 @@
    skip_hash is set, zeroes BSS and returns the entry point (0 on failure). */
 u32 dol_load(CPUState* cpu, const char* disc_dir, bool skip_hash);
 
+/* Data section i (0-10) of the loaded DOL; false if that section is empty. */
+bool dol_data_section(int i, u32* addr, u32* len);
+
 /* Fills the low-memory boot globals that the IPL normally leaves for the game
    (disc ID, memory size, console type, clock speeds). */
 bool boot_globals_init(CPUState* cpu, const char* disc_dir);

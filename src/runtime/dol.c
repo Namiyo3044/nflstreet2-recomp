@@ -45,6 +45,15 @@ static bool copy_to_guest(CPUState* cpu, u32 addr, const u8* src, u32 size) {
     return true;
 }
 
+static u32 g_data_addr[11], g_data_len[11];
+
+bool dol_data_section(int i, u32* addr, u32* len) {
+    if (i < 0 || i >= 11 || !g_data_len[i]) return false;
+    *addr = g_data_addr[i];
+    *len = g_data_len[i];
+    return true;
+}
+
 u32 dol_load(CPUState* cpu, const char* disc_dir, bool skip_hash) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/sys/main.dol", disc_dir);
@@ -85,6 +94,10 @@ u32 dol_load(CPUState* cpu, const char* disc_dir, bool skip_hash) {
         if (!copy_to_guest(cpu, addr, dol + off, len)) {
             free(dol);
             return 0;
+        }
+        if (i >= 7) {
+            g_data_addr[i - 7] = addr;
+            g_data_len[i - 7] = len;
         }
     }
 

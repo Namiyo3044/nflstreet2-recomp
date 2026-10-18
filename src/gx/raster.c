@@ -1,12 +1,17 @@
+#include "runtime/prof.h"
 #include "gx/raster.h"
 #include "gx/state.h"
 #include "gx/texture.h"
+#include "gx/raster_internal.h"
+#include "gx/raster_gl.h"
 #include "runtime/interrupts.h"
 
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -16,12 +21,10 @@
 #define make_dir(p) mkdir((p), 0755)
 #endif
 
-#define EFB_W 640
-#define EFB_H 528
 #define MAX_DUMPS 300
 
-static u32 g_color[EFB_W * EFB_H];   /* 0xAARRGGBB */
-static u32 g_depth[EFB_W * EFB_H];   /* 24-bit, larger = farther */
+u32 g_color[EFB_W * EFB_H];          /* 0xAARRGGBB */
+u32 g_depth[EFB_W * EFB_H];          /* 24-bit, larger = farther */
 
 static char g_dir[512] = "frames";
 static u32 g_every;          /* render every Nth displayed frame */
@@ -29,7 +32,105 @@ static bool g_save;          /* and save it as frame_N.bmp */
 static u32 g_frames;        /* frames copied to the display so far */
 static u32 g_dumped;
 static unsigned long long g_tris_skipped, g_tris_recorded;
+
+/* Widescreen detection. With its widescreen option on, the game squeezes a
+   16:9 picture into the same 640-pixel frame (anamorphic) and expects the TV
+   to stretch it. It shows in the 3D projection: the field of view is set for
+   a 16:9 screen. Each frame's full-screen perspective draws vote, and the
+   result only changes after several frames agree. */
+static u32 g_wide_draws, g_narrow_draws;      /* this frame */
+static int g_wide_candidate = -1, g_wide_streak, g_widescreen = -1;
+static float g_last_aspect;
+
+static void note_projection(void) {
+    if (gx_xf_reg[0x26] != 0)
+        return;                                /* orthographic: 2D, says nothing */
+    float p0 = fabsf(gx_f32(gx_xf_reg[0x20])), p2 = fabsf(gx_f32(gx_xf_reg[0x22]));
+    float vw = fabsf(gx_f32(gx_xf_reg[0x1A])) * 2.0f, vh = fabsf(gx_f32(gx_xf_reg[0x1B])) * 2.0f;
+    if (!(p0 > 1e-6f) || !(p2 > 1e-6f) || vw < 480.0f || vh < 300.0f)
+        return;                                /* split screen, render-to-texture, ... */
+    /* The shape of the screen the projection was made for, given that the
+       640-pixel frame fills a 4:3 TV. */
+    float aspect = p2 / p0 * (vh / vw) * (4.0f / 3.0f);
+    g_last_aspect = aspect;
+    if (aspect > 1.55f) g_wide_draws++;
+    else g_narrow_draws++;
+}
+
+/* A frame only votes when it has a real 3D scene: loading screens and boot
+   screens draw a few small 3D pieces (a spinning logo) at 4:3 whatever the
+   game's setting, while menus and matches draw hundreds. */
+#define WIDE_MIN_DRAWS 40u
+
+static void vote_widescreen(void) {
+    u32 total = g_wide_draws + g_narrow_draws;
+    if (total < WIDE_MIN_DRAWS) {
+        g_wide_draws = g_narrow_draws = 0;
+        return;                                /* little or no 3D this frame: keep what we had */
+    }
+    int vote = g_wide_draws > g_narrow_draws;
+    g_wide_draws = g_narrow_draws = 0;
+    if (vote != g_wide_candidate) {
+        g_wide_candidate = vote;
+        g_wide_streak = 0;
+    }
+    if (++g_wide_streak >= 10 && g_widescreen != vote) {
+        g_widescreen = vote;
+        printf("screen shape: game is drawing for %s (%u 3D draws in the deciding frame, projection %.2f:1)\n",
+               vote ? "16:9" : "4:3", total, g_last_aspect);
+    }
+}
+
+void gx_raster_widescreen_reset(void) {
+    g_widescreen = -1;
+    g_wide_candidate = -1;
+    g_wide_streak = 0;
+}
+
+int gx_raster_widescreen(void) {
+    return g_widescreen;
+}
 static CPUState* g_cpu;     /* for texture fetches during rasterisation */
+
+/* The transform unit state that vertices are transformed with: the live
+   registers (software renderer, transforming as the game draws), or the GPU
+   thread's own copy, kept up to date by replaying the recorded writes (GPU
+   renderer, where transforming is deferred to that thread). */
+static u32 g_xf_mem_local[0x800], g_xf_reg_local[0x100];
+static const u32* XFM = gx_xf_mem;
+static const u32* XFR = gx_xf_reg;
+static bool g_defer;                   /* GPU renderer: transform on the GPU thread */
+
+/* Which backend draws the recorded frames: the software rasteriser (worker
+   threads) or the graphics card (raster_gl.c, on the game thread). */
+static bool g_gpu;
+
+static void texture_freed(const u32* texels) {
+    glr_texture_freed(texels);
+}
+
+bool gx_raster_use_gpu(void* (*getproc)(const char*), int scale, void (*make_current)(void)) {
+    if (!glr_init(getproc, scale, make_current))
+        return false;
+    g_gpu = true;
+    gx_tex_set_free_hook(texture_freed);
+    /* Transform on the GPU thread, from its own copy of the transform unit
+       registers (starting from the current ones). */
+    memcpy(g_xf_mem_local, gx_xf_mem, sizeof(g_xf_mem_local));
+    memcpy(g_xf_reg_local, gx_xf_reg, sizeof(g_xf_reg_local));
+    XFM = g_xf_mem_local;
+    XFR = g_xf_reg_local;
+    g_defer = true;
+    return true;
+}
+
+/* The software frame buffer must hold the picture (a copy reads it).
+   With the GPU, the read-back runs on the GPU thread (it owns the GL
+   context); defined with the threads below. */
+static void efb_to_memory(bool depth);
+static void gpu_tex_copy(const TexCopy* info);
+static const CmdList* expand_list(const CmdList* l);
+static u32 gpu_tex_copy_for(u32 map);
 
 void gx_raster_config(const char* dir, u32 every) {
     if (dir) {
@@ -47,16 +148,6 @@ bool gx_raster_active(void) {
 }
 
 /* ------------------------------------------------------ vertex decode --- */
-typedef struct {
-    float pos[3];
-    u32 pos_mtx;                 /* row index into transform memory */
-    u32 tex_mtx[8];
-    u32 color[2];                /* 0xRRGGBBAA */
-    bool has_color[2];
-    float tc[8][2];              /* texture coordinates as given */
-    bool has_tc[8];
-    float nrm[3];                /* normal as given (0,0,1 if none) */
-} Vtx;
 
 static u32 rd16(const u8* p) { return ((u32)p[0] << 8) | p[1]; }
 static u32 rd32(const u8* p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
@@ -115,65 +206,37 @@ static const u8* attr_data(CPUState* cpu, const u8** p, u32 type, u32 array, u32
     return array_elem(cpu, array, idx, size);
 }
 
-/* Decodes one vertex; returns bytes consumed. Must agree with vertex_size()
-   in fifo.c. */
-static u32 decode_vertex(CPUState* cpu, u32 vat, const u8* p, Vtx* v) {
+/* The layout of a draw's vertices, worked out once per draw from the
+   vertex descriptor (CP 0x50/0x60) and format (CP 0x70-0x97). */
+typedef struct {
+    u32 lo, hi, mia, mib;
+    u32 pos_type, pos_n, pos_fmt, pos_shift, pos_cs;
+    u32 nrm_type, nrm_fmt, nrm_cs, nrm_shift;
+    bool nbt, index3;
+    u32 col_type[2], col_fmt[2];
+    u32 tc_type[8], tc_n[8], tc_fmt[8], tc_shift[8], tc_cs[8];
+} VtxFormat;
+
+static void vtx_format(u32 vat, VtxFormat* f) {
     u32 lo = gx_cp[0x50], hi = gx_cp[0x60];
     u32 a = gx_cp[0x70 + vat], b = gx_cp[0x80 + vat], c = gx_cp[0x90 + vat];
-    const u8* start = p;
-    u32 mia = gx_xf_reg[0x18], mib = gx_xf_reg[0x19];
-
-    memset(v, 0, sizeof(*v));
-    v->pos_mtx = mia & 0x3Fu;
-    for (u32 i = 0; i < 4; i++) v->tex_mtx[i] = (mia >> (6 + 6 * i)) & 0x3Fu;
-    for (u32 i = 0; i < 4; i++) v->tex_mtx[4 + i] = (mib >> (6 * i)) & 0x3Fu;
-
-    if (lo & 1u) v->pos_mtx = *p++ & 0x3Fu;
-    for (u32 i = 0; i < 8; i++)
-        if ((lo >> (1 + i)) & 1u) v->tex_mtx[i] = *p++ & 0x3Fu;
-
-    u32 pos = (lo >> 9) & 3u;
-    if (pos) {
-        u32 n = (a & 1u) ? 3u : 2u, fmt = (a >> 1) & 7u, shift = (a >> 4) & 31u, cs = comp_size(fmt);
-        const u8* d = attr_data(cpu, &p, pos, 0, n * cs);
-        if (d)
-            for (u32 k = 0; k < n; k++)
-                v->pos[k] = read_comp(d + k * cs, fmt, shift);
-    }
-
-    v->nrm[2] = 1.0f;
-    u32 nrm = (lo >> 11) & 3u;
-    if (nrm) {   /* normal (and binormal/tangent, which are skipped); s8 has 6 and s16 14 fraction bits */
-        bool nbt = (a >> 9) & 1u, index3 = (a >> 31) & 1u;
-        u32 fmt = (a >> 10) & 7u, cs = comp_size(fmt);
-        u32 shift = cs == 1 ? 6u : cs == 2 ? 14u : 0u;
-        const u8* d = NULL;
-        if (nrm == 1) {
-            d = p;
-            p += (nbt ? 9u : 3u) * cs;
-        } else {
-            u32 n_idx = (nbt && index3) ? 3u : 1u, isz = nrm == 2 ? 1u : 2u;
-            u32 idx = nrm == 2 ? *p : rd16(p);
-            d = array_elem(cpu, 1, idx, 3 * cs);
-            p += n_idx * isz;
-        }
-        if (d)
-            for (u32 k = 0; k < 3; k++)
-                v->nrm[k] = read_comp(d + k * cs, fmt, shift);
-    }
-
+    f->lo = lo; f->hi = hi;
+    f->mia = gx_xf_reg[0x18]; f->mib = gx_xf_reg[0x19];
+    f->pos_type = (lo >> 9) & 3u;
+    f->pos_n = (a & 1u) ? 3u : 2u;
+    f->pos_fmt = (a >> 1) & 7u;
+    f->pos_shift = (a >> 4) & 31u;
+    f->pos_cs = comp_size(f->pos_fmt);
+    f->nrm_type = (lo >> 11) & 3u;
+    f->nbt = (a >> 9) & 1u;
+    f->index3 = (a >> 31) & 1u;
+    f->nrm_fmt = (a >> 10) & 7u;
+    f->nrm_cs = comp_size(f->nrm_fmt);
+    f->nrm_shift = f->nrm_cs == 1 ? 6u : f->nrm_cs == 2 ? 14u : 0u;   /* s8 has 6 and s16 14 fraction bits */
     for (u32 ch = 0; ch < 2; ch++) {
-        u32 t = (lo >> (13 + ch * 2)) & 3u;
-        u32 fmt = (a >> (14 + ch * 4)) & 7u;
-        if (!t)
-            continue;
-        const u8* d = attr_data(cpu, &p, t, 2 + ch, color_size(fmt));
-        if (d) {
-            v->color[ch] = read_color(d, fmt);
-            v->has_color[ch] = true;
-        }
+        f->col_type[ch] = (lo >> (13 + ch * 2)) & 3u;
+        f->col_fmt[ch] = (a >> (14 + ch * 4)) & 7u;
     }
-
     const u32 tc_cnt[8] = {(a >> 21) & 1u, b & 1u, (b >> 9) & 1u, (b >> 18) & 1u,
                            (b >> 27) & 1u, (c >> 5) & 1u, (c >> 14) & 1u, (c >> 23) & 1u};
     const u32 tc_fmt[8] = {(a >> 22) & 7u, (b >> 1) & 7u, (b >> 10) & 7u, (b >> 19) & 7u,
@@ -181,32 +244,87 @@ static u32 decode_vertex(CPUState* cpu, u32 vat, const u8* p, Vtx* v) {
     const u32 tc_shift[8] = {(a >> 25) & 31u, (b >> 4) & 31u, (b >> 13) & 31u, (b >> 22) & 31u,
                              c & 31u, (c >> 9) & 31u, (c >> 18) & 31u, (c >> 27) & 31u};
     for (u32 i = 0; i < 8; i++) {
-        u32 t = (hi >> (i * 2)) & 3u;
+        f->tc_type[i] = (hi >> (i * 2)) & 3u;
+        f->tc_n[i] = tc_cnt[i] ? 2u : 1u;
+        f->tc_fmt[i] = tc_fmt[i];
+        f->tc_shift[i] = tc_shift[i];
+        f->tc_cs[i] = comp_size(tc_fmt[i]);
+    }
+}
+
+/* Decodes one vertex; returns bytes consumed. Must agree with vertex_size()
+   in fifo.c. */
+static u32 decode_vertex(CPUState* cpu, const VtxFormat* f, const u8* p, Vtx* v) {
+    const u8* start = p;
+    u32 lo = f->lo;
+
+    memset(v, 0, sizeof(*v));
+    v->pos_mtx = f->mia & 0x3Fu;
+    for (u32 i = 0; i < 4; i++) v->tex_mtx[i] = (f->mia >> (6 + 6 * i)) & 0x3Fu;
+    for (u32 i = 0; i < 4; i++) v->tex_mtx[4 + i] = (f->mib >> (6 * i)) & 0x3Fu;
+
+    if (lo & 1u) v->pos_mtx = *p++ & 0x3Fu;
+    if (lo & 0x1FEu)
+        for (u32 i = 0; i < 8; i++)
+            if ((lo >> (1 + i)) & 1u) v->tex_mtx[i] = *p++ & 0x3Fu;
+
+    if (f->pos_type) {
+        u32 cs = f->pos_cs;
+        const u8* d = attr_data(cpu, &p, f->pos_type, 0, f->pos_n * cs);
+        if (d)
+            for (u32 k = 0; k < f->pos_n; k++)
+                v->pos[k] = read_comp(d + k * cs, f->pos_fmt, f->pos_shift);
+    }
+
+    v->nrm[2] = 1.0f;
+    if (f->nrm_type) {   /* normal (and binormal/tangent, which are skipped) */
+        u32 cs = f->nrm_cs;
+        const u8* d = NULL;
+        if (f->nrm_type == 1) {
+            d = p;
+            p += (f->nbt ? 9u : 3u) * cs;
+        } else {
+            u32 n_idx = (f->nbt && f->index3) ? 3u : 1u, isz = f->nrm_type == 2 ? 1u : 2u;
+            u32 idx = f->nrm_type == 2 ? *p : rd16(p);
+            d = array_elem(cpu, 1, idx, 3 * cs);
+            p += n_idx * isz;
+        }
+        if (d)
+            for (u32 k = 0; k < 3; k++)
+                v->nrm[k] = read_comp(d + k * cs, f->nrm_fmt, f->nrm_shift);
+    }
+
+    for (u32 ch = 0; ch < 2; ch++) {
+        u32 t = f->col_type[ch];
         if (!t)
             continue;
-        u32 n = tc_cnt[i] ? 2u : 1u, cs = comp_size(tc_fmt[i]);
-        const u8* d = attr_data(cpu, &p, t, 4 + i, n * cs);
+        const u8* d = attr_data(cpu, &p, t, 2 + ch, color_size(f->col_fmt[ch]));
         if (d) {
-            v->tc[i][0] = read_comp(d, tc_fmt[i], tc_shift[i]);
-            v->tc[i][1] = n == 2 ? read_comp(d + cs, tc_fmt[i], tc_shift[i]) : 0.0f;
-            v->has_tc[i] = true;
+            v->color[ch] = read_color(d, f->col_fmt[ch]);
+            v->has_color[ch] = true;
         }
     }
+
+    if (f->hi)
+        for (u32 i = 0; i < 8; i++) {
+            u32 t = f->tc_type[i];
+            if (!t)
+                continue;
+            u32 n = f->tc_n[i], cs = f->tc_cs[i];
+            const u8* d = attr_data(cpu, &p, t, 4 + i, n * cs);
+            if (d) {
+                v->tc[i][0] = read_comp(d, f->tc_fmt[i], f->tc_shift[i]);
+                v->tc[i][1] = n == 2 ? read_comp(d + cs, f->tc_fmt[i], f->tc_shift[i]) : 0.0f;
+                v->has_tc[i] = true;
+            }
+        }
     return (u32)(p - start);
 }
 
 /* ---------------------------------------------------------- transform --- */
-#define MAX_TC 8
-
-typedef struct {
-    float x, y, z;              /* screen x, y; depth 0..16777215 */
-    float inv_w;                /* 1/w, for perspective-correct interpolation */
-    float col[2][4];            /* colour channels 0/1, RGBA 0..1 */
-    float tc[MAX_TC][3];        /* s, t, q (q = 1 unless projected) */
-    bool valid;
-} SVtx;
 
 static float clamp01(float v);
+static float g_u8f[256];               /* i / 255 */
 
 static void unpack(u32 rgba, float out[4]) {
     out[0] = (float)(rgba >> 24) / 255.0f;
@@ -221,27 +339,73 @@ static void unpack(u32 rgba, float out[4]) {
    its colour, diffuse function and attenuation, as the transform unit does.
    pos / nrm are the vertex position and normal in view space. Light n lives
    at XF 0x600 + 16n: colour +3, cos attenuation +4..6, distance attenuation
-   +7..9, position +10..12, direction +13..15. */
+   +7..9, position +10..12, direction +13..15.
+
+   Everything that is the same for the whole draw (the channel settings,
+   material and ambient colours, each light's values) is worked out once per
+   draw in draw_setup; only the per-vertex part is left here. */
+typedef struct {
+    float col[4], lp[3], ld[3], k[6];
+    float sdir[3];                     /* specular: the position, normalised */
+} LightSetup;
+
+typedef struct {
+    u32 cctrl[2], actrl[2];
+    float mat[2][4], amb[2][4];
+    LightSetup light[8];
+    bool lit, chan1, persp;
+    u32 ntex;
+} DrawSetup;
+static DrawSetup g_setup;
+
+static void draw_setup(void) {
+    DrawSetup* d = &g_setup;
+    u32 mask = 0;
+    for (u32 ch = 0; ch < 2; ch++) {
+        d->cctrl[ch] = XFR[0x0E + ch];
+        d->actrl[ch] = XFR[0x10 + ch];
+        unpack(XFR[0x0C + ch], d->mat[ch]);
+        unpack(XFR[0x0A + ch], d->amb[ch]);
+        for (int k = 0; k < 2; k++) {
+            u32 ctrl = k ? d->actrl[ch] : d->cctrl[ch];
+            if (ctrl & 2u) mask |= ((ctrl >> 2) & 0xFu) | (((ctrl >> 11) & 0xFu) << 4);
+        }
+    }
+    d->lit = ((XFR[0x0E] | XFR[0x0F] | XFR[0x10] | XFR[0x11]) & 2u) != 0;
+    d->chan1 = (XFR[0x09] & 3u) >= 2u;
+    d->persp = XFR[0x26] == 0;
+    d->ntex = XFR[0x3F] & 15u;
+    for (u32 n = 0; n < 8; n++) {
+        if (!(mask & (1u << n)))
+            continue;
+        const u32* L = &XFM[0x600u + n * 16u];
+        LightSetup* ls = &d->light[n];
+        u32 c = L[3];
+        ls->col[0] = (float)(c >> 24) / 255.0f; ls->col[1] = (float)((c >> 16) & 255) / 255.0f;
+        ls->col[2] = (float)((c >> 8) & 255) / 255.0f; ls->col[3] = (float)(c & 255) / 255.0f;
+        for (int k = 0; k < 6; k++) ls->k[k] = gx_f32(L[4 + k]);
+        for (int k = 0; k < 3; k++) { ls->lp[k] = gx_f32(L[10 + k]); ls->ld[k] = gx_f32(L[13 + k]); }
+        float len = sqrtf(ls->lp[0] * ls->lp[0] + ls->lp[1] * ls->lp[1] + ls->lp[2] * ls->lp[2]);
+        for (int k = 0; k < 3; k++) ls->sdir[k] = len > 1e-9f ? ls->lp[k] / len : 0.0f;
+    }
+}
+
 static void light_sum(u32 ctrl, const float pos[3], const float nrm[3], float lit[4], bool alpha) {
     u32 mask = ((ctrl >> 2) & 0xFu) | (((ctrl >> 11) & 0xFu) << 4);
     u32 diff_fn = (ctrl >> 7) & 3u, attn_fn = (ctrl >> 9) & 3u;
     for (u32 n = 0; n < 8; n++) {
         if (!(mask & (1u << n)))
             continue;
-        const u32* L = &gx_xf_mem[0x600u + n * 16u];
-        u32 c = L[3];
-        float col[4] = {(float)(c >> 24) / 255.0f, (float)((c >> 16) & 255) / 255.0f,
-                        (float)((c >> 8) & 255) / 255.0f, (float)(c & 255) / 255.0f};
-        float lp[3] = {gx_f32(L[10]), gx_f32(L[11]), gx_f32(L[12])};
-        float ld[3] = {gx_f32(L[13]), gx_f32(L[14]), gx_f32(L[15])};
+        const LightSetup* L = &g_setup.light[n];
+        const float* lp = L->lp;
+        const float* ld = L->ld;
         float ldir[3], attn = 1.0f;
         if (attn_fn == 0) {               /* specular */
-            float len = sqrtf(lp[0] * lp[0] + lp[1] * lp[1] + lp[2] * lp[2]);
-            for (int k = 0; k < 3; k++) ldir[k] = len > 1e-9f ? lp[k] / len : 0.0f;
+            ldir[0] = L->sdir[0]; ldir[1] = L->sdir[1]; ldir[2] = L->sdir[2];
             float nd = nrm[0] * ldir[0] + nrm[1] * ldir[1] + nrm[2] * ldir[2];
             float h = nd >= 0.0f ? fmaxf(0.0f, nrm[0] * ld[0] + nrm[1] * ld[1] + nrm[2] * ld[2]) : 0.0f;
-            float num = gx_f32(L[4]) + gx_f32(L[5]) * h + gx_f32(L[6]) * h * h;
-            float den = gx_f32(L[7]) + gx_f32(L[8]) * h + gx_f32(L[9]) * h * h;
+            float num = L->k[0] + L->k[1] * h + L->k[2] * h * h;
+            float den = L->k[3] + L->k[4] * h + L->k[5] * h * h;
             attn = fabsf(den) > 1e-9f ? fmaxf(0.0f, num) / den : 0.0f;
         } else {
             float v[3] = {lp[0] - pos[0], lp[1] - pos[1], lp[2] - pos[2]};
@@ -249,8 +413,8 @@ static void light_sum(u32 ctrl, const float pos[3], const float nrm[3], float li
             for (int k = 0; k < 3; k++) ldir[k] = d > 1e-9f ? v[k] / d : 0.0f;
             if (attn_fn == 1) {           /* spot */
                 float cs = fmaxf(0.0f, ldir[0] * ld[0] + ldir[1] * ld[1] + ldir[2] * ld[2]);
-                float num = gx_f32(L[4]) + gx_f32(L[5]) * cs + gx_f32(L[6]) * cs * cs;
-                float den = gx_f32(L[7]) + gx_f32(L[8]) * d + gx_f32(L[9]) * d2;
+                float num = L->k[0] + L->k[1] * cs + L->k[2] * cs * cs;
+                float den = L->k[3] + L->k[4] * d + L->k[5] * d2;
                 attn = fabsf(den) > 1e-9f ? fmaxf(0.0f, num) / den : 0.0f;
             }
         }
@@ -261,23 +425,27 @@ static void light_sum(u32 ctrl, const float pos[3], const float nrm[3], float li
         }
         float f = dif * attn;
         if (alpha) {
-            lit[3] += col[3] * f;
+            lit[3] += L->col[3] * f;
         } else {
-            for (int k = 0; k < 3; k++) lit[k] += col[k] * f;
+            for (int k = 0; k < 3; k++) lit[k] += L->col[k] * f;
         }
     }
 }
 
+static inline void unpack_tab(u32 rgba, float out[4]) {   /* as unpack(), from the i/255 table */
+    out[0] = g_u8f[rgba >> 24]; out[1] = g_u8f[(rgba >> 16) & 255];
+    out[2] = g_u8f[(rgba >> 8) & 255]; out[3] = g_u8f[rgba & 255];
+}
+
 static void channel(const Vtx* v, u32 ch, const float pos[3], const float nrm[3], float out[4]) {
-    u32 cctrl = gx_xf_reg[0x0E + ch], actrl = gx_xf_reg[0x10 + ch];
-    float mat[4], amb[4], vc[4];
-    unpack(gx_xf_reg[0x0C + ch], mat);
-    unpack(gx_xf_reg[0x0A + ch], amb);
-    unpack(v->has_color[ch] ? v->color[ch] : 0xFFFFFFFFu, vc);
+    u32 cctrl = g_setup.cctrl[ch], actrl = g_setup.actrl[ch];
+    const float* mat = g_setup.mat[ch];
+    const float* amb = g_setup.amb[ch];
+    float vc[4];
+    unpack_tab(v->has_color[ch] ? v->color[ch] : 0xFFFFFFFFu, vc);
 
     /* colour */
-    float m[4];
-    memcpy(m, (cctrl & 1u) ? vc : mat, sizeof(m));
+    const float* m = (cctrl & 1u) ? vc : mat;
     if (cctrl & 2u) {
         float lit[4];
         memcpy(lit, (cctrl & 0x40u) ? vc : amb, sizeof(lit));
@@ -301,7 +469,7 @@ static void channel(const Vtx* v, u32 ch, const float pos[3], const float nrm[3]
 /* Texture coordinate generation (XF 0x1040+i): regular texgens multiply the
    chosen input (position or a texture coordinate) by a texture matrix. */
 static void texgen(const Vtx* v, u32 i, float out[3]) {
-    u32 ctl = gx_xf_reg[0x40 + i];
+    u32 ctl = XFR[0x40 + i];
     bool proj = (ctl >> 1) & 1u;
     u32 type = (ctl >> 4) & 7u;
     u32 src = (ctl >> 7) & 31u;
@@ -321,21 +489,21 @@ static void texgen(const Vtx* v, u32 i, float out[3]) {
         in[2] = 1.0f;            /* AB11 */
     }
 
-    const u32* m = &gx_xf_mem[(v->tex_mtx[i] * 4u) & 0x3FFu];
+    const u32* m = &XFM[(v->tex_mtx[i] * 4u) & 0x3FFu];
     float s = gx_f32(m[0]) * in[0] + gx_f32(m[1]) * in[1] + gx_f32(m[2]) * in[2] + gx_f32(m[3]) * in[3];
     float t = gx_f32(m[4]) * in[0] + gx_f32(m[5]) * in[1] + gx_f32(m[6]) * in[2] + gx_f32(m[7]) * in[3];
     float q = proj ? gx_f32(m[8]) * in[0] + gx_f32(m[9]) * in[1] + gx_f32(m[10]) * in[2] + gx_f32(m[11]) * in[3]
                    : 1.0f;
 
     /* Optional second ("dual") texture transform. */
-    if (gx_xf_reg[0x12] & 1u) {
-        u32 post = gx_xf_reg[0x50 + i];
+    if (XFR[0x12] & 1u) {
+        u32 post = XFR[0x50 + i];
         float vin[3] = {s, t, q};
         if ((post >> 8) & 1u) {
             float len = sqrtf(vin[0] * vin[0] + vin[1] * vin[1] + vin[2] * vin[2]);
             if (len > 1e-9f) { vin[0] /= len; vin[1] /= len; vin[2] /= len; }
         }
-        const u32* pm = &gx_xf_mem[0x500u + ((post & 0x3Fu) * 4u)];
+        const u32* pm = &XFM[0x500u + ((post & 0x3Fu) * 4u)];
         s = gx_f32(pm[0]) * vin[0] + gx_f32(pm[1]) * vin[1] + gx_f32(pm[2]) * vin[2] + gx_f32(pm[3]);
         t = gx_f32(pm[4]) * vin[0] + gx_f32(pm[5]) * vin[1] + gx_f32(pm[6]) * vin[2] + gx_f32(pm[7]);
         q = gx_f32(pm[8]) * vin[0] + gx_f32(pm[9]) * vin[1] + gx_f32(pm[10]) * vin[2] + gx_f32(pm[11]);
@@ -343,40 +511,89 @@ static void texgen(const Vtx* v, u32 i, float out[3]) {
     out[0] = s; out[1] = t; out[2] = q;
 }
 
+/* Clip space to screen: the divide by w and the viewport. */
+static void project(SVtx* out) {
+    float cw = out->clip[3];
+    out->valid = cw > 1e-6f;
+    if (!out->valid)
+        return;
+    out->inv_w = 1.0f / cw;
+    const u32* vp = &XFR[0x1A];
+    out->x = out->clip[0] * out->inv_w * gx_f32(vp[0]) + gx_f32(vp[3]) - 342.0f;
+    out->y = out->clip[1] * out->inv_w * gx_f32(vp[1]) + gx_f32(vp[4]) - 342.0f;
+    out->z = out->clip[2] * out->inv_w * gx_f32(vp[2]) + gx_f32(vp[5]);
+}
+
+/* A point between two vertices (t from a to b), interpolated in clip space. */
+static void lerp_vtx(const SVtx* a, const SVtx* b, float t, SVtx* out) {
+    for (int k = 0; k < 4; k++) out->clip[k] = a->clip[k] + (b->clip[k] - a->clip[k]) * t;
+    for (int c = 0; c < 2; c++)
+        for (int k = 0; k < 4; k++) out->col[c][k] = a->col[c][k] + (b->col[c][k] - a->col[c][k]) * t;
+    for (int i = 0; i < MAX_TC; i++)
+        for (int k = 0; k < 3; k++) out->tc[i][k] = a->tc[i][k] + (b->tc[i][k] - a->tc[i][k]) * t;
+    out->near_d = a->near_d + (b->near_d - a->near_d) * t;
+    out->far_d = a->far_d + (b->far_d - a->far_d) * t;
+    project(out);
+}
+
+/* Free camera (debug): a 3x4 matrix applied to view-space positions of 3D
+   (perspective) draws just before projection. Set from the window thread;
+   each frame's transforming uses a copy taken when it starts. */
+static float g_cam[12];
+static volatile int g_cam_on;
+static float g_cam_cur[12];
+static int g_cam_cur_on;
+
+void gx_raster_set_free_camera(bool on, const float m[12]) {
+    if (m) memcpy(g_cam, m, sizeof(g_cam));
+    g_cam_on = on;
+}
+
+static void take_free_camera(void) {
+    g_cam_cur_on = g_cam_on;
+    memcpy(g_cam_cur, g_cam, sizeof(g_cam_cur));
+}
+
 static void transform(const Vtx* in, SVtx* out) {
-    const u32* m = &gx_xf_mem[(in->pos_mtx * 4u) & 0x3FFu];
+    const u32* m = &XFM[(in->pos_mtx * 4u) & 0x3FFu];
     float ex = gx_f32(m[0]) * in->pos[0] + gx_f32(m[1]) * in->pos[1] + gx_f32(m[2]) * in->pos[2] + gx_f32(m[3]);
     float ey = gx_f32(m[4]) * in->pos[0] + gx_f32(m[5]) * in->pos[1] + gx_f32(m[6]) * in->pos[2] + gx_f32(m[7]);
     float ez = gx_f32(m[8]) * in->pos[0] + gx_f32(m[9]) * in->pos[1] + gx_f32(m[10]) * in->pos[2] + gx_f32(m[11]);
 
-    const u32* pr = &gx_xf_reg[0x20];
+    const u32* pr = &XFR[0x20];
     float cx, cy, cz, cw;
-    if (gx_xf_reg[0x26] == 0) {
-        cx = gx_f32(pr[0]) * ex + gx_f32(pr[1]) * ez;
-        cy = gx_f32(pr[2]) * ey + gx_f32(pr[3]) * ez;
-        cz = gx_f32(pr[4]) * ez + gx_f32(pr[5]);
-        cw = -ez;
+    if (g_setup.persp) {
+        float qx = ex, qy = ey, qz = ez;   /* where the (free) camera sees it; lighting keeps the game's view */
+        if (g_cam_cur_on) {
+            const float* c = g_cam_cur;
+            qx = c[0] * ex + c[1] * ey + c[2] * ez + c[3];
+            qy = c[4] * ex + c[5] * ey + c[6] * ez + c[7];
+            qz = c[8] * ex + c[9] * ey + c[10] * ez + c[11];
+        }
+        cx = gx_f32(pr[0]) * qx + gx_f32(pr[1]) * qz;
+        cy = gx_f32(pr[2]) * qy + gx_f32(pr[3]) * qz;
+        cz = gx_f32(pr[4]) * qz + gx_f32(pr[5]);
+        cw = -qz;
     } else {
         cx = gx_f32(pr[0]) * ex + gx_f32(pr[1]);
         cy = gx_f32(pr[2]) * ey + gx_f32(pr[3]);
         cz = gx_f32(pr[4]) * ez + gx_f32(pr[5]);
         cw = 1.0f;
     }
-    out->valid = cw > 1e-6f;
-    if (!out->valid)
-        return;
-    out->inv_w = 1.0f / cw;
-    const u32* vp = &gx_xf_reg[0x1A];
-    out->x = cx * out->inv_w * gx_f32(vp[0]) + gx_f32(vp[3]) - 342.0f;
-    out->y = cy * out->inv_w * gx_f32(vp[1]) + gx_f32(vp[4]) - 342.0f;
-    out->z = cz * out->inv_w * gx_f32(vp[2]) + gx_f32(vp[5]);
+    out->clip[0] = cx; out->clip[1] = cy; out->clip[2] = cz; out->clip[3] = cw;
+    /* Perspective: GX's near plane is z = -w. Orthographic draws are never
+       near-clipped (2D and full-screen effects). */
+    out->near_d = g_setup.persp ? cz + cw : 1.0f;
+    /* GX clip space keeps -w <= z <= 0: z = 0 is the far plane, and the GPU
+       drops what lies beyond it (distant scenery the game expects hidden). */
+    out->far_d = g_setup.persp ? -cz : 1.0f;
+    project(out);
 
     /* View-space position and normal for lighting. The normal matrix rows
        for position matrix row r start at XF 0x400 + 3r (three floats each). */
     float vpos[3] = {ex, ey, ez}, vn[3] = {0.0f, 0.0f, 1.0f};
-    bool lit = ((gx_xf_reg[0x0E] | gx_xf_reg[0x0F] | gx_xf_reg[0x10] | gx_xf_reg[0x11]) & 2u) != 0;
-    if (lit) {
-        const u32* nm = &gx_xf_mem[0x400u + (in->pos_mtx & 31u) * 3u];
+    if (g_setup.lit) {
+        const u32* nm = &XFM[0x400u + (in->pos_mtx & 31u) * 3u];
         for (int r = 0; r < 3; r++)
             vn[r] = gx_f32(nm[r * 3]) * in->nrm[0] + gx_f32(nm[r * 3 + 1]) * in->nrm[1] + gx_f32(nm[r * 3 + 2]) * in->nrm[2];
         float len = sqrtf(vn[0] * vn[0] + vn[1] * vn[1] + vn[2] * vn[2]);
@@ -384,8 +601,11 @@ static void transform(const Vtx* in, SVtx* out) {
         else { vn[0] = 0.0f; vn[1] = 0.0f; vn[2] = 1.0f; }
     }
     channel(in, 0, vpos, vn, out->col[0]);
-    channel(in, 1, vpos, vn, out->col[1]);
-    u32 ntex = gx_xf_reg[0x3F] & 15u;
+    if (g_setup.chan1)                         /* second colour channel in use */
+        channel(in, 1, vpos, vn, out->col[1]);
+    else
+        out->col[1][0] = out->col[1][1] = out->col[1][2] = out->col[1][3] = 0.0f;
+    u32 ntex = g_setup.ntex;
     for (u32 i = 0; i < MAX_TC; i++) {
         if (i < ntex)
             texgen(in, i, out->tc[i]);
@@ -407,39 +627,9 @@ static void transform(const Vtx* in, SVtx* out) {
      5    rasterised colour of the current stage (after swizzle)
      6-8  constants 1, 0.5, 0
      9+   konstant colour / alpha for each stage (two rows per stage) */
-enum { ROW_PREV = 0, ROW_TEX = 4, ROW_RAS = 5, ROW_ONE = 6, ROW_HALF = 7, ROW_ZERO = 8, ROW_KONST = 9,
-       ROW_COUNT = ROW_KONST + 32 };
-static float g_u8f[256];               /* i / 255 */
 
-typedef struct {
-    u8 ci[4];                          /* colour input rows a, b, c, d */
-    bool cbc[4];                       /* input is an alpha broadcast to RGB */
-    u8 ai[4];                          /* alpha input rows a, b, c, d (A component) */
-    u8 cdst, adst;
-    bool csub, asub, cclamp, aclamp, ccmp, acmp;
-    float cbias, abias, cscale, ascale;
-    bool tex_on;
-    u8 texcoord, chan;
-    u8 tsw[4], rsw[4];
-    const u32* texels;                 /* decoded texture; stays valid until the frame is drawn */
-    u32 tw, th, wrap_s, wrap_t;
-} Stage;
 
-enum { FAST_NONE, FAST_MODULATE, FAST_REPLACE, FAST_PASSCLR };
 
-typedef struct {
-    u32 stages;
-    u32 fast;                          /* one-stage standard modes (GXSetTevOp) */
-    Stage st[16];
-    float reg_init[4][4];
-    float konst[32][4];
-    u32 at_ref0, at_ref1, at_f0, at_f1, at_logic;
-    bool at_always;
-    /* rasteriser and pixel engine */
-    int sx0, sy0, sx1, sy1;            /* scissor, inclusive */
-    bool ztest, zupdate, blend, blend_alpha, subtract, color_update, alpha_update;
-    u32 zfunc, sfac, dfac, ntex;
-} RenderState;
 
 static float clamp01(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
 
@@ -487,8 +677,17 @@ static void scissor(int* x0, int* y0, int* x1, int* y1) {
 }
 
 /* Snapshot of everything a draw needs from the current register state. */
+/* A snapshot only fills (and is compared over) what the draw uses: the
+   fixed fields, the stages in use and their konstant rows. The parts of a
+   RenderState around the stage and konst arrays: */
+#define RS_HEAD_END offsetof(RenderState, st)
+#define RS_MID_BEGIN offsetof(RenderState, reg_init)
+#define RS_MID_END offsetof(RenderState, konst)
+#define RS_TAIL_BEGIN (offsetof(RenderState, konst) + sizeof(((RenderState*)0)->konst))
+
 static void snapshot_state(RenderState* ds) {
-    memset(ds, 0, sizeof(*ds));
+    memset(ds, 0, RS_HEAD_END);
+    memset((u8*)ds + RS_TAIL_BEGIN, 0, sizeof(RenderState) - RS_TAIL_BEGIN);
     for (u32 r = 0; r < 4; r++)
         for (u32 k = 0; k < 4; k++)
             ds->reg_init[r][k] = (float)gx_tev_reg[r][k] / 255.0f;
@@ -506,6 +705,7 @@ static void snapshot_state(RenderState* ds) {
     ds->stages = ((gx_bp[0x00] >> 10) & 15u) + 1;
     for (u32 i = 0; i < ds->stages; i++) {
         Stage* s = &ds->st[i];
+        memset(s, 0, sizeof(*s));
         u32 cop = gx_bp[0xC0 + i * 2], aop = gx_bp[0xC1 + i * 2];
         u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
         u32 texmap = order & 7u;
@@ -530,15 +730,27 @@ static void snapshot_state(RenderState* ds) {
         memcpy(s->tsw, swap[(aop >> 2) & 3u], 4);
         memcpy(s->rsw, swap[aop & 3u], 4);
 
+        if (s->tex_on && g_gpu)
+            s->efb_copy = gpu_tex_copy_for(texmap);
         if (s->tex_on) {
             const GxTexture* tex = gx_tex_get(g_cpu, texmap);
             if (tex) {
                 u32 mode0 = gx_bp[(texmap < 4 ? 0x80u : 0xA0u) + (texmap & 3u)];
+                u32 mode1 = gx_bp[(texmap < 4 ? 0x84u : 0xA4u) + (texmap & 3u)];
                 s->texels = tex->texels;
                 s->tw = tex->width;
                 s->th = tex->height;
                 s->wrap_s = mode0 & 3u;
                 s->wrap_t = (mode0 >> 2) & 3u;
+                s->levels = tex->levels;
+                memcpy(s->lw, tex->lw, sizeof(s->lw));
+                memcpy(s->lh, tex->lh, sizeof(s->lh));
+                memcpy(s->loff, tex->off, sizeof(s->loff));
+                s->mag_linear = (mode0 >> 4) & 1u;
+                s->min_filter = (u8)((mode0 >> 5) & 7u);
+                s->lod_bias = (float)(s8)((mode0 >> 9) & 0xFFu) / 32.0f;
+                s->min_lod = (float)(mode1 & 0xFFu) / 16.0f;
+                s->max_lod = (float)((mode1 >> 8) & 0xFFu) / 16.0f;
             }
         }
     }
@@ -585,14 +797,11 @@ static void snapshot_state(RenderState* ds) {
     ds->blend_alpha = ds->blend && !ds->subtract && ds->sfac == 4 && ds->dfac == 5;  /* src*a + dst*(1-a) */
     ds->ntex = gx_xf_reg[0x3F] & 15u;
     if (ds->ntex > MAX_TC) ds->ntex = MAX_TC;
+    ds->cull = (gx_bp[0x00] >> 14) & 3u;
 }
 
 /* ---------------------------------------------------------------- TEV --- */
-static inline int wrap_index(float c, u32 size, u32 mode) {
-    float f = c * (float)size;
-    int i = (int)f;
-    if (f < (float)i) i--;             /* floor without a libm call */
-    int n = (int)size;
+static inline int wrap_int(int i, int n, u32 mode) {
     switch (mode) {
     case 0:                            /* clamp */
         return i < 0 ? 0 : i >= n ? n - 1 : i;
@@ -603,11 +812,51 @@ static inline int wrap_index(float c, u32 size, u32 mode) {
         return m < n ? m : period - 1 - m;
     }
     default:                           /* repeat */
-        if ((size & (size - 1)) == 0)
+        if ((n & (n - 1)) == 0)
             return i & (n - 1);
         i %= n;
         return i < 0 ? i + n : i;
     }
+}
+
+static inline int ifloor(float f) {
+    int i = (int)f;
+    return f < (float)i ? i - 1 : i;   /* floor without a libm call */
+}
+
+static inline void unpack_texel(u32 c, float out[4]) {
+    out[0] = g_u8f[(c >> 16) & 255]; out[1] = g_u8f[(c >> 8) & 255];
+    out[2] = g_u8f[c & 255]; out[3] = g_u8f[c >> 24];
+}
+
+/* One mip level, nearest or bilinear. */
+static inline void fetch_level(const Stage* s, u32 l, float u, float v, bool linear, float out[4]) {
+    const u32* tx = s->texels + s->loff[l];
+    int w = (int)s->lw[l], h = (int)s->lh[l];
+    if (!linear) {
+        int x = wrap_int(ifloor(u * (float)w), w, s->wrap_s);
+        int y = wrap_int(ifloor(v * (float)h), h, s->wrap_t);
+        unpack_texel(tx[y * w + x], out);
+        return;
+    }
+    float fu = u * (float)w - 0.5f, fv = v * (float)h - 0.5f;
+    int x0 = ifloor(fu), y0 = ifloor(fv);
+    float ax = fu - (float)x0, ay = fv - (float)y0;
+    int xa = wrap_int(x0, w, s->wrap_s), xb = wrap_int(x0 + 1, w, s->wrap_s);
+    int ya = wrap_int(y0, h, s->wrap_t), yb = wrap_int(y0 + 1, h, s->wrap_t);
+    u32 c00 = tx[ya * w + xa], c10 = tx[ya * w + xb], c01 = tx[yb * w + xa], c11 = tx[yb * w + xb];
+    if (c00 == c10 && c00 == c01 && c00 == c11) {   /* flat area: no blending needed */
+        unpack_texel(c00, out);
+        return;
+    }
+    float w00 = (1 - ax) * (1 - ay), w10 = ax * (1 - ay), w01 = (1 - ax) * ay, w11 = ax * ay;
+    for (int sh = 0, k = 2; k >= 0; k--, sh += 8) {
+        float v00 = (float)((c00 >> sh) & 255), v10 = (float)((c10 >> sh) & 255);
+        float v01 = (float)((c01 >> sh) & 255), v11 = (float)((c11 >> sh) & 255);
+        out[k] = (v00 * w00 + v10 * w10 + v01 * w01 + v11 * w11) * (1.0f / 255.0f);
+    }
+    out[3] = ((float)(c00 >> 24) * w00 + (float)(c10 >> 24) * w10 + (float)(c01 >> 24) * w01 +
+              (float)(c11 >> 24) * w11) * (1.0f / 255.0f);
 }
 
 static bool alpha_compare(u32 func, u32 v, u32 ref) {
@@ -643,33 +892,55 @@ static inline float tev_combine(float a, float b, float c, float d, bool sub, fl
     return r < -4.0f ? -4.0f : r > 4.0f ? 4.0f : r;
 }
 
-static inline void sample_stage(const Stage* s, const float tc[][2], float out[4]) {
+/* Samples a stage's texture at its coordinates. lod: level of detail for
+   this triangle (log2 of texels per pixel, bias included). Filters follow
+   the game's settings: magnification nearest/linear; minification nearest,
+   linear, or mipmapped with nearest/linear inside a level and between levels. */
+static inline void sample_stage(const Stage* s, const float tc[][2], float lod, float out[4]) {
     if (!s->texels) {
         out[0] = out[1] = out[2] = out[3] = 0.0f;
         return;
     }
-    int x = wrap_index(tc[s->texcoord][0], s->tw, s->wrap_s);
-    int y = wrap_index(tc[s->texcoord][1], s->th, s->wrap_t);
-    u32 c = s->texels[(u32)y * s->tw + (u32)x];
-    out[0] = g_u8f[(c >> 16) & 255]; out[1] = g_u8f[(c >> 8) & 255];
-    out[2] = g_u8f[c & 255]; out[3] = g_u8f[c >> 24];
+    float u = tc[s->texcoord][0], v = tc[s->texcoord][1];
+    if (lod <= 0.0f || s->levels <= 1 || s->min_filter < 2) {
+        bool linear = lod <= 0.0f ? s->mag_linear : (s->min_filter == 1 || s->min_filter == 3 || s->min_filter == 5);
+        fetch_level(s, 0, u, v, linear, out);
+        return;
+    }
+    bool linear = s->min_filter == 3 || s->min_filter == 5;      /* LIN_MIP_* */
+    bool mip_linear = s->min_filter == 4 || s->min_filter == 5;  /* *_MIP_LIN */
+    float maxl = (float)(s->levels - 1);
+    if (lod > maxl) lod = maxl;
+    if (!mip_linear) {
+        fetch_level(s, (u32)(lod + 0.5f), u, v, linear, out);
+        return;
+    }
+    u32 l0 = (u32)lod;
+    float f = lod - (float)l0;
+    fetch_level(s, l0, u, v, linear, out);
+    if (f > 0.0f && l0 + 1 < s->levels) {
+        float o2[4];
+        fetch_level(s, l0 + 1, u, v, linear, o2);
+        for (int k = 0; k < 4; k++) out[k] += (o2[k] - out[k]) * f;
+    }
 }
 
 /* Runs the TEV stages for one pixel. Returns false if the alpha test
    discards it. rows: this thread's input table, konst rows already filled. */
-static bool tev_pixel(const RenderState* ds, float (*rows)[4], const float col[2][4], const float tc[][2], float out[4]) {
+static bool tev_pixel(const RenderState* ds, float (*rows)[4], const float col[2][4], const float tc[][2],
+                      const float* lod, float out[4]) {
     if (ds->fast != FAST_NONE) {
         const Stage* s = &ds->st[0];
         switch (ds->fast) {
         case FAST_MODULATE: {
             float t[4];
-            sample_stage(s, tc, t);
+            sample_stage(s, tc, lod[0], t);
             const float* c = col[s->chan];
             for (int k = 0; k < 4; k++) out[k] = t[k] * clamp01(c[k]);
             break;
         }
         case FAST_REPLACE:
-            sample_stage(s, tc, out);
+            sample_stage(s, tc, lod[0], out);
             break;
         default: {
             const float* c = col[s->chan];
@@ -685,7 +956,7 @@ static bool tev_pixel(const RenderState* ds, float (*rows)[4], const float col[2
         if (s->tex_on) {
             float raw[4];
             float* tex = rows[ROW_TEX];
-            sample_stage(s, tc, raw);
+            sample_stage(s, tc, lod[n], raw);
             tex[0] = raw[s->tsw[0]]; tex[1] = raw[s->tsw[1]]; tex[2] = raw[s->tsw[2]]; tex[3] = raw[s->tsw[3]];
         }
         float* ras = rows[ROW_RAS];
@@ -756,6 +1027,11 @@ static void draw_triangle(const RenderState* ds, float (*rows)[4], const SVtx* a
                           int band_y0, int band_y1) {
     float area = (b->x - a->x) * (c->y - a->y) - (b->y - a->y) * (c->x - a->x);
     if (fabsf(area) < 1e-6f || !isfinite(area)) return;
+    /* Face culling. With y pointing down the screen, a positive area means the
+       vertices run clockwise; GX treats counter-clockwise as front-facing
+       (confirmed by the Select Teams logos, which are drawn in both windings). */
+    if ((ds->cull == 1 && area < 0.0f) || (ds->cull == 2 && area > 0.0f))
+        return;
 
     int sy0 = ds->sy0 > band_y0 ? ds->sy0 : band_y0;
     int sy1 = ds->sy1 < band_y1 ? ds->sy1 : band_y1;
@@ -776,6 +1052,34 @@ static void draw_triangle(const RenderState* ds, float (*rows)[4], const SVtx* a
     bool no_q = true;
     for (u32 t = 0; t < ntex; t++)
         if (a->tc[t][2] != 1.0f || b->tc[t][2] != 1.0f || c->tc[t][2] != 1.0f) no_q = false;
+
+    /* Level of detail per stage, from how fast its texture coordinates change
+       across the screen (texels per pixel), worked out once per triangle. */
+    float lod[16];
+    for (u32 n = 0; n < ds->stages; n++) {
+        const Stage* s = &ds->st[n];
+        lod[n] = 0.0f;
+        if (!s->tex_on || !s->texels)
+            continue;
+        u32 t = s->texcoord < MAX_TC ? s->texcoord : 0;
+        float qa = a->tc[t][2], qb = b->tc[t][2], qc = c->tc[t][2];
+        float sa = a->tc[t][0] / (fabsf(qa) > 1e-9f ? qa : 1.0f), ta = a->tc[t][1] / (fabsf(qa) > 1e-9f ? qa : 1.0f);
+        float sb = b->tc[t][0] / (fabsf(qb) > 1e-9f ? qb : 1.0f), tb = b->tc[t][1] / (fabsf(qb) > 1e-9f ? qb : 1.0f);
+        float sc = c->tc[t][0] / (fabsf(qc) > 1e-9f ? qc : 1.0f), tc_ = c->tc[t][1] / (fabsf(qc) > 1e-9f ? qc : 1.0f);
+        float dsdx = ((sb - sa) * (c->y - a->y) - (sc - sa) * (b->y - a->y)) * inv * (float)s->tw;
+        float dsdy = ((sc - sa) * (b->x - a->x) - (sb - sa) * (c->x - a->x)) * inv * (float)s->tw;
+        float dtdx = ((tb - ta) * (c->y - a->y) - (tc_ - ta) * (b->y - a->y)) * inv * (float)s->th;
+        float dtdy = ((tc_ - ta) * (b->x - a->x) - (tb - ta) * (c->x - a->x)) * inv * (float)s->th;
+        float rx = dsdx * dsdx + dtdx * dtdx, ry = dsdy * dsdy + dtdy * dtdy;
+        float rho2 = rx > ry ? rx : ry;
+        float l = rho2 > 1e-12f ? 0.5f * log2f(rho2) : -16.0f;
+        l += s->lod_bias;
+        if (l > 0.0f) {                 /* the LOD clamp only applies when minifying */
+            if (l < s->min_lod) l = s->min_lod;
+            if (l > s->max_lod) l = s->max_lod;
+        }
+        lod[n] = isfinite(l) ? l : 0.0f;
+    }
 
     /* Edge functions step linearly across a row. */
     float dw0dx = (b->y - c->y) * inv, dw1dx = (c->y - a->y) * inv;
@@ -829,7 +1133,7 @@ static void draw_triangle(const RenderState* ds, float (*rows)[4], const SVtx* a
             }
 
             float out[4];
-            if (!tev_pixel(ds, rows, col, tc, out))
+            if (!tev_pixel(ds, rows, col, tc, lod, out))
                 continue;
             float r = out[0] * 255.0f, g = out[1] * 255.0f, bl = out[2] * 255.0f, al = out[3] * 255.0f;
 
@@ -864,31 +1168,23 @@ static void draw_triangle(const RenderState* ds, float (*rows)[4], const SVtx* a
 }
 
 /* ----------------------------------------------------- command lists --- */
-typedef struct {
-    u32 cmd, sx, sy, w, h;             /* copy command and source rectangle */
-    u32 dest, stride, lines;           /* to_xfb: destination in RAM */
-    float yscale;
-    bool to_xfb, clear;
-    u32 clear_color, clear_z;
-} CopyCmd;
 
-typedef struct {
-    u32 type;                          /* CMD_TRI or CMD_COPY */
-    u32 state;                         /* RenderState index (triangles) */
-    union {
-        SVtx v[3];
-        CopyCmd copy;
-    } u;
-} Cmd;
-
-enum { CMD_TRI, CMD_COPY };
-
-typedef struct {
-    Cmd* cmds;
-    u32 n, cap;
-    RenderState* states;
-    u32 ns, cap_s;
-} CmdList;
+/* Room for count more vertices in the pool; returns the first index, or
+   ~0 if memory ran out. The pool may move: hold indices, not pointers. */
+static u32 list_verts(CmdList* l, u32 count) {
+    if (l->nv + count > l->cap_v) {
+        u32 cap = l->cap_v ? l->cap_v : 16384;
+        while (cap < l->nv + count) cap *= 2;
+        SVtx* v = (SVtx*)realloc(l->verts, sizeof(SVtx) * cap);
+        if (!v)
+            return ~0u;
+        l->verts = v;
+        l->cap_v = cap;
+    }
+    u32 base = l->nv;
+    l->nv += count;
+    return base;
+}
 
 static CmdList g_lists[2];
 static u32 g_rec;                      /* list being recorded */
@@ -905,6 +1201,51 @@ static Cmd* list_push(CmdList* l) {
     return &l->cmds[l->n++];
 }
 
+/* Hashing, comparing and copying the used part of a snapshot. */
+static u64 hash_words(u64 h, const void* p, size_t n) {
+    const u8* b = (const u8*)p;
+    for (; n >= 8; n -= 8, b += 8) {
+        u64 w;
+        memcpy(&w, b, 8);
+        h = (h ^ w) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    for (; n; n--, b++) h = (h ^ *b) * 0x100000001B3ull;
+    return h;
+}
+
+static u64 rs_hash(const RenderState* r) {
+    u64 h = 0xCBF29CE484222325ull;
+    h = hash_words(h, r, RS_HEAD_END);
+    h = hash_words(h, r->st, sizeof(Stage) * r->stages);
+    h = hash_words(h, (const u8*)r + RS_MID_BEGIN, RS_MID_END - RS_MID_BEGIN);
+    h = hash_words(h, r->konst, sizeof(r->konst[0]) * 2u * r->stages);
+    return hash_words(h, (const u8*)r + RS_TAIL_BEGIN, sizeof(RenderState) - RS_TAIL_BEGIN);
+}
+
+static bool rs_equal(const RenderState* a, const RenderState* b) {
+    return a->stages == b->stages && memcmp(a, b, RS_HEAD_END) == 0 &&
+           memcmp(a->st, b->st, sizeof(Stage) * a->stages) == 0 &&
+           memcmp((const u8*)a + RS_MID_BEGIN, (const u8*)b + RS_MID_BEGIN, RS_MID_END - RS_MID_BEGIN) == 0 &&
+           memcmp(a->konst, b->konst, sizeof(a->konst[0]) * 2u * a->stages) == 0 &&
+           memcmp((const u8*)a + RS_TAIL_BEGIN, (const u8*)b + RS_TAIL_BEGIN, sizeof(RenderState) - RS_TAIL_BEGIN) == 0;
+}
+
+static void rs_copy(RenderState* d, const RenderState* s) {
+    memcpy(d, s, RS_HEAD_END);
+    memcpy(d->st, s->st, sizeof(Stage) * s->stages);
+    memcpy((u8*)d + RS_MID_BEGIN, (const u8*)s + RS_MID_BEGIN, RS_MID_END - RS_MID_BEGIN);
+    memcpy(d->konst, s->konst, sizeof(s->konst[0]) * 2u * s->stages);
+    memcpy((u8*)d + RS_TAIL_BEGIN, (const u8*)s + RS_TAIL_BEGIN, sizeof(RenderState) - RS_TAIL_BEGIN);
+}
+
+/* The snapshots already in the list being recorded, by hash, so a draw that
+   goes back to an earlier setup (models alternating between a few textures)
+   reuses its snapshot instead of adding another. */
+#define STATE_TABLE 4096u
+static struct { u64 hash; u32 idx, gen; } g_stab[STATE_TABLE];
+static u32 g_stab_gen = 1;
+
 static u32 list_state(CmdList* l) {
     if (l->ns == l->cap_s) {
         u32 cap = l->cap_s ? l->cap_s * 2 : 256;
@@ -914,12 +1255,37 @@ static u32 list_state(CmdList* l) {
         l->states = s;
         l->cap_s = cap;
     }
-    RenderState tmp;
+    /* Nothing that the snapshot reads has changed since the last draw. */
+    static u32 last_serial;
+    static const CmdList* last_list;
+    static u32 last_idx;
+    if (gx_state_serial == last_serial && l == last_list && last_idx < l->ns)
+        return last_idx;
+    last_serial = gx_state_serial;
+    last_list = l;
+    if (l->ns == 0)
+        g_stab_gen++;                  /* a fresh list: forget the table */
+    static RenderState tmp;
     snapshot_state(&tmp);
-    /* Consecutive draws often share state: reuse the previous snapshot. */
-    if (l->ns && memcmp(&l->states[l->ns - 1], &tmp, sizeof(tmp)) == 0)
-        return l->ns - 1;
-    l->states[l->ns] = tmp;
+    u64 h = rs_hash(&tmp);
+    u32 slot = (u32)(h ^ (h >> 32)) & (STATE_TABLE - 1u);
+    for (u32 probe = 0; probe < 8; probe++, slot = (slot + 1) & (STATE_TABLE - 1u)) {
+        if (g_stab[slot].gen != g_stab_gen)
+            break;                     /* empty for this list */
+        if (g_stab[slot].hash == h && g_stab[slot].idx < l->ns && rs_equal(&l->states[g_stab[slot].idx], &tmp))
+            return last_idx = g_stab[slot].idx;
+    }
+    rs_copy(&l->states[l->ns], &tmp);
+    last_idx = l->ns;
+    /* remember it (in the first free slot of its run, or over the oldest) */
+    slot = (u32)(h ^ (h >> 32)) & (STATE_TABLE - 1u);
+    for (u32 probe = 0; probe < 8; probe++) {
+        u32 sl = (slot + probe) & (STATE_TABLE - 1u);
+        if (g_stab[sl].gen != g_stab_gen || probe == 7) {
+            g_stab[sl].hash = h; g_stab[sl].idx = l->ns; g_stab[sl].gen = g_stab_gen;
+            break;
+        }
+    }
     return l->ns++;
 }
 
@@ -934,6 +1300,34 @@ static gx_cond g_cv_work, g_cv_done;
 static u32 g_generation;               /* bumped for each submitted list */
 static int g_busy;                     /* workers still drawing the current list */
 static const CmdList* g_drawing;
+
+/* EFB rows [y0, y1] of a TV-buffer copy, written to RAM as YUYV. Each
+   destination line is written by whoever owns its source line, so no
+   drawing thread reads rows another is still drawing. */
+void raster_xfb_write(const CopyCmd* cp, int y0, int y1) {
+    if (!cp->lines || !g_cpu)
+        return;
+    for (u32 y = 0; y < cp->lines; y++) {
+        u32 srcy = cp->sy + (u32)(y / cp->yscale);
+        if (srcy >= EFB_H || srcy >= cp->sy + cp->h)
+            srcy = cp->sy + cp->h - 1 < EFB_H ? cp->sy + cp->h - 1 : EFB_H - 1;
+        if ((int)srcy < y0 || (int)srcy > y1)
+            continue;
+        u8* d = g_cpu->ram + cp->dest + y * cp->stride;
+        const u32* src = &g_color[srcy * EFB_W];
+        for (u32 x = 0; x + 1 < cp->w; x += 2) {
+            u32 c0 = cp->sx + x < EFB_W ? src[cp->sx + x] : 0;
+            u32 c1 = cp->sx + x + 1 < EFB_W ? src[cp->sx + x + 1] : 0;
+            int r0 = (c0 >> 16) & 255, g0 = (c0 >> 8) & 255, b0 = c0 & 255;
+            int r1 = (c1 >> 16) & 255, g1 = (c1 >> 8) & 255, b1 = c1 & 255;
+            int r = (r0 + r1) / 2, g = (g0 + g1) / 2, b = (b0 + b1) / 2;
+            d[x * 2 + 0] = (u8)((66 * r0 + 129 * g0 + 25 * b0 + 128) / 256 + 16);
+            d[x * 2 + 1] = (u8)((-38 * r - 74 * g + 112 * b + 128) / 256 + 128);
+            d[x * 2 + 2] = (u8)((66 * r1 + 129 * g1 + 25 * b1 + 128) / 256 + 16);
+            d[x * 2 + 3] = (u8)((112 * r - 94 * g - 18 * b + 128) / 256 + 128);
+        }
+    }
+}
 
 /* Executes the whole list for frame-buffer rows [y0, y1]. */
 static void run_list(const CmdList* l, int y0, int y1) {
@@ -952,34 +1346,12 @@ static void run_list(const CmdList* l, int y0, int y1) {
                 memcpy(rows[ROW_KONST], ds->konst, sizeof(ds->konst));
                 cur = c->state;
             }
-            draw_triangle(ds, rows, &c->u.v[0], &c->u.v[1], &c->u.v[2], y0, y1);
+            draw_triangle(ds, rows, &l->verts[c->u.vi[0]], &l->verts[c->u.vi[1]], &l->verts[c->u.vi[2]], y0, y1);
             continue;
         }
         const CopyCmd* cp = &c->u.copy;
-        if (cp->to_xfb && cp->lines && g_cpu) {
-            /* Each destination line is written by the worker that owns its
-               source line, so no thread reads rows another is still drawing. */
-            for (u32 y = 0; y < cp->lines; y++) {
-                u32 srcy = cp->sy + (u32)(y / cp->yscale);
-                if (srcy >= EFB_H || srcy >= cp->sy + cp->h)
-                    srcy = cp->sy + cp->h - 1 < EFB_H ? cp->sy + cp->h - 1 : EFB_H - 1;
-                if ((int)srcy < y0 || (int)srcy > y1)
-                    continue;
-                u8* d = g_cpu->ram + cp->dest + y * cp->stride;
-                const u32* src = &g_color[srcy * EFB_W];
-                for (u32 x = 0; x + 1 < cp->w; x += 2) {
-                    u32 c0 = cp->sx + x < EFB_W ? src[cp->sx + x] : 0;
-                    u32 c1 = cp->sx + x + 1 < EFB_W ? src[cp->sx + x + 1] : 0;
-                    int r0 = (c0 >> 16) & 255, g0 = (c0 >> 8) & 255, b0 = c0 & 255;
-                    int r1 = (c1 >> 16) & 255, g1 = (c1 >> 8) & 255, b1 = c1 & 255;
-                    int r = (r0 + r1) / 2, g = (g0 + g1) / 2, b = (b0 + b1) / 2;
-                    d[x * 2 + 0] = (u8)((66 * r0 + 129 * g0 + 25 * b0 + 128) / 256 + 16);
-                    d[x * 2 + 1] = (u8)((-38 * r - 74 * g + 112 * b + 128) / 256 + 128);
-                    d[x * 2 + 2] = (u8)((66 * r1 + 129 * g1 + 25 * b1 + 128) / 256 + 16);
-                    d[x * 2 + 3] = (u8)((112 * r - 94 * g - 18 * b + 128) / 256 + 128);
-                }
-            }
-        }
+        if (cp->to_xfb)
+            raster_xfb_write(cp, y0, y1);
         if (cp->clear) {
             for (int y = y0; y <= y1; y++) {
                 u32* cr = &g_color[(size_t)y * EFB_W];
@@ -998,6 +1370,42 @@ static void band(int who, int count, int* y0, int* y1) {
     *y1 = EFB_H * (who + 1) / count - 1;
 }
 
+/* Renderer timing for the performance log: how long the game thread waited
+   for the workers, and how long each frame took to draw (submit to last
+   band done), in seconds since the last gx_raster_take_perf. */
+static double now_s(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static double g_submit_at, g_perf_wait, g_perf_draw, g_perf_draw_max;
+static u32 g_perf_frames;
+static unsigned long long g_perf_tris_at;
+
+void gx_raster_take_perf(double* wait_s, double* draw_avg_s, double* draw_max_s, u32* tris_per_frame) {
+    if (!g_workers) {
+        *wait_s = *draw_avg_s = *draw_max_s = 0.0;
+        *tris_per_frame = 0;
+        return;
+    }
+    gx_mutex_lock(&g_mx);
+    *wait_s = g_perf_wait;
+    *draw_avg_s = g_perf_frames ? g_perf_draw / g_perf_frames : 0.0;
+    *draw_max_s = g_perf_draw_max;
+    *tris_per_frame = g_perf_frames ? (u32)((g_tris_recorded - g_perf_tris_at) / g_perf_frames) : 0;
+    g_perf_wait = g_perf_draw = g_perf_draw_max = 0.0;
+    g_perf_frames = 0;
+    g_perf_tris_at = g_tris_recorded;
+    gx_mutex_unlock(&g_mx);
+}
+
+/* What the threads are asked to do: draw a list, or (GPU) read the frame
+   buffer back into memory. */
+enum { JOB_LIST, JOB_READBACK, JOB_TEXCOPY };
+static int g_job;
+static bool g_job_depth;
+static const TexCopy* g_job_copy;
+
 static void worker_main(void* arg) {
     int who = (int)(size_t)arg;
     u32 seen = 0;
@@ -1008,15 +1416,31 @@ static void worker_main(void* arg) {
         seen = g_generation;
         const CmdList* l = g_drawing;
         int count = g_workers;
+        int job = g_job;
+        bool job_depth = g_job_depth;
         gx_mutex_unlock(&g_mx);
 
-        int y0, y1;
-        band(who, count, &y0, &y1);
-        run_list(l, y0, y1);
+        if (g_gpu) {                   /* the one GPU thread */
+            if (job == JOB_READBACK)
+                glr_readback(job_depth);
+            else if (job == JOB_TEXCOPY)
+                glr_tex_copy(g_job_copy);
+            else
+                glr_run_list(g_defer ? expand_list(l) : l);
+        } else {
+            int y0, y1;
+            band(who, count, &y0, &y1);
+            run_list(l, y0, y1);
+        }
 
         gx_mutex_lock(&g_mx);
-        if (--g_busy == 0)
+        if (--g_busy == 0) {
+            double d = now_s() - g_submit_at;
+            g_perf_draw += d;
+            if (d > g_perf_draw_max) g_perf_draw_max = d;
+            g_perf_frames++;
             gx_cond_broadcast(&g_cv_done);
+        }
         gx_mutex_unlock(&g_mx);
     }
 }
@@ -1028,6 +1452,8 @@ static void start_workers(void) {
     started = true;
     for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;
     int n = g_workers_wanted;
+    if (g_gpu)
+        n = 1;                         /* one thread feeds the graphics card */
     if (n < 0) {
         n = gx_cpu_count() - 1;        /* leave one core for the game */
         if (n > 8) n = 8;
@@ -1044,7 +1470,10 @@ static void start_workers(void) {
             break;
         g_workers++;
     }
-    printf("renderer: %d drawing thread%s\n", g_workers, g_workers == 1 ? "" : "s");
+    if (g_gpu)
+        printf("renderer: graphics card, fed by its own thread\n");
+    else
+        printf("renderer: %d drawing thread%s\n", g_workers, g_workers == 1 ? "" : "s");
 }
 
 /* Waits until the workers have finished the list they are drawing. */
@@ -1052,24 +1481,35 @@ static void wait_idle(void) {
     if (!g_workers)
         return;
     gx_mutex_lock(&g_mx);
-    while (g_busy > 0)
-        gx_cond_wait(&g_cv_done, &g_mx);
+    if (g_busy > 0) {
+        int prev = prof_enter(PROF_RENDER_WAIT);
+        double t0 = now_s();
+        while (g_busy > 0)
+            gx_cond_wait(&g_cv_done, &g_mx);
+        g_perf_wait += now_s() - t0;
+        prof_leave(prev);
+    }
     gx_mutex_unlock(&g_mx);
 }
 
 /* Ends the recorded frame: hands its list to the workers (or draws it here
    when there are none) and starts recording into the other list. */
 static void submit(void) {
+    gx_state_serial++;                 /* the next draw starts a new list: take a fresh snapshot */
     start_workers();
     wait_idle();                       /* the other list is free again */
     gx_tex_collect_garbage();          /* texture memory the finished frame used */
     CmdList* l = &g_lists[g_rec];
-    if (!g_workers) {
+    if (g_gpu && !g_workers) {         /* no thread could be started: draw here */
+        glr_run_list(g_defer ? expand_list(l) : l);
+    } else if (!g_workers) {
         run_list(l, 0, EFB_H - 1);
     } else {
         gx_mutex_lock(&g_mx);
+        g_job = JOB_LIST;
         g_drawing = l;
         g_busy = g_workers;
+        g_submit_at = now_s();
         g_generation++;
         gx_cond_broadcast(&g_cv_work);
         gx_mutex_unlock(&g_mx);
@@ -1077,6 +1517,49 @@ static void submit(void) {
     g_rec ^= 1u;
     g_lists[g_rec].n = 0;
     g_lists[g_rec].ns = 0;
+    g_lists[g_rec].nv = 0;
+    g_lists[g_rec].nraw = 0;
+    g_lists[g_rec].nxf = 0;
+}
+
+/* GPU mode: has the GPU thread make its own copy into a texture. */
+
+static void gpu_tex_copy(const TexCopy* info) {
+    start_workers();
+    wait_idle();
+    if (!g_workers) {
+        glr_tex_copy(info);
+        return;
+    }
+    gx_mutex_lock(&g_mx);
+    g_job = JOB_TEXCOPY;
+    g_job_copy = info;
+    g_busy = 1;
+    g_submit_at = now_s();
+    g_generation++;
+    gx_cond_broadcast(&g_cv_work);
+    gx_mutex_unlock(&g_mx);
+    wait_idle();                       /* info lives on the caller's stack */
+}
+
+static void efb_to_memory(bool depth) {
+    if (!g_gpu)
+        return;
+    start_workers();
+    wait_idle();
+    if (!g_workers) {
+        glr_readback(depth);
+        return;
+    }
+    gx_mutex_lock(&g_mx);
+    g_job = JOB_READBACK;
+    g_job_depth = depth;
+    g_busy = 1;
+    g_submit_at = now_s();
+    g_generation++;
+    gx_cond_broadcast(&g_cv_work);
+    gx_mutex_unlock(&g_mx);
+    wait_idle();
 }
 
 void gx_raster_set_threads(int n) {
@@ -1093,6 +1576,7 @@ void gx_raster_sync(void) {
 static double g_dlog_at = -1.0;
 static int g_dlog_frames;              /* frames still to log once started */
 static FILE* g_dlog;
+static FILE* g_dlog_short;             /* one line per draw */
 static u32 g_dlog_draws;
 
 void gx_raster_draw_log(double at_seconds, int frames) {
@@ -1127,14 +1611,102 @@ static void dlog_op(FILE* f, u32 op, bool color) {
         fprintf(f, " [compare mode %u]", ((op >> 20) & 3u) | (sub << 2));
 }
 
+/* Saves a decoded texture (level 0) as tex_ADDRESS.bmp: colour on the left,
+   alpha as grey on the right. Once per address per log. */
+static u32 g_dlog_dumped[128];
+static u32 g_dlog_ndumped;
+
+static void dlog_texture(u32 map, u32 addr) {
+    for (u32 i = 0; i < g_dlog_ndumped; i++)
+        if (g_dlog_dumped[i] == addr) return;
+    if (g_dlog_ndumped >= 128 || !g_cpu) return;
+    g_dlog_dumped[g_dlog_ndumped++] = addr;
+    const GxTexture* t = gx_tex_get(g_cpu, map);
+    if (!t) return;
+    char path[64];
+    snprintf(path, sizeof(path), "tex_%08X.bmp", addr);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    u32 w = t->width * 2, h = t->height, row = (w * 3 + 3) & ~3u, size = 54 + row * h;
+    u8 hdr[54] = {'B', 'M'};
+    hdr[2] = (u8)size; hdr[3] = (u8)(size >> 8); hdr[4] = (u8)(size >> 16); hdr[5] = (u8)(size >> 24);
+    hdr[10] = 54; hdr[14] = 40;
+    hdr[18] = (u8)w; hdr[19] = (u8)(w >> 8);
+    hdr[22] = (u8)h; hdr[23] = (u8)(h >> 8);
+    hdr[26] = 1; hdr[28] = 24;
+    fwrite(hdr, 1, 54, f);
+    u8* line = (u8*)calloc(1, row);
+    for (u32 y = 0; y < h; y++) {
+        const u32* src = t->texels + (h - 1 - y) * t->width;
+        for (u32 x = 0; x < t->width; x++) {
+            u32 c = src[x];
+            line[x * 3] = (u8)c; line[x * 3 + 1] = (u8)(c >> 8); line[x * 3 + 2] = (u8)(c >> 16);
+            u8 a = (u8)(c >> 24);
+            u8* d = line + (t->width + x) * 3;
+            d[0] = d[1] = d[2] = a;
+        }
+        fwrite(line, 1, row, f);
+    }
+    free(line);
+    fclose(f);
+}
+
+static void dlog_short(u8 prim, u32 count, const SVtx* sv) {
+    FILE* f = g_dlog_short;
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (u32 i = 0; i < count; i++) {
+        if (!sv[i].valid) continue;
+        x0 = fminf(x0, sv[i].x); x1 = fmaxf(x1, sv[i].x);
+        y0 = fminf(y0, sv[i].y); y1 = fmaxf(y1, sv[i].y);
+    }
+    u32 stages = ((gx_bp[0x00] >> 10) & 15u) + 1, cm = gx_bp[0x41], at = gx_bp[0xF3];
+    fprintf(f, "#%-4u box %4.0f,%4.0f-%4.0f,%4.0f prim %02X n%-3u cull %u stages %u", g_dlog_draws, x0, y0, x1, y1, prim,
+            count, (gx_bp[0x00] >> 14) & 3u, stages);
+    for (u32 i = 0; i < stages && i < 4; i++) {
+        u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
+        fprintf(f, " [c%06X a%06X", gx_bp[0xC0 + i * 2] & 0xFFFFFFu, gx_bp[0xC1 + i * 2] & 0xFFFFFFu);
+        if ((order >> 6) & 1u) {
+            u32 map = order & 7u, bank = map < 4 ? 0u : 0x20u, m = map & 3u;
+            u32 img0 = gx_bp[0x88 + bank + m], mode0 = gx_bp[0x80 + bank + m], mode1 = gx_bp[0x84 + bank + m];
+            u32 tlut = gx_bp[0x98 + bank + m], fmt = (img0 >> 20) & 15u;
+            u32 addr = (gx_bp[0x94 + bank + m] << 5) & 0x01FFFFE0u;
+            fprintf(f, " %s %ux%u@%08X tc%u f%u/%u lod%u-%u bias%d", k_fmt[fmt], (img0 & 0x3FFu) + 1,
+                    ((img0 >> 10) & 0x3FFu) + 1, addr, (order >> 3) & 7u,
+                    (mode0 >> 4) & 1u, (mode0 >> 5) & 7u, mode1 & 0xFFu, (mode1 >> 8) & 0xFFu, (int)(s8)((mode0 >> 9) & 0xFFu));
+            if (fmt == 8 || fmt == 9 || fmt == 10)
+                fprintf(f, " tlut %s@tmem%05X", ((const char* const[]){"IA8", "RGB565", "RGB5A3", "?3"})[(tlut >> 10) & 3u],
+                        (tlut & 0x3FFu) << 9);
+            dlog_texture(map, addr);
+        }
+        fprintf(f, "]");
+    }
+    fprintf(f, " blend %s %s/%s at %s%u/%s%u col0 %.2f,%.2f,%.2f,%.2f", (cm & 1u) ? "on" : "off",
+            k_blend[(cm >> 8) & 7u], k_blend[(cm >> 5) & 7u], k_cmp[(at >> 16) & 7u], at & 255u, k_cmp[(at >> 19) & 7u],
+            (at >> 8) & 255u, sv[0].col[0][0], sv[0].col[0][1], sv[0].col[0][2], sv[0].col[0][3]);
+    /* every vertex (small draws): screen position and texture coordinate 0 */
+    fprintf(f, " v:");
+    for (u32 i = 0; i < count && i < 8; i++) {
+        float q = fabsf(sv[i].tc[0][2]) > 1e-9f ? sv[i].tc[0][2] : 1.0f;
+        fprintf(f, " (%.0f,%.0f %.3f,%.3f)", sv[i].x, sv[i].y, sv[i].tc[0][0] / q, sv[i].tc[0][1] / q);
+    }
+    fprintf(f, "\n");
+}
+
 static void dlog_draw(u8 prim, u32 count, const SVtx* first) {
     if (!g_dlog) {
         g_dlog = fopen("drawlog.txt", "w");
         if (!g_dlog) { g_dlog_frames = 0; return; }
+        g_dlog_short = fopen("drawlog-short.txt", "w");
+        g_dlog_ndumped = 0;
         fprintf(g_dlog, "draw log from %.2f s of game time, frame %u\n", interrupts_game_seconds(), g_frames + 1);
+        if (g_dlog_short)
+            fprintf(g_dlog_short, "draw log from %.2f s of game time, frame %u (box = screen x0,y0-x1,y1; "
+                    "f = mag/min filter; c/a = TEV colour/alpha op words)\n", interrupts_game_seconds(), g_frames + 1);
     }
     FILE* f = g_dlog;
     g_dlog_draws++;
+    if (g_dlog_short)
+        dlog_short(prim, count, first);
     fprintf(f, "\n#%u frame %u prim 0x%02X count %u\n", g_dlog_draws, g_frames + 1, prim, count);
     u32 stages = ((gx_bp[0x00] >> 10) & 15u) + 1;
     fprintf(f, "  genmode 0x%06X (tev stages %u, texgens %u, chans %u, cull %u)  pe_control 0x%06X (pixel format %u)\n",
@@ -1193,47 +1765,82 @@ static void dlog_draw(u8 prim, u32 count, const SVtx* first) {
 }
 
 static void dlog_frame_end(void) {
+    if (g_dlog_short && g_dlog)
+        fprintf(g_dlog_short, "-- end of frame %u\n", g_frames + 1);
     if (g_dlog && --g_dlog_frames <= 0) {
         fclose(g_dlog);
         g_dlog = NULL;
+        if (g_dlog_short) fclose(g_dlog_short);
+        g_dlog_short = NULL;
         g_dlog_at = -1.0;
         printf("  draw log written to drawlog.txt (%u draws)\n", g_dlog_draws);
     }
 }
 
 /* ------------------------------------------------------------ record --- */
-void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) {
-    if (!gx_raster_active() || count == 0)
+static void push_tri(CmdList* l, u32 state, u32 a, u32 b, u32 c) {
+    if (!l->verts[a].valid || !l->verts[b].valid || !l->verts[c].valid) {
+        g_tris_skipped++;
         return;
-    if ((gx_bp[0x00] >> 14 & 3u) == 3u)
-        return;                        /* cull everything */
-    g_cpu = cpu;
-    if (g_u8f[255] == 0.0f)
-        for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;
-    CmdList* l = &g_lists[g_rec];
-    u32 state = list_state(l);
-
-    SVtx* sv = (SVtx*)malloc(sizeof(SVtx) * count);
-    if (!sv)
-        return;
-    const u8* p = data;
-    for (u32 i = 0; i < count; i++) {
-        Vtx v;
-        p += decode_vertex(cpu, vat, p, &v);
-        transform(&v, &sv[i]);
     }
-    if (g_dlog_at >= 0.0 && g_dlog_frames > 0 && interrupts_game_seconds() >= g_dlog_at)
-        dlog_draw(prim, count, &sv[0]);
+    Cmd* cmd = list_push(l);
+    if (!cmd)
+        return;
+    cmd->type = CMD_TRI;
+    cmd->state = state;
+    cmd->u.vi[0] = a; cmd->u.vi[1] = b; cmd->u.vi[2] = c;
+    g_tris_recorded++;
+}
 
-#define EMIT(i0, i1, i2) do {                                                        \
-        const SVtx *a_ = &sv[i0], *b_ = &sv[i1], *c_ = &sv[i2];                      \
-        if (!a_->valid || !b_->valid || !c_->valid) { g_tris_skipped++; break; }     \
-        Cmd* cmd_ = list_push(l);                                                    \
-        if (!cmd_) break;                                                            \
-        cmd_->type = CMD_TRI; cmd_->state = state;                                   \
-        cmd_->u.v[0] = *a_; cmd_->u.v[1] = *b_; cmd_->u.v[2] = *c_;                  \
-        g_tris_recorded++;                                                           \
-    } while (0)
+/* Records a triangle (vertex pool indices), cutting off any part in front
+   of the near plane or beyond the far plane, as the GPU's clipper does
+   (dropping whole triangles made big pieces of scenery that reach past the
+   camera vanish and flicker; not clipping at the far plane drew distant
+   scenery the game expects hidden). */
+static float plane_d(const SVtx* v, int plane) {
+    return plane ? v->far_d : v->near_d;
+}
+
+static void emit_tri(CmdList* l, u32 state, u32 a, u32 b, u32 c) {
+    u32 poly[8] = {a, b, c};
+    int n = 3;
+    for (int plane = 0; plane < 2; plane++) {
+        int inside = 0;
+        for (int i = 0; i < n; i++) inside += plane_d(&l->verts[poly[i]], plane) >= 0.0f;
+        if (inside == n)
+            continue;
+        if (inside == 0) {
+            g_tris_skipped++;
+            return;
+        }
+        /* Sutherland-Hodgman against one plane, keeping the winding order;
+           new points go into the pool. */
+        u32 out[8];
+        int m = 0;
+        for (int i = 0; i < n && m < 7; i++) {
+            u32 pi = poly[i], qi = poly[(i + 1) % n];
+            float pd = plane_d(&l->verts[pi], plane), qd = plane_d(&l->verts[qi], plane);
+            bool pin = pd >= 0.0f, qin = qd >= 0.0f;
+            if (pin)
+                out[m++] = pi;
+            if (pin != qin) {
+                u32 ni = list_verts(l, 1);       /* may move the pool */
+                if (ni == ~0u)
+                    return;
+                lerp_vtx(&l->verts[pi], &l->verts[qi], pd / (pd - qd), &l->verts[ni]);
+                out[m++] = ni;
+            }
+        }
+        memcpy(poly, out, sizeof(u32) * (size_t)m);
+        n = m;
+    }
+    for (int i = 1; i + 1 < n; i++)
+        push_tri(l, state, poly[0], poly[i], poly[i + 1]);
+}
+
+/* Triangles of a primitive whose transformed vertices are at base..base+count. */
+static void emit_prim(CmdList* l, u32 state, u8 prim, u32 base, u32 count) {
+#define EMIT(i0, i1, i2) emit_tri(l, state, base + (i0), base + (i1), base + (i2))
 
     switch (prim & 0xF8) {
     case 0x80:
@@ -1247,9 +1854,13 @@ void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) 
         for (u32 i = 0; i + 2 < count; i += 3)
             EMIT(i, i + 1, i + 2);
         break;
-    case 0x98:
-        for (u32 i = 0; i + 2 < count; i++)
-            EMIT(i, i + 1, i + 2);
+    case 0x98:   /* strip: every other triangle is reversed to keep one winding */
+        for (u32 i = 0; i + 2 < count; i++) {
+            if (i & 1u)
+                EMIT(i + 1, i, i + 2);
+            else
+                EMIT(i, i + 1, i + 2);
+        }
         break;
     case 0xA0:
         for (u32 i = 1; i + 1 < count; i++)
@@ -1259,7 +1870,153 @@ void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) 
         break;
     }
 #undef EMIT
-    free(sv);
+}
+
+/* Room for count more decoded vertices (deferred mode); ~0 if out of memory. */
+static u32 list_raw(CmdList* l, u32 count) {
+    if (l->nraw + count > l->cap_raw) {
+        u32 cap = l->cap_raw ? l->cap_raw : 16384;
+        while (cap < l->nraw + count) cap *= 2;
+        Vtx* v = (Vtx*)realloc(l->raw, sizeof(Vtx) * cap);
+        if (!v)
+            return ~0u;
+        l->raw = v;
+        l->cap_raw = cap;
+    }
+    u32 base = l->nraw;
+    l->nraw += count;
+    return base;
+}
+
+/* Deferred mode: transform unit writes go into the list in stream order. */
+void gx_raster_xf_write(u32 addr, const u32* values, u32 n) {
+    if (!g_defer || !gx_raster_active() || !n)
+        return;
+    CmdList* l = &g_lists[g_rec];
+    if (l->nxf + n > l->cap_xf) {
+        u32 cap = l->cap_xf ? l->cap_xf : 65536;
+        while (cap < l->nxf + n) cap *= 2;
+        u32* d = (u32*)realloc(l->xfdata, sizeof(u32) * cap);
+        if (!d)
+            return;
+        l->xfdata = d;
+        l->cap_xf = cap;
+    }
+    memcpy(l->xfdata + l->nxf, values, sizeof(u32) * n);
+    /* one command for a run of consecutive writes */
+    Cmd* last = l->n ? &l->cmds[l->n - 1] : NULL;
+    if (last && last->type == CMD_XF && last->u.xf.addr + last->u.xf.n == addr &&
+        last->u.xf.off + last->u.xf.n == l->nxf) {
+        last->u.xf.n += n;
+    } else {
+        Cmd* c = list_push(l);
+        if (!c)
+            return;
+        c->type = CMD_XF;
+        c->u.xf.addr = addr;
+        c->u.xf.n = n;
+        c->u.xf.off = l->nxf;
+    }
+    l->nxf += n;
+}
+
+/* GPU thread: turns a deferred list into one of triangles, replaying the
+   transform unit writes into its own copy of the registers and transforming,
+   lighting and clipping each draw with them. */
+static CmdList g_expanded;
+
+static const CmdList* expand_list(const CmdList* l) {
+    CmdList* e = &g_expanded;
+    take_free_camera();
+    e->n = 0;
+    e->nv = 0;
+    e->states = l->states;
+    e->ns = l->ns;
+    for (u32 i = 0; i < l->n; i++) {
+        const Cmd* c = &l->cmds[i];
+        if (c->type == CMD_XF) {
+            const u32* v = l->xfdata + c->u.xf.off;
+            for (u32 k = 0, a = c->u.xf.addr; k < c->u.xf.n; k++, a++) {
+                if (a < 0x800u) g_xf_mem_local[a] = v[k];
+                else if (a >= 0x1000u && a < 0x1100u) g_xf_reg_local[a - 0x1000u] = v[k];
+            }
+        } else if (c->type == CMD_DRAW) {
+            u32 count = c->u.draw.count;
+            u32 base = list_verts(e, count);
+            if (base == ~0u)
+                continue;
+            draw_setup();
+            const Vtx* raw = l->raw + c->u.draw.first;
+            for (u32 k = 0; k < count; k++)
+                transform(&raw[k], &e->verts[base + k]);
+            emit_prim(e, c->state, (u8)c->u.draw.prim, base, count);
+        } else {
+            Cmd* d = list_push(e);
+            if (d) *d = *c;
+        }
+    }
+    return e;
+}
+
+static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) {
+    if (count)
+        note_projection();
+    if (!gx_raster_active() || count == 0)
+        return;
+    if ((gx_bp[0x00] >> 14 & 3u) == 3u)
+        return;                        /* cull everything */
+    g_cpu = cpu;
+    if (g_u8f[255] == 0.0f)
+        for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;
+    CmdList* l = &g_lists[g_rec];
+    u32 state = list_state(l);
+
+    if (g_defer) {                     /* decode now (RAM may change), transform on the GPU thread */
+        u32 first = list_raw(l, count);
+        if (first == ~0u)
+            return;
+        VtxFormat fmt;
+        vtx_format(vat, &fmt);
+        const u8* p = data;
+        for (u32 i = 0; i < count; i++)
+            p += decode_vertex(cpu, &fmt, p, &l->raw[first + i]);
+        Cmd* c = list_push(l);
+        if (!c)
+            return;
+        c->type = CMD_DRAW;
+        c->state = state;
+        c->u.draw.prim = prim;
+        c->u.draw.count = count;
+        c->u.draw.first = first;
+        return;
+    }
+
+    take_free_camera();
+    /* Transform straight into the list's vertex pool; triangles refer to
+       vertices by index, so strips and fans don't copy each vertex 3 times. */
+    u32 base = list_verts(l, count);
+    if (base == ~0u)
+        return;
+    SVtx* sv = &l->verts[base];
+    const u8* p = data;
+    VtxFormat fmt;
+    vtx_format(vat, &fmt);
+    draw_setup();
+    for (u32 i = 0; i < count; i++) {
+        Vtx v;
+        p += decode_vertex(cpu, &fmt, p, &v);
+        transform(&v, &sv[i]);
+    }
+    if (g_dlog_at >= 0.0 && g_dlog_frames > 0 && interrupts_game_seconds() >= g_dlog_at)
+        dlog_draw(prim, count, &sv[0]);
+
+    emit_prim(l, state, prim, base, count);
+}
+
+void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) {
+    int prev = prof_enter(PROF_GX_VERTEX);
+    raster_draw(cpu, prim, vat, count, data);
+    prof_leave(prev);
 }
 
 /* ------------------------------------------------------- copy & dump --- */
@@ -1298,6 +2055,64 @@ static void write_bmp(const char* path, u32 sx, u32 sy, u32 w, u32 h) {
    does, so the copy never runs past the buffer the game allocated. */
 static u32 g_xfb_copy_log;
 
+/* TV frame buffers filled by frame-buffer copies: how many lines each copy
+   wrote. The picture shown can be taller than what the game copied (the
+   video interface shows 480 lines, the game copies fewer); the rest of that
+   memory holds leftovers, which showed as a strip of noise along the bottom.
+   Those lines are shown black instead. A record lapses when the buffer is
+   written another way (movies write frames straight into it) or when no
+   copy has gone there for a few frames. */
+typedef struct { u32 dest, stride, lines, frame; u32 sum; bool valid; } XfbCopy;
+static XfbCopy g_xfb_copies[4];
+/* Until the game copies its first picture to the screen, the picture memory
+   holds whatever was there at boot (zeros and leftovers that show as green
+   and lines of noise), so the screen stays black until then. */
+static bool g_xfb_first_copy;
+
+/* A quick fingerprint of a TV buffer in RAM (a few hundred words spread over
+   it). When the GPU keeps the copies and RAM isn't written, a change means
+   the game wrote the buffer itself (a movie frame). */
+static u32 xfb_sample_sum(u32 dest, u32 stride, u32 lines) {
+    if (!g_cpu || !stride || !lines || dest >= g_cpu->ram_size || (u64)stride * lines > g_cpu->ram_size - dest)
+        return 0;
+    u32 bytes = stride * lines, h = 2166136261u;
+    for (u32 i = 0; i < 512; i++) {
+        u32 off = (u32)((u64)bytes * i / 512u) & ~3u;
+        u32 v;
+        memcpy(&v, g_cpu->ram + dest + off, 4);
+        h = (h ^ v) * 16777619u;
+    }
+    return h;
+}
+
+static void note_xfb_copy(u32 dest, u32 stride, u32 lines) {
+    g_xfb_first_copy = true;
+    XfbCopy* slot = &g_xfb_copies[0];
+    for (int i = 0; i < 4; i++) {
+        if (g_xfb_copies[i].valid && g_xfb_copies[i].dest == dest) { slot = &g_xfb_copies[i]; break; }
+        if (!g_xfb_copies[i].valid || g_xfb_copies[i].frame < slot->frame) slot = &g_xfb_copies[i];
+    }
+    slot->dest = dest; slot->stride = stride; slot->lines = lines; slot->frame = g_frames; slot->valid = true;
+    slot->sum = xfb_sample_sum(dest, stride, lines);
+}
+
+void gx_raster_note_ram_write(u32 addr) {
+    for (int i = 0; i < 4; i++) {
+        XfbCopy* c = &g_xfb_copies[i];
+        if (c->valid && addr >= c->dest && addr < c->dest + c->stride * 576u)
+            c->valid = false;
+    }
+}
+
+static u32 xfb_copied_lines(u32 addr) {
+    for (int i = 0; i < 4; i++) {
+        const XfbCopy* c = &g_xfb_copies[i];
+        if (c->valid && c->dest == addr && g_frames - c->frame <= 4u)
+            return c->lines;
+    }
+    return ~0u;
+}
+
 static void setup_xfb_copy(CPUState* cpu, CopyCmd* cp) {
     u32 dest = (gx_bp[0x4B] & 0x00FFFFFFu) << 5;
     u32 stride = (gx_bp[0x4D] & 0x3FFu) << 5;
@@ -1306,7 +2121,8 @@ static void setup_xfb_copy(CPUState* cpu, CopyCmd* cp) {
     double yscale = 1.0;
     if (yscale_reg)
         yscale = invert ? 256.0 / yscale_reg : yscale_reg / 256.0;
-    u32 lines = (u32)(cp->h * yscale + 0.5);
+    /* The GPU writes 1 + (height - 1) * scale lines (as Dolphin computes it). */
+    u32 lines = 1u + (u32)((double)(cp->h - 1u) * yscale);
     if (lines > 1024)
         lines = 1024;
     u32 w = cp->w;
@@ -1323,7 +2139,173 @@ static void setup_xfb_copy(CPUState* cpu, CopyCmd* cp) {
     cp->dest = dest;
     cp->stride = stride;
     cp->lines = lines;
+    if (lines)
+        note_xfb_copy(dest, stride, lines);
     cp->yscale = (float)yscale;
+}
+
+/* ------------------------------------------------- EFB to texture copy --- */
+/* GXCopyTex: the game copies a rectangle of the frame buffer into RAM in a
+   texture format and then draws with it (screen transitions such as the
+   crossfade and the curtain wipe, and other render-to-texture effects).
+   The frame so far is drawn first, then the pixels are converted and
+   written out in the GPU's tiled texture layout. */
+static unsigned long long g_tex_copies;
+
+static void efb_texel(u32 x, u32 y, bool half, bool depth, bool keep_alpha, u8 rgba[4]) {
+    u32 r = 0, g = 0, b = 0, a = 0, n = half ? 2u : 1u;
+    for (u32 dy = 0; dy < n; dy++)
+        for (u32 dx = 0; dx < n; dx++) {
+            u32 px = x + dx < EFB_W ? x + dx : EFB_W - 1, py = y + dy < EFB_H ? y + dy : EFB_H - 1;
+            if (depth) {
+                u32 z = g_depth[py * EFB_W + px] & 0xFFFFFFu;
+                r += z >> 16; g += (z >> 8) & 255u; b += z & 255u; a += 255u;
+            } else {
+                u32 c = g_color[py * EFB_W + px];
+                r += (c >> 16) & 255u; g += (c >> 8) & 255u; b += c & 255u;
+                a += keep_alpha ? c >> 24 : 255u;
+            }
+        }
+    u32 d = n * n;
+    rgba[0] = (u8)(r / d); rgba[1] = (u8)(g / d); rgba[2] = (u8)(b / d); rgba[3] = (u8)(a / d);
+}
+
+/* Returns false if nothing was written. *info: what was copied (for the GPU's
+   own copy of it); bytes: how much RAM it covers. */
+static bool efb_copy_to_texture(u32 cmd, TexCopy* info, u32* dest_out, u32* bytes_out) {
+    CPUState* cpu = g_cpu;
+    if (!cpu)
+        return false;
+    u32 sx = gx_bp[0x49] & 0x3FFu, sy = (gx_bp[0x49] >> 10) & 0x3FFu;
+    u32 w = (gx_bp[0x4A] & 0x3FFu) + 1, h = ((gx_bp[0x4A] >> 10) & 0x3FFu) + 1;
+    u32 dest = (gx_bp[0x4B] & 0x00FFFFFFu) << 5;
+    u32 stride = (gx_bp[0x4D] & 0x3FFu) << 5;        /* bytes from one row of tiles to the next */
+    bool half = (cmd >> 9) & 1u;
+    bool intensity = (cmd >> 15) & 1u;
+    u32 tpf = (cmd >> 3) & 15u;
+    u32 fmt = (tpf >> 1) | ((tpf & 1u) << 3);         /* the copy's texture format */
+    u32 pixfmt = gx_bp[0x43] & 7u;
+    bool depth = pixfmt == 3u;                        /* Z24 frame buffer: depth copy */
+    bool keep_alpha = pixfmt == 1u;                   /* only RGBA6 keeps alpha */
+    u32 src_w = w, src_h = h;
+    if (half) { w = (w + 1) / 2; h = (h + 1) / 2; }
+
+    /* Tile shape and bytes per texel for each format. */
+    u32 tw, th, bits;
+    switch (fmt) {
+    case 0x0: tw = 8; th = 8; bits = 4; break;                    /* R4 / I4 */
+    case 0x1: case 0x8: case 0x7: case 0x9: case 0xA:
+    case 0x2: tw = 8; th = 4; bits = 8; break;                    /* R8, A8, G8, B8, RA4 */
+    case 0x3: case 0x4: case 0x5: case 0xB: case 0xC:
+              tw = 4; th = 4; bits = 16; break;                   /* RA8, RGB565, RGB5A3, RG8, GB8 */
+    case 0x6: tw = 4; th = 4; bits = 32; break;                   /* RGBA8 */
+    default: return false;
+    }
+    u32 tiles_x = (w + tw - 1) / tw, tiles_y = (h + th - 1) / th;
+    u32 tile_bytes = tw * th * bits / 8;
+    if (fmt == 0x6) tile_bytes = 64;
+    if (!stride) stride = tiles_x * tile_bytes;
+    if (dest >= cpu->ram_size || (u64)tiles_y * stride > cpu->ram_size - dest)
+        return false;
+
+    for (u32 ty = 0; ty < tiles_y; ty++)
+        for (u32 tx = 0; tx < tiles_x; tx++) {
+            u8* out = cpu->ram + dest + ty * stride + tx * tile_bytes;
+            for (u32 iy = 0; iy < th; iy++)
+                for (u32 ix = 0; ix < tw; ix++) {
+                    u32 x = tx * tw + ix, y = ty * th + iy;
+                    u8 c[4] = {0, 0, 0, 0};
+                    if (x < w && y < h)
+                        efb_texel(sx + (half ? x * 2 : x), sy + (half ? y * 2 : y), half, depth, keep_alpha, c);
+                    u8 lum = intensity ? (u8)((66 * c[0] + 129 * c[1] + 25 * c[2] + 128) / 256 + 16)
+                                       : c[0];
+                    u32 i = iy * tw + ix;
+                    switch (fmt) {
+                    case 0x0: {                                   /* 4 bits: high nibble first */
+                        u8 v = lum >> 4;
+                        if (i & 1u) out[i / 2] = (u8)((out[i / 2] & 0xF0u) | v);
+                        else out[i / 2] = (u8)(v << 4);
+                        break;
+                    }
+                    case 0x1: case 0x8: out[i] = lum; break;      /* R8 / I8 */
+                    case 0x7: out[i] = c[3]; break;               /* A8 */
+                    case 0x9: out[i] = c[1]; break;               /* G8 */
+                    case 0xA: out[i] = c[2]; break;               /* B8 */
+                    case 0x2: out[i] = (u8)((c[3] & 0xF0u) | (lum >> 4)); break;   /* RA4: alpha high */
+                    case 0x3: out[i * 2] = c[3]; out[i * 2 + 1] = lum; break;      /* RA8 */
+                    case 0xB: out[i * 2] = c[0]; out[i * 2 + 1] = c[1]; break;     /* RG8 */
+                    case 0xC: out[i * 2] = c[1]; out[i * 2 + 1] = c[2]; break;     /* GB8 */
+                    case 0x4: {                                   /* RGB565 */
+                        u32 v = ((u32)(c[0] >> 3) << 11) | ((u32)(c[1] >> 2) << 5) | (c[2] >> 3);
+                        out[i * 2] = (u8)(v >> 8); out[i * 2 + 1] = (u8)v;
+                        break;
+                    }
+                    case 0x5: {                                   /* RGB5A3 */
+                        u32 v;
+                        if (c[3] >= 0xE0u)
+                            v = 0x8000u | ((u32)(c[0] >> 3) << 10) | ((u32)(c[1] >> 3) << 5) | (c[2] >> 3);
+                        else
+                            v = ((u32)(c[3] >> 5) << 12) | ((u32)(c[0] >> 4) << 8) | ((u32)(c[1] >> 4) << 4) | (c[2] >> 4);
+                        out[i * 2] = (u8)(v >> 8); out[i * 2 + 1] = (u8)v;
+                        break;
+                    }
+                    case 0x6:                                     /* RGBA8: AR half, then GB half */
+                        out[i * 2] = c[3]; out[i * 2 + 1] = c[0];
+                        out[32 + i * 2] = c[1]; out[32 + i * 2 + 1] = c[2];
+                        break;
+                    }
+                }
+        }
+    gx_tex_invalidate(dest, tiles_y * stride);
+    g_tex_copies++;
+    if (info) {
+        info->sx = sx; info->sy = sy; info->src_w = src_w; info->src_h = src_h;
+        info->w = w; info->h = h; info->fmt = fmt;
+        info->intensity = intensity; info->keep_alpha = keep_alpha;
+        info->id = depth ? 0u : 1u;    /* depth copies stay in RAM only */
+    }
+    *dest_out = dest;
+    *bytes_out = tiles_y * stride;
+    return true;
+}
+
+/* GPU mode: frame-buffer copies into textures are also made on the GPU, at
+   its resolution, and drawn with in place of the (native-size) RAM copy for
+   as long as that RAM is unchanged (a fingerprint, as for TV buffers). */
+#define TEX_COPY_RECORDS 16
+typedef struct { u32 id, dest, bytes, w, h, sum; bool valid; } TexCopyRec;
+static TexCopyRec g_tex_copy_recs[TEX_COPY_RECORDS];
+static u32 g_tex_copy_next_id = 1;
+
+static u32 ram_sample_sum(u32 addr, u32 bytes) {
+    if (!g_cpu || !bytes || addr >= g_cpu->ram_size || bytes > g_cpu->ram_size - addr)
+        return 0;
+    u32 h = 2166136261u, n = bytes / 4u < 256u ? bytes / 4u : 256u;
+    for (u32 i = 0; i < n; i++) {
+        u32 off = (u32)((u64)bytes * i / n) & ~3u, v;
+        memcpy(&v, g_cpu->ram + addr + off, 4);
+        h = (h ^ v) * 16777619u;
+    }
+    return h;
+}
+
+/* The GPU copy to use for a texture map, or 0. */
+static u32 gpu_tex_copy_for(u32 map) {
+    u32 bank = map < 4 ? 0u : 0x20u, i = map & 3u;
+    u32 image0 = gx_bp[0x88 + bank + i], image3 = gx_bp[0x94 + bank + i];
+    u32 addr = (image3 << 5) & 0x01FFFFE0u;
+    u32 w = (image0 & 0x3FFu) + 1, h = ((image0 >> 10) & 0x3FFu) + 1;
+    for (int k = 0; k < TEX_COPY_RECORDS; k++) {
+        TexCopyRec* r = &g_tex_copy_recs[k];
+        if (!r->valid || r->dest != addr || r->w != w || r->h != h)
+            continue;
+        if (ram_sample_sum(r->dest, r->bytes) != r->sum) {
+            r->valid = false;          /* the game wrote something else there since */
+            continue;
+        }
+        return r->id;
+    }
+    return 0;
 }
 
 void gx_raster_copy(u32 cmd) {
@@ -1337,6 +2319,34 @@ void gx_raster_copy(u32 cmd) {
                 (gx_bp[0x49] >> 10) & 0x3FFu, (gx_bp[0x4A] & 0x3FFu) + 1, ((gx_bp[0x4A] >> 10) & 0x3FFu) + 1,
                 (gx_bp[0x4B] & 0x00FFFFFFu) << 5, (gx_bp[0x4D] & 0x3FFu) << 5, gx_bp[0x4E] & 0x1FFu, gx_bp[0x4F],
                 gx_bp[0x50] & 0xFFFFu, gx_bp[0x51] & 0xFFFFFFu);
+
+    if (active && !to_xfb) {
+        /* Copy to a texture: draw everything recorded so far, then convert
+           (before any clear this copy asks for, which is recorded below). */
+        submit();
+        wait_idle();
+        bool depth_copy = (gx_bp[0x43] & 7u) == 3u;
+        efb_to_memory(depth_copy);
+        TexCopy info;
+        u32 dest = 0, bytes = 0;
+        if (efb_copy_to_texture(cmd, &info, &dest, &bytes) && g_gpu && info.id) {
+            /* forget older copies at the same place, then keep this one on the GPU too */
+            TexCopyRec* slot = &g_tex_copy_recs[0];
+            for (int k = 0; k < TEX_COPY_RECORDS; k++) {
+                TexCopyRec* r = &g_tex_copy_recs[k];
+                if (r->valid && r->dest < dest + bytes && dest < r->dest + r->bytes) r->valid = false;
+            }
+            for (int k = 0; k < TEX_COPY_RECORDS; k++)
+                if (!g_tex_copy_recs[k].valid) { slot = &g_tex_copy_recs[k]; break; }
+            if (slot->valid)           /* all in use: replace the oldest */
+                for (int k = 0; k < TEX_COPY_RECORDS; k++)
+                    if (g_tex_copy_recs[k].id < slot->id) slot = &g_tex_copy_recs[k];
+            info.id = g_tex_copy_next_id++;
+            slot->id = info.id; slot->dest = dest; slot->bytes = bytes;
+            slot->w = info.w; slot->h = info.h; slot->sum = ram_sample_sum(dest, bytes); slot->valid = true;
+            gpu_tex_copy(&info);
+        }
+    }
 
     if (active && (to_xfb || clear)) {
         Cmd* c = list_push(&g_lists[g_rec]);
@@ -1375,6 +2385,7 @@ void gx_raster_copy(u32 cmd) {
                     last = l->cmds[--l->n];
                 submit();
                 wait_idle();
+                efb_to_memory(false);
                 char path[600];
                 snprintf(path, sizeof(path), "%s/frame_%06u.bmp", g_dir, g_frames + 1);
                 write_bmp(path, sx, sy, w, h);
@@ -1388,6 +2399,8 @@ void gx_raster_copy(u32 cmd) {
             submit();
         }
         dlog_frame_end();
+        vote_widescreen();
+        gx_state_serial++;          /* textures are re-checked each frame: take a fresh snapshot */
         g_frames++;
         gx_tex_flush_cache();   /* texture data in RAM may change between frames: re-check */
     }
@@ -1442,19 +2455,87 @@ bool gx_raster_xfb_rgb(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, u32* o
         return false;
     if (width > max_w) width = max_w;
     if (height > max_h) height = max_h;
+    u32 copied = xfb_copied_lines(addr);
+    {
+        /* Log the shown picture's layout whenever it changes (for display bugs). */
+        static u32 last_w, last_h, last_st, last_copied, logged;
+        if ((width != last_w || height != last_h || stride != last_st || copied != last_copied) && logged < 20) {
+            printf("  tv picture: %ux%u from 0x%08X, stride %u, game copied %d lines (VI 0x%08X 0x%04X 0x%04X)\n",
+                   width, height, addr, stride, copied == ~0u ? -1 : (int)copied, tfbl, picture_cfg, vtr);
+            last_w = width; last_h = height; last_st = stride; last_copied = copied;
+            logged++;
+        }
+    }
     for (u32 y = 0; y < height; y++) {
         const u8* src = cpu->ram + addr + y * stride;
         u32* d = out + y * width;
+        if (y >= copied || !g_xfb_first_copy) { /* below what the game copied: black, not leftovers */
+            for (u32 x = 0; x < width; x++) d[x] = 0xFF000000u;
+            continue;
+        }
         for (u32 x = 0; x + 1 < width; x += 2) {
-            int y0 = src[x * 2], u = src[x * 2 + 1] - 128, y1 = src[x * 2 + 2], v = src[x * 2 + 3] - 128;
-            int r = (int)(1.371f * v), g = (int)(-0.698f * v - 0.336f * u), b = (int)(1.732f * u);
-            d[x] = 0xFF000000u | ((u32)clamp8(y0 + r) << 16) | ((u32)clamp8(y0 + g) << 8) | clamp8(y0 + b);
-            d[x + 1] = 0xFF000000u | ((u32)clamp8(y1 + r) << 16) | ((u32)clamp8(y1 + g) << 8) | clamp8(y1 + b);
+            /* Untouched (zeroed) memory, which is what the screen shows
+               before the game draws its first picture, decodes as bright
+               green. The frame-buffer copy never writes all-zero pixels
+               (black is Y 16, U and V 128), so show these as black. */
+            if (!(src[x * 2] | src[x * 2 + 1] | src[x * 2 + 2] | src[x * 2 + 3])) {
+                d[x] = d[x + 1] = 0xFF000000u;
+                continue;
+            }
+            /* Video-range YUV (black at Y 16, white at 235, as the frame-buffer
+               copy writes it and TVs expect), expanded to full-range RGB
+               (BT.601). Treating Y as full range made everything look
+               grey and washed out. */
+            int y0 = (src[x * 2] - 16) * 298, u = src[x * 2 + 1] - 128;
+            int y1 = (src[x * 2 + 2] - 16) * 298, v = src[x * 2 + 3] - 128;
+            int r = 409 * v + 128, g = -100 * u - 208 * v + 128, b = 516 * u + 128;
+            d[x] = 0xFF000000u | ((u32)clamp8((y0 + r) >> 8) << 16) | ((u32)clamp8((y0 + g) >> 8) << 8) |
+                   clamp8((y0 + b) >> 8);
+            d[x + 1] = 0xFF000000u | ((u32)clamp8((y1 + r) >> 8) << 16) | ((u32)clamp8((y1 + g) >> 8) << 8) |
+                       clamp8((y1 + b) >> 8);
         }
     }
     *out_w = width;
     *out_h = height;
     return true;
+}
+
+/* Shows the picture the TV shows, from the GPU (the frame copied there at
+   the internal resolution) or, when the game wrote the TV buffer itself or
+   nothing has been copied, from RAM. Window thread, GPU mode only. */
+static u32 g_present_pixels[720 * 576];
+static bool g_present_from_gpu;
+
+void gx_raster_present_gpu(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, int win_w, int win_h, float aspect,
+                           const char* shot_path) {
+    wait_idle();
+    GlrPicture pic;
+    memset(&pic, 0, sizeof(pic));
+    u32 addr, w, h, st;
+    if (g_xfb_first_copy && xfb_geometry(cpu, tfbl, picture_cfg, vtr, &addr, &w, &h, &st)) {
+        XfbCopy* rec = NULL;
+        for (int i = 0; i < 4; i++)
+            if (g_xfb_copies[i].valid && g_xfb_copies[i].dest == addr) rec = &g_xfb_copies[i];
+        if (rec && g_present_from_gpu && xfb_sample_sum(rec->dest, rec->stride, rec->lines) != rec->sum)
+            rec->valid = false;        /* written since by the game itself */
+        if (rec && rec->valid && glr_xfb_on_gpu(addr)) {
+            pic.kind = GLR_PIC_GPU;
+            pic.dest = addr;
+            pic.tv_w = w;
+            pic.tv_h = h;
+        } else if (gx_raster_xfb_rgb(cpu, tfbl, picture_cfg, vtr, g_present_pixels, 720, 576, &pic.w, &pic.h)) {
+            pic.kind = GLR_PIC_PIXELS;
+            pic.pixels = g_present_pixels;
+        }
+    }
+    glr_present(&pic, 0, win_w, win_h, aspect, shot_path);
+}
+
+/* The window shows frames straight from the GPU, so TV-buffer copies needn't
+   be read back and written to RAM. */
+void gx_raster_present_from_gpu(bool on) {
+    g_present_from_gpu = on;
+    glr_keep_ram_copies(!on || g_xfb_every);
 }
 
 void gx_raster_render_all(void) {
@@ -1511,7 +2592,11 @@ u32 gx_raster_frames(void) {
 void gx_raster_report(void) {
     wait_idle();
     gx_tex_report();
+    glr_report();
     unsigned long long drawn = g_tris_recorded;
     printf("renderer: %u frames shown, %u dumped to %s, %llu triangles drawn, %llu clipped, %d drawing threads\n",
            g_frames, g_dumped, g_every ? g_dir : "(off)", drawn, g_tris_skipped, g_workers);
+    printf("screen shape: %s (last 3D projection made for %.2f:1)\n",
+           g_widescreen == 1 ? "16:9 widescreen" : g_widescreen == 0 ? "4:3" : "not known (no 3D drawn)",
+           g_last_aspect);
 }

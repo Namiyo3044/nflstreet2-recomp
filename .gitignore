@@ -24,3 +24,13 @@
 /play.txt
 /play.txt
 /play.txt
+/drawlog*.txt
+/shot_*.bmp
+/tex_*.bmp
+/tex_*.bmp
+/tex_*.bmp
+
+nfls2-screen.txt
+text-replacements.txt
+drawlog.txt
+*.zip

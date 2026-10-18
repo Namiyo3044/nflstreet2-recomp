@@ -8,7 +8,13 @@ typedef struct {
     uint64_t offset;
     uint64_t length;
     char* path;      /* host file holding these bytes */
+    unsigned long long reads, bytes;   /* how much the game read from it */
+    double first, last;                /* game time of the first and last read */
+    unsigned order;                    /* 1 = first file read, 2 = second, ... */
 } Range;
+
+static double (*g_clock)(void);
+static unsigned g_order;
 
 static Range* g_ranges;
 static size_t g_count, g_cap;
@@ -49,6 +55,7 @@ static void add_range(uint64_t offset, uint64_t length, char* path) {
         g_cap = g_cap ? g_cap * 2 : 1024;
         g_ranges = (Range*)realloc(g_ranges, g_cap * sizeof(Range));
     }
+    memset(&g_ranges[g_count], 0, sizeof(Range));
     g_ranges[g_count].offset = offset;
     g_ranges[g_count].length = length;
     g_ranges[g_count].path = path;
@@ -204,6 +211,11 @@ bool disc_read(uint64_t offset, void* dst, size_t len) {
         uint64_t b = end < r->offset + r->length ? end : r->offset + r->length;
         if (a >= b)
             continue;
+        Range* rw = &g_ranges[i];
+        double now = g_clock ? g_clock() : 0.0;
+        if (!rw->reads++) { rw->first = now; rw->order = ++g_order; }
+        rw->last = now;
+        rw->bytes += b - a;
         FILE* f = open_cached(r->path);
         if (!f || fseek(f, (long)(a - r->offset), SEEK_SET) != 0 ||
             fread(out + (a - offset), 1, (size_t)(b - a), f) != (size_t)(b - a)) {
@@ -221,6 +233,43 @@ const uint8_t* disc_fst(size_t* size) {
     return g_fst;
 }
 
+void disc_set_clock(double (*clock)(void)) {
+    g_clock = clock;
+}
+
 void disc_report(void) {
     printf("disc: %llu reads, %llu bytes, %llu failed\n", g_reads, g_bytes, g_misses);
+}
+
+void disc_report_files(void) {
+    printf("\nfiles read (in order of first read): reads, KB, first and last read in game seconds\n");
+    for (unsigned n = 1; n <= g_order; n++) {
+        for (size_t i = 0; i < g_count; i++) {
+            const Range* r = &g_ranges[i];
+            if (r->order != n)
+                continue;
+            const char* name = r->path;
+            const char* f = strstr(name, "files");
+            if (f) name = f + 6;
+            printf("  %-40s %6llu %8llu  %7.2f %7.2f\n", name, r->reads, r->bytes / 1024, r->first, r->last);
+        }
+    }
+}
+
+const char* disc_file_at(uint64_t offset, uint64_t* file_offset) {
+    size_t lo = 0, hi = g_count;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (g_ranges[mid].offset <= offset) lo = mid + 1;
+        else hi = mid;
+    }
+    if (!lo)
+        return NULL;
+    const Range* r = &g_ranges[lo - 1];
+    if (offset >= r->offset + r->length)
+        return NULL;
+    if (file_offset) *file_offset = offset - r->offset;
+    const char* name = r->path;
+    const char* f = strstr(name, "files");
+    return f ? f + 6 : name;
 }

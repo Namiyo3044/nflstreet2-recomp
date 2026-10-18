@@ -16,6 +16,11 @@
 #include "audio/ax_hle.h"
 #include "runtime/mmio.h"
 #include "runtime/symbols.h"
+#include "runtime/prof.h"
+#include "runtime/interp.h"
+#include "runtime/textscan.h"
+#include "runtime/textpatch.h"
+#include "runtime/exi.h"
 #ifdef NFLS2_HAVE_WINDOW
 #include "platform/window.h"
 #endif
@@ -31,6 +36,9 @@ static u32 g_trace[TRACE_LEN];
 static u32 g_trace_pos;
 static bool g_have_symbols;
 static bool g_verbose_entries = true;
+/* --debug: the diagnostics that cost time while playing (per-call counts,
+   sound engine checks, file and stream logs, the end-of-run profile). */
+static bool g_debug;
 
 /* Bitmap of functions already announced, indexed by (start - 0x80000000) / 4. */
 static u8* g_seen;
@@ -42,6 +50,72 @@ static u32* g_profile;
 static bool g_profiling;
 static unsigned long long g_profiled;
 
+/* Calls counted for the whole run, indexed like the profile by
+   (address - 0x80000000) / 4; only function entry points are reported. */
+static u32* g_calls;
+
+/* Idle skipping (see the main loop): how often and how much time was skipped. */
+static unsigned long long g_idle_skips, g_idle_ticks;
+
+/* File-open calls (path in r3) logged with the game time. */
+static u32 g_dvd_open, g_dvd_path;
+static u32 g_open_lines;
+static bool g_skip_intros;             /* --skip-thx: fast-forward through the THX intro movie */
+static u32 g_movie_opens;
+
+/* Audio stream timeline: the engine's stream calls, logged with the game time. */
+static u32 g_refills_this_second;
+static u32 g_stream_lines;
+static void print_streams_brief(CPUState* cpu, double now);
+
+/* Sound-engine callback list at 0x803A6BCC (head word; nodes: +0 next,
+   +8 function, +12 argument), run by 0x80269C70. A pass crashes the game
+   when that list holds a node whose function pointer is garbage. Log the
+   list whenever it changes, flag bad nodes, and log frees (0x8026B7D8) of
+   memory holding a node that is still listed. */
+#define CBL_MAX 32
+static u32 g_cbl_nodes[CBL_MAX], g_cbl_funcs[CBL_MAX], g_cbl_n;
+static u32 g_cbl_lines;
+
+static void cbl_check(CPUState* ctx, const char* why) {
+    u32 nodes[CBL_MAX], funcs[CBL_MAX], args[CBL_MAX], n = 0;
+    u32 p = mem_read32(ctx, 0x803A6BCCu);
+    while (p && n < CBL_MAX) {
+        if (p < 0x80000000u || p >= 0x81800000u) { nodes[n] = p; funcs[n] = 0; args[n] = 0; n++; break; }
+        nodes[n] = p;
+        funcs[n] = mem_read32(ctx, p + 8);
+        args[n] = mem_read32(ctx, p + 12);
+        n++;
+        p = mem_read32(ctx, p);
+    }
+    bool changed = n != g_cbl_n;
+    for (u32 i = 0; i < n && !changed; i++)
+        changed = nodes[i] != g_cbl_nodes[i] || funcs[i] != g_cbl_funcs[i];
+    if (changed && g_cbl_lines < 300) {
+        printf("  cblist: %7.2f s (%s) %u node%s:", interrupts_game_seconds(), why, n, n == 1 ? "" : "s");
+        for (u32 i = 0; i < n; i++) {
+            bool bad = funcs[i] < 0x80003100u || funcs[i] >= 0x80300000u;
+            printf(" [%08X fn %08X arg %08X%s]", nodes[i], funcs[i], args[i], bad ? " BAD" : "");
+        }
+        printf("\n");
+        g_cbl_lines++;
+    }
+    g_cbl_n = n;
+    memcpy(g_cbl_nodes, nodes, n * 4);
+    memcpy(g_cbl_funcs, funcs, n * 4);
+}
+
+static void cbl_free(CPUState* ctx) {
+    u32 p = ctx->gpr[3];
+    for (u32 i = 0; i < g_cbl_n; i++) {
+        if (p + 0x40u >= g_cbl_nodes[i] && p <= g_cbl_nodes[i] + 0x10u && g_cbl_lines < 300) {
+            printf("  cblist: %7.2f s  memory 0x%08X freed while node %08X (fn %08X) is still listed; called from "
+                   "0x%08X\n", interrupts_game_seconds(), p, g_cbl_nodes[i], g_cbl_funcs[i], ctx->lr);
+            g_cbl_lines++;
+        }
+    }
+}
+
 /* --trace-at: from this much game time, log calls that matter for frame
    pacing (video, OS timing and threads, GPU sync, the game's video module at
    0x801CE000-0x801CF000) across a few displayed frames. */
@@ -50,6 +124,10 @@ static bool g_tracing;
 static u32 g_trace_lines, g_trace_frames_start;
 #define TRACE_MAX_LINES 3000
 #define TRACE_FRAMES 4
+
+static bool guest_ptr_any(CPUState* cpu, u32 addr) {
+    return addr >= GC_RAM_BASE && addr - GC_RAM_BASE < cpu->ram_size;
+}
 
 static bool trace_wanted(u32 address, const char* name) {
     if (address >= 0x801CE000u && address < 0x801CF000u)
@@ -68,10 +146,130 @@ static bool trace_wanted(u32 address, const char* name) {
     return false;
 }
 
+static double wall_seconds(void);
+static double g_launch_wall;
+
 /* Every dispatched call passes through here. Later this is where HLE
    replacements go; for now it only records where execution has been. */
+/* After F8: for a few seconds, every function the game calls is checked for
+   a string argument holding on-screen text, to find which functions build
+   and draw the messages. */
+static double g_text_watch_until;
+static int g_text_watch_lines;
+static u32 g_text_seen[512][2];
+static int g_text_seen_n;
+
+static void text_watch(CPUState* ctx, u32 address) {
+    static const char* const k_needles[] = {"Device", "emory Card", "Slot A"};
+    for (int r = 3; r <= 8; r++) {
+        u32 p = ctx->gpr[r];
+        if (p < GC_RAM_BASE || p - GC_RAM_BASE >= ctx->ram_size - 256) continue;
+        const char* s = (const char*)ctx->ram + (p - GC_RAM_BASE);
+        size_t n = 0;
+        while (n < 240 && s[n] && ((u8)s[n] >= 0x20 || s[n] == '\n') && (u8)s[n] < 0x7F) n++;
+        if (n < 4 || s[n]) continue;
+        bool hit = false;
+        for (size_t k = 0; k < sizeof k_needles / sizeof *k_needles && !hit; k++) {
+            size_t ln = strlen(k_needles[k]);
+            for (size_t i = 0; i + ln <= n && !hit; i++)
+                if (!memcmp(s + i, k_needles[k], ln)) hit = true;
+        }
+        if (!hit) continue;
+        u32 key = address ^ ((u32)r << 28), key2 = p;
+        bool seen = false;
+        for (int i = 0; i < g_text_seen_n && !seen; i++)
+            if (g_text_seen[i][0] == key && g_text_seen[i][1] == key2) seen = true;
+        if (seen) continue;
+        if (g_text_seen_n < 512) { g_text_seen[g_text_seen_n][0] = key; g_text_seen[g_text_seen_n][1] = key2; g_text_seen_n++; }
+        if (g_text_watch_lines++ >= 150) return;
+        char text[256];
+        size_t t;
+        for (t = 0; t < n; t++) text[t] = s[t] == '\n' ? '|' : s[t];
+        text[t] = 0;
+        u32 off = 0, loff = 0;
+        const char* fname = g_have_symbols ? symbols_lookup(address, &off) : "?";
+        char fbuf[64];
+        snprintf(fbuf, sizeof fbuf, "%s", fname);
+        const char* lname = g_have_symbols ? symbols_lookup(ctx->lr, &loff) : "?";
+        printf("textcall: %s (0x%08X) r%d=0x%08X from %s+0x%X (0x%08X): \"%s\"\n", fbuf, address, r, p, lname, loff,
+               ctx->lr, text);
+    }
+}
+
 int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
     g_trace[g_trace_pos++ % TRACE_LEN] = address;
+    if (g_text_watch_until > 0) {
+        if (interrupts_game_seconds() < g_text_watch_until) text_watch(ctx, address);
+        else { g_text_watch_until = 0; printf("textcall: watch ended\n"); }
+    }
+    if (g_debug) {
+        u32 slot = (address - GC_RAM_BASE) >> 2;
+        if (g_calls && slot < (GC_MAIN_RAM_SIZE >> 2) && g_calls[slot] != 0xFFFFFFFFu)
+            g_calls[slot]++;
+    }
+    if (g_debug && address >= 0x80273040u && address <= 0x80274F5Cu && g_stream_lines < 400) {
+        const char* what = NULL;
+        switch (address) {
+        case 0x802743A0u: what = "stream create   (stream r3)"; break;
+        case 0x80274464u: what = "stream start    (stream r3, channel r4)"; break;
+        case 0x80274F5Cu: what = "channel stop    (channel r3)"; break;
+        case 0x8027474Cu: what = "stream free     (stream r3)"; break;
+        case 0x80273040u: g_refills_this_second++; break;
+        }
+        if (what) {
+            printf("  stream: %7.2f s  %s  r3 %d r4 %d\n", interrupts_game_seconds(), what, (int)ctx->gpr[3],
+                   (int)ctx->gpr[4]);
+            g_stream_lines++;
+        }
+    }
+    if (g_debug) {
+        if (address == 0x80269C70u)
+            cbl_check(ctx, "run");
+        else if (address == 0x8026B7D8u && g_cbl_n)
+            cbl_free(ctx);
+    }
+    if ((address == g_dvd_open || address == g_dvd_path) && address && g_open_lines < 300) {
+        char path[96];
+        u32 p = ctx->gpr[3];
+        u32 n = 0;
+        while (n + 1 < sizeof(path) && guest_ptr_any(ctx, p + n)) {
+            u8 c = mem_read8(ctx, p + n);
+            if (!c) break;
+            path[n++] = (char)c;
+        }
+        path[n] = 0;
+        if (g_debug)
+            printf("  file open at %7.2f s: %s\n", interrupts_game_seconds(), path);
+        g_open_lines++;
+        {
+            /* Loading-time markers: the NFL Street 2 intro starting (3rd
+               movie open) and the title screen's data (Streamed.db). */
+            static int movie_opens, title_seen;
+            bool movie = strstr(path, "MOVIEDAT") || strstr(path, "moviedat");
+            if (movie && address == g_dvd_open) movie_opens++;
+            if (address == g_dvd_open &&
+                ((movie && movie_opens == 3) || (!title_seen && (strstr(path, "Streamed") || strstr(path, "streamed"))))) {
+                if (!movie) title_seen = 1;
+                if (g_debug) printf("startup: %s at %.1f s after launch (game time %.1f s)\n",
+                       movie ? "NFL Street 2 intro starts" : "title screen data loaded", wall_seconds() - g_launch_wall,
+                       interrupts_game_seconds());
+            }
+        }
+#ifdef NFLS2_HAVE_WINDOW
+        /* Skipping the THX intro: the intro movies are opens of MOVIEDAT.DAT
+           in turn (EA SPORTS BIG, THX, NFL Street 2). Fast-forward, unseen
+           and unheard, from the second open to the third. */
+        if (address == g_dvd_open && (strstr(path, "MOVIEDAT") || strstr(path, "moviedat"))) {
+            g_movie_opens++;
+            if (g_skip_intros && g_movie_opens == 2) window_set_turbo(true);
+            if (g_movie_opens == 3) {
+                if (g_skip_intros) window_set_turbo(false);
+                g_skip_intros = false;
+                window_trust_screen_shape();   /* past the boot screens: the game's own setting applies now */
+            }
+        }
+#endif
+    }
 
     if (g_tracing && g_have_symbols && symbols_function_start(address) == address) {
         const char* name = symbols_lookup(address, NULL);
@@ -142,6 +340,18 @@ static void print_backtrace(CPUState* cpu, u32 sp, u32 lr, const char* indent) {
     }
 }
 
+/* True if some game thread is ready to run (an interrupt just woke it and
+   the OS is about to leave its idle loop and switch to it). */
+static bool any_thread_ready(CPUState* cpu) {
+    u32 t = mem_read32(cpu, 0x800000DC);
+    for (int n = 0; n < 64 && guest_ptr(cpu, t); n++) {
+        if ((mem_read32(cpu, t + 0x2C8) >> 16) == 1u)
+            return true;
+        t = mem_read32(cpu, t + 0x2FC);
+    }
+    return false;
+}
+
 /* Lists the game's threads from the OS's active-thread list (0x800000DC),
    with where each one is and what its call stack looks like. */
 static void print_threads(CPUState* cpu) {
@@ -186,9 +396,109 @@ static void print_profile(void) {
     }
 }
 
+/* Whole-run call counts for the game's audio engine (0x8026A000-0x8027C000)
+   and the SDK's disc, ARAM and audio libraries. */
+typedef struct { int printed; } CountCtx;
+
+static void count_one(uint32_t start, const char* name, void* user) {
+    CountCtx* c = (CountCtx*)user;
+    u32 slot = (start - GC_RAM_BASE) >> 2;
+    if (slot >= (GC_MAIN_RAM_SIZE >> 2) || !g_calls[slot])
+        return;
+    bool engine = start >= 0x8026A000u && start < 0x8027C000u;
+    static const char* const k_prefixes[] = {"DVD", "__DVD", "AR", "__AR", "AX", "__AX", "AI", "__AI", "DSP",
+                                             "__DSP", "OSCreateThread", "OSResumeThread", "OSSetThreadPriority"};
+    bool sdk = false;
+    for (size_t i = 0; i < sizeof(k_prefixes) / sizeof(k_prefixes[0]) && !sdk; i++)
+        sdk = strncmp(name, k_prefixes[i], strlen(k_prefixes[i])) == 0;
+    if (!engine && !sdk)
+        return;
+    printf("  0x%08X %-26.26s %9u%s", start, name, g_calls[slot], (++c->printed % 3) ? "  |" : "\n");
+}
+
+static void print_call_counts(void) {
+    if (!g_calls || !g_have_symbols)
+        return;
+    printf("\naudio and disc calls (whole run): address, name, calls\n");
+    CountCtx c = {0};
+    symbols_each(count_one, &c);
+    if (c.printed % 3)
+        printf("\n");
+}
+
+/* The audio engine's stream blocks (table of 32 pointers at 0x803AA170). */
+static void print_streams(CPUState* cpu) {
+    printf("\naudio engine streams (table 0x803AA170):\n");
+    int shown = 0;
+    for (int i = 0; i < 32; i++) {
+        u32 b = mem_read32(cpu, 0x803AA170u + i * 4);
+        if (!guest_ptr(cpu, b))
+            continue;
+        s8 channel = (s8)mem_read8(cpu, b + 0x2598);
+        printf("  stream %2d at 0x%08X: channel %d half %u countdown 0x%02X voices %u aram 0x%08X "
+               "data 0x%08X size %d pos %d\n",
+               i, b, channel, mem_read8(cpu, b + 0x2599), mem_read8(cpu, b + 0x259A), mem_read8(cpu, b + 0x259B),
+               mem_read32(cpu, b + 0x259C), mem_read32(cpu, b + 0x25C4), (int)mem_read32(cpu, b + 0x25DC),
+               (int)mem_read32(cpu, b + 0x25E0));
+        if (channel >= 0 && channel < 64) {
+            u32 vpb = mem_read32(cpu, 0x803A8D60u + channel * 64 + 0x3C);
+            if (guest_ptr(cpu, vpb))
+                printf("    voice 0x%08X: state %u  format 0x%X  loop %u  cur 0x%08X  loop 0x%08X  end 0x%08X  "
+                       "src %u ratio 0x%08X  vol 0x%04X  mixL 0x%04X mixR 0x%04X\n",
+                       vpb, mem_read16(cpu, vpb + 0x138 + 0x0E), mem_read16(cpu, vpb + 0x138 + 0x70),
+                       mem_read16(cpu, vpb + 0x138 + 0x6E),
+                       (mem_read16(cpu, vpb + 0x138 + 0x7A) << 16) | mem_read16(cpu, vpb + 0x138 + 0x7C),
+                       (mem_read16(cpu, vpb + 0x138 + 0x72) << 16) | mem_read16(cpu, vpb + 0x138 + 0x74),
+                       (mem_read16(cpu, vpb + 0x138 + 0x76) << 16) | mem_read16(cpu, vpb + 0x138 + 0x78),
+                       mem_read16(cpu, vpb + 0x138 + 0x08),
+                       (mem_read16(cpu, vpb + 0x138 + 0xA6) << 16) | mem_read16(cpu, vpb + 0x138 + 0xA8),
+                       mem_read16(cpu, vpb + 0x138 + 0x64), mem_read16(cpu, vpb + 0x138 + 0x12),
+                       mem_read16(cpu, vpb + 0x138 + 0x16));
+        }
+        shown++;
+    }
+    if (!shown)
+        printf("  (none)\n");
+}
+
+/* Once a second: refills done and each playing stream's voice. */
+static void print_streams_brief(CPUState* cpu, double now) {
+    if (g_stream_lines >= 400)
+        return;
+    bool any = false;
+    for (int i = 0; i < 32; i++) {
+        u32 b = mem_read32(cpu, 0x803AA170u + i * 4);
+        if (!guest_ptr(cpu, b))
+            continue;
+        s8 channel = (s8)mem_read8(cpu, b + 0x2598);
+        if (channel < 0 || channel >= 64)
+            continue;
+        u32 vpb = mem_read32(cpu, 0x803A8D60u + channel * 64 + 0x3C);
+        if (!guest_ptr(cpu, vpb))
+            continue;
+        u32 pb = vpb + 0x138;
+        printf("  stream: %7.2f s  stream %d channel %d: %u refills this second, data 0x%08X size %d pos %d | voice "
+               "state %u fmt 0x%X loop %u cur 0x%08X loop 0x%08X end 0x%08X ratio 0x%08X vol 0x%04X mix %04X/%04X\n",
+               now, i, channel, g_refills_this_second, mem_read32(cpu, b + 0x25C4), (int)mem_read32(cpu, b + 0x25DC),
+               (int)mem_read32(cpu, b + 0x25E0), mem_read16(cpu, pb + 0x0E), mem_read16(cpu, pb + 0x70),
+               mem_read16(cpu, pb + 0x6E), (mem_read16(cpu, pb + 0x7A) << 16) | mem_read16(cpu, pb + 0x7C),
+               (mem_read16(cpu, pb + 0x72) << 16) | mem_read16(cpu, pb + 0x74),
+               (mem_read16(cpu, pb + 0x76) << 16) | mem_read16(cpu, pb + 0x78),
+               (mem_read16(cpu, pb + 0xA6) << 16) | mem_read16(cpu, pb + 0xA8), mem_read16(cpu, pb + 0x64),
+               mem_read16(cpu, pb + 0x12), mem_read16(cpu, pb + 0x16));
+        g_stream_lines++;
+        any = true;
+    }
+    if (!any && g_refills_this_second) {
+        printf("  stream: %7.2f s  %u refills this second, no stream playing\n", now, g_refills_this_second);
+        g_stream_lines++;
+    }
+    g_refills_this_second = 0;
+}
+
 static void usage(const char* argv0) {
     fprintf(stderr,
-            "usage: %s <disc folder> [--map main.map] [--max-steps N] [--quiet] [--skip-hash]\n"
+            "usage: %s <disc folder> [--map main.map] [--max-steps N] [--quiet] [--debug] [--skip-hash]\n"
             "         [--dump-every N (default 60, 0 = off)] [--dump-dir DIR (default frames)]\n"
             "         [--press SECONDS:BUTTON[+BUTTON][@HOLD]]...  e.g. --press 5.5:A --press 7:DOWN@0.2\n"
             "         [--stop-at SECONDS (stop at this much game time)]\n"
@@ -198,6 +508,11 @@ static void usage(const char* argv0) {
             "         [--render-threads N (threads that draw frames; 0 = draw on the game thread)]\n"
             "         [--draw-log-at SECONDS (write two frames of draw calls and GPU state to drawlog.txt)]\n"
             "         [--window (play in a window at real-time speed)] [--scale N (window size, default 2)]\n"
+            "         [--skip-thx (window: skip the THX intro movie)]\n"
+            "         [--memcard FILE (memory card image in slot A; created if missing)]\n"
+            "         [--text FILE (game text replacements, default text-replacements.txt) | --no-text]\n"
+            "         [--aspect auto|4:3|16:9 (screen shape; auto follows the game's widescreen option)]\n"
+            "         [--gpu (draw with the graphics card) [--res N (its internal resolution, N x 640x528)]]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -209,6 +524,11 @@ int main(int argc, char** argv) {
     bool max_steps_given = false;
     bool want_window = false;
     int window_scale = 2;
+    int gpu_scale = 0;                 /* 0 = software renderer */
+    int aspect_mode = 0;
+    bool idle_skip = true;
+    const char* memcard_path = NULL;
+    const char* text_path = "text-replacements.txt";
     bool skip_hash = false;
     const char* dump_dir = "frames";
     u32 dump_every = 60;
@@ -224,8 +544,28 @@ int main(int argc, char** argv) {
             max_steps_given = true;
         } else if (strcmp(argv[i], "--window") == 0) {
             want_window = true;
+        } else if (strcmp(argv[i], "--text") == 0 && i + 1 < argc) {
+            text_path = argv[++i];
+        } else if (strcmp(argv[i], "--no-text") == 0) {
+            text_path = NULL;
+        } else if (strcmp(argv[i], "--memcard") == 0 && i + 1 < argc) {
+            memcard_path = argv[++i];
+        } else if (strcmp(argv[i], "--skip-thx") == 0) {
+            g_skip_intros = true;
+        } else if (strcmp(argv[i], "--no-idle-skip") == 0) {
+            idle_skip = false;
+        } else if (strcmp(argv[i], "--aspect") == 0 && i + 1 < argc) {
+            const char* a = argv[++i];
+            aspect_mode = strcmp(a, "4:3") == 0 ? 1 : strcmp(a, "16:9") == 0 ? 2 : 0;
+        } else if (strcmp(argv[i], "--gpu") == 0) {
+            if (!gpu_scale) gpu_scale = 1;
+        } else if (strcmp(argv[i], "--res") == 0 && i + 1 < argc) {
+            gpu_scale = atoi(argv[++i]);
+            if (gpu_scale < 1) gpu_scale = 1;
         } else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
             window_scale = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            g_debug = true;
         } else if (strcmp(argv[i], "--quiet") == 0) {
             g_verbose_entries = false;
         } else if (strcmp(argv[i], "--dump-every") == 0 && i + 1 < argc) {
@@ -271,13 +611,23 @@ int main(int argc, char** argv) {
             fprintf(stderr, "warning: couldn't load symbols from %s\n", map_path);
     }
     g_seen = (u8*)calloc(GC_MAIN_RAM_SIZE >> 5, 1);
-    g_profile = (u32*)calloc(GC_MAIN_RAM_SIZE >> 2, sizeof(u32));
+    if (g_debug) {                     /* 2 x 24 MB of counters: only when asked for */
+        g_profile = (u32*)calloc(GC_MAIN_RAM_SIZE >> 2, sizeof(u32));
+        g_calls = (u32*)calloc(GC_MAIN_RAM_SIZE >> 2, sizeof(u32));
+    }
+    disc_set_clock(interrupts_game_seconds);
+    if (g_have_symbols) {
+        g_dvd_open = symbols_address("DVDOpen");
+        g_dvd_path = symbols_address("DVDConvertPathToEntrynum");
+    }
     gx_raster_config(dump_dir, dump_every);
     gx_raster_config_xfb(xfb_every);
     if (draw_log)
         gx_raster_render_all();        /* logged frames must be drawn */
     if (want_window) {
 #ifdef NFLS2_HAVE_WINDOW
+        window_set_aspect_mode(aspect_mode);
+        window_set_gpu(gpu_scale);
         if (!window_open(window_scale))
             return 1;
         gx_raster_render_all();
@@ -293,14 +643,19 @@ int main(int argc, char** argv) {
     static CPUState cpu;
     if (!cpu_init(&cpu))
         return 1;
+
     hle_cpu_install(&cpu);
+    prof_start(&cpu);
     mmio_install(&cpu);
+    if (memcard_path && !exi_insert_memcard(0, memcard_path))
+        fprintf(stderr, "warning: running without a memory card\n");
 
     u32 entry = dol_load(&cpu, disc_dir, skip_hash);
     if (!entry)
         return 1;
     if (!boot_globals_init(&cpu, disc_dir))
         return 1;
+    textpatch_apply(&cpu, text_path);
     if (!disc_open(disc_dir) || !boot_place_fst(&cpu))
         return 1;
 
@@ -311,8 +666,12 @@ int main(int argc, char** argv) {
     print_location("entry", entry);
 
     double started = wall_seconds();
+    g_launch_wall = started;
     const char* reason = "step limit reached";
     unsigned long long steps = 0;
+    unsigned long long quit_steps = 0;   /* step at which the window was closed */
+    u32 idle_lo = g_have_symbols ? symbols_address("SelectThread") : 0;
+    u32 idle_hi = idle_lo ? symbols_function_end(idle_lo) : 0;
     while (steps < max_steps) {
         u32 pc = cpu.pc;
         if (g_trace_at > 0 && !g_tracing && g_trace_lines == 0 && interrupts_game_seconds() >= g_trace_at) {
@@ -325,12 +684,21 @@ int main(int argc, char** argv) {
             g_trace_lines = TRACE_MAX_LINES;
             printf("  trace: end at %.2f s, frame %u\n", interrupts_game_seconds(), gx_raster_frames());
         }
-        g_profiling = g_profile && (steps + PROFILE_STEPS >= max_steps ||
+        g_profiling = g_debug && g_profile && (steps + PROFILE_STEPS >= max_steps || quit_steps ||
                                     (stop_at > 0 && interrupts_game_seconds() >= stop_at - 1.0));
         cpu.downcount = 0;
         if (!dolrecomp_call(&cpu, pc)) {
-            reason = "no recompiled code at this address";
-            break;
+            /* No native version: code the game built in memory at run time
+               (the sound engine makes small call stubs). Interpret it. */
+            InterpResult ir = interp_run(&cpu, 4096);
+            if (ir == INTERP_UNSUPPORTED) {
+                reason = "unsupported instruction in run-time code";
+                break;
+            }
+            if (ir == INTERP_BAD_ADDRESS) {
+                reason = "no recompiled code at this address";
+                break;
+            }
         }
         s64 consumed = -cpu.downcount;
         cpu.timebase += (u64)(consumed > 0 ? consumed : 1) / 12u + 1u;
@@ -343,10 +711,52 @@ int main(int argc, char** argv) {
             break;
         }
         interrupts_poll(&cpu);
+
+        /* Idle skipping: with no thread ready to run, the OS spins in
+           SelectThread with interrupts on until one wakes a thread. Nothing
+           can change until the next timed event, so jump straight to it
+           instead of spinning (the game sees exactly the same timing). */
+        if (idle_skip && idle_lo && cpu.pc >= idle_lo && cpu.pc < idle_hi && (cpu.msr & 0x8000u) &&
+            mem_read32(&cpu, 0x800000E4u) == 0 && !any_thread_ready(&cpu)) {
+            u64 next = interrupts_next_event();
+            if (next > cpu.timebase && next != ~0ull) {
+                g_idle_ticks += next - cpu.timebase;
+                cpu.timebase = next;
+                g_idle_skips++;
+            }
+        }
+        if ((steps & 0x3FFu) == 0) {
+            static int last_second;
+            double now = interrupts_game_seconds();
+            if ((int)now != last_second) {
+                last_second = (int)now;
+                if (g_debug)
+                    print_streams_brief(&cpu, now);
+            }
+        }
 #ifdef NFLS2_HAVE_WINDOW
+        if (want_window && (steps & 0xFFFu) == 0 && window_take_text_search()) {
+            static const char* const k_phrases[] = {"memory card", "storage device", "save device"};
+            for (size_t i = 0; i < sizeof k_phrases / sizeof *k_phrases; i++)
+                textscan_run(&cpu, k_phrases[i]);
+            g_text_watch_until = interrupts_game_seconds() + 3.0;
+            printf("textcall: watching game calls for 3 seconds\n");
+            fflush(stdout);
+        }
         if (want_window && window_quit_requested()) {
-            reason = "window closed";
-            break;
+            /* Run a little longer to profile where the game spends its time
+               (shows what a frozen game is stuck on), then stop. */
+            if (!g_debug) {
+                reason = "window closed";
+                break;
+            }
+            if (!quit_steps) {
+                quit_steps = steps;
+                printf("window closed: profiling a few more steps before stopping\n");
+            } else if (steps - quit_steps >= PROFILE_STEPS / 4) {
+                reason = "window closed";
+                break;
+            }
         }
 #endif
         if (stop_at > 0 && (steps & 0xFFFu) == 0 && interrupts_game_seconds() >= stop_at) {
@@ -360,6 +770,9 @@ int main(int argc, char** argv) {
     printf("\n=== stopped after %llu steps: %s ===\n", steps, reason);
     printf("run time %.1f s (%.1f million steps/s), game time %.1f s\n", secs,
            secs > 0 ? (double)steps / secs / 1e6 : 0.0, interrupts_game_seconds());
+    printf("idle skipping: %llu times, %.1f s of game time skipped (%.0f%%)\n", g_idle_skips,
+           (double)g_idle_ticks / 40500000.0, interrupts_game_seconds() > 0
+           ? (double)g_idle_ticks / 40500000.0 / interrupts_game_seconds() * 100.0 : 0.0);
     print_location("pc   ", cpu.pc);
     if (cpu.exception) {
         printf("exception flags 0x%08X, program cause 0x%08X\n", cpu.exception, cpu.program_exception);
@@ -367,10 +780,34 @@ int main(int argc, char** argv) {
     }
     print_location("lr   ", cpu.lr);
     printf("r1 (stack) 0x%08X  r2 0x%08X  r13 0x%08X  r14 0x%08X\n", cpu.gpr[1], cpu.gpr[2], cpu.gpr[13], cpu.gpr[14]);
+    if ((strcmp(reason, "no recompiled code at this address") == 0 ||
+         strcmp(reason, "unsupported instruction in run-time code") == 0) && guest_ptr(&cpu, cpu.pc & ~3u)) {
+        /* Is there code here (the game copied or loaded it at run time) or data? */
+        printf("memory at pc:");
+        for (int i = -4; i < 12; i++)
+            printf("%s %08X", (i + 4) % 8 ? "" : "\n ", mem_read32(&cpu, cpu.pc + (u32)(i * 4)));
+        printf("\n");
+    }
+    if (strcmp(reason, "game time limit reached") != 0 && strcmp(reason, "window closed") != 0) {
+        printf("registers:");
+        for (int r = 0; r < 32; r++)
+            printf("%s r%-2d %08X", (r % 8) ? "" : "\n ", r, cpu.gpr[r]);
+        printf("\n ctr %08X  cr %08X  xer %08X\n", cpu.ctr, cpu.cr, cpu.xer);
+    }
     printf("backtrace (innermost first):\n");
     print_backtrace(&cpu, cpu.gpr[1], cpu.lr, "  ");
     print_threads(&cpu);
-    print_profile();
+    if (g_debug) {
+        print_profile();
+        prof_report();
+    }
+    interp_report();
+    exi_report();
+    if (g_debug) {
+        print_call_counts();
+        print_streams(&cpu);
+    }
+    disc_report_files();
 
     printf("\nlast dispatched addresses (oldest first):\n");
     u32 n = g_trace_pos < TRACE_LEN ? g_trace_pos : TRACE_LEN;

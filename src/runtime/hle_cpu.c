@@ -34,6 +34,15 @@ static void spr_write(CPUState* cpu, u16 spr, u32 value, u32 cia) {
         g_spr[22] = value + (u32)cpu->timebase;
         return;
     }
+    if (spr == 923 && (value & 2u)) {
+        /* DMAL with the trigger bit: run the locked-cache DMA now. Length in
+           32-byte lines: DMAU bits 0-4 high, DMAL bits 2-3 low; 0 = 128. */
+        u32 dmau = g_spr[922];
+        u32 lines = ((dmau & 0x1Fu) << 2) | ((value >> 2) & 3u);
+        if (!lines) lines = 128;
+        mmio_locked_cache_dma(cpu, dmau & ~0x1Fu, value & ~0x1Fu, lines * 32u, (value & 0x10u) != 0);
+        value &= ~2u;                  /* done: the trigger bit reads back clear */
+    }
     g_spr[spr & 1023] = value;
     if (spr == 921)
         mmio_wpar_written();           /* resets the write-gather pipe */

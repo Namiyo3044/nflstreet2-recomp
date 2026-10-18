@@ -9,6 +9,7 @@
 #include <string.h>
 
 u32 gx_cp[256];
+u32 gx_state_serial = 1;
 u32 gx_bp[256] = {[0xFE] = 0x00FFFFFFu};  /* 0xFE: write mask, all bits by default */
 u32 gx_xf_mem[0x800];
 u32 gx_xf_reg[0x100];
@@ -18,6 +19,10 @@ u8 gx_tev_konst[4][4];
 /* Bytes received from the write-gather pipe that don't yet form a command. */
 static u8* g_buf;
 static size_t g_len, g_cap;
+/* How many buffered bytes the incomplete command at the front needs: until
+   then there's no point parsing again (the game writes vertex data one or
+   two bytes at a time, and a draw can be hundreds of bytes). */
+static size_t g_need;
 
 static struct {
     unsigned long long bytes, nops, cp, xf, indexed, bp, display_lists;
@@ -108,6 +113,8 @@ static void write_bp(CPUState* cpu, u32 value) {
         data = (gx_bp[reg] & ~mask) | (data & mask);
         gx_bp[0xFE] = 0x00FFFFFFu;
     }
+    if (gx_bp[reg] != data || (reg >= 0xE0 && reg <= 0xE7) || reg == 0x63 || reg == 0x65)
+        gx_state_serial++;
     gx_bp[reg] = data;
     g_stats.bp++;
 
@@ -129,6 +136,9 @@ static void write_bp(CPUState* cpu, u32 value) {
     }
 
     switch (reg) {
+    case 0x63: /* preload a texture into texture memory (source 0x60, TMEM 0x61/0x62) */
+        gx_tex_preload(cpu);
+        break;
     case 0x65: /* load a colour table (address in BP 0x64) into texture memory */
         gx_tex_load_tlut(cpu, gx_bp[0x64], data);
         break;
@@ -175,11 +185,14 @@ static void load_indexed(CPUState* cpu, u32 array, u32 value) {
     u32 count = ((value >> 12) & 0xFu) + 1u;
     u32 addr = value & 0xFFFu;
     u32 src = ((gx_cp[0xA0 + array] & 0x03FFFFFFu) + index * gx_cp[0xB0 + array]) & 0x01FFFFFFu;
+    u32 start = addr, done = 0;
     for (u32 i = 0; i < count; i++, addr++, src += 4) {
         if (src + 4 > cpu->ram_size || addr >= 0x800u)
             break;
         gx_xf_mem[addr] = be32(cpu->ram + src);
+        done++;
     }
+    gx_raster_xf_write(start, &gx_xf_mem[start], done);
 }
 
 static void run_display_list(CPUState* cpu, u32 addr, u32 size);
@@ -203,14 +216,37 @@ static size_t parse_one(CPUState* cpu, const u8* p, size_t avail, bool in_dl) {
         u32 hdr = be32(p + 1);
         size_t n = ((hdr >> 16) & 0xFFFFu) + 1u;
         size_t len = 5 + n * 4;
-        if (avail < len) return 0;
+        if (avail < len) {
+            if (!in_dl) g_need = len;
+            return 0;
+        }
         u32 addr = hdr & 0xFFFFu;
+        u32 first_addr = addr;
         for (size_t i = 0; i < n; i++, addr++) {
             u32 v = be32(p + 5 + i * 4);
             if (addr < 0x800u)
                 gx_xf_mem[addr] = v;
-            else if (addr >= 0x1000u && addr < 0x1100u)
+            else if (addr >= 0x1000u && addr < 0x1100u) {
+                /* Of the transform registers, the renderer's state snapshot
+                   only reads the texture coordinate count (0x103F); the rest
+                   (matrix indices, lighting, projection, ...) are read per
+                   vertex. Matrix index changes come before nearly every draw
+                   and mustn't force a fresh snapshot each time. */
+                if (addr == 0x103Fu && gx_xf_reg[0x3F] != v)
+                    gx_state_serial++;
                 gx_xf_reg[addr - 0x1000u] = v;
+            }
+        }
+        /* (the values in stream order, for deferred transforming) */
+        {
+            u32 vals[64];
+            size_t done = 0;
+            while (done < n) {
+                size_t k = n - done > 64 ? 64 : n - done;
+                for (size_t i = 0; i < k; i++) vals[i] = be32(p + 5 + (done + i) * 4);
+                gx_raster_xf_write(first_addr + (u32)done, vals, (u32)k);
+                done += k;
+            }
         }
         g_stats.xf++;
         return len;
@@ -239,7 +275,10 @@ static size_t parse_one(CPUState* cpu, const u8* p, size_t avail, bool in_dl) {
             if (avail < 3) return 0;
             u32 count = ((u32)p[1] << 8) | p[2];
             size_t len = 3 + (size_t)count * vertex_size(op & 7u);
-            if (avail < len) return 0;
+            if (avail < len) {
+                if (!in_dl) g_need = len;
+                return 0;
+            }
             g_stats.draws++;
             g_stats.vertices += count;
             gx_raster_draw(cpu, op, op & 7u, count, p + 3);
@@ -280,6 +319,9 @@ void gx_fifo_write(CPUState* cpu, u32 value, u8 size) {
     for (u8 i = 0; i < size; i++)
         g_buf[g_len++] = (u8)(value >> (8 * (size - 1 - i)));
     g_stats.bytes += size;
+    if (g_len < g_need)
+        return;                        /* the command at the front is still incomplete */
+    g_need = 0;
 
     size_t off = 0;
     while (off < g_len) {
