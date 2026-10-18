@@ -843,7 +843,7 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         value = ai_sample_count(cpu);
     else if (off >= DI && off < DI + 0x40 && di_read(off, size, &value))
         ;
-    else if (off >= 0x6800u && off < 0x6800u + 3 * 0x14u && exi_read(off, size, &value))
+    else if (off >= 0x6800u && off < 0x6800u + 3 * 0x14u && exi_read(cpu, off, size, &value))
         ;
     else if (off >= SI && off < SI + 0x40 && si_read(off, size, &value))
         ;
@@ -931,7 +931,8 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
 }
 
 u64 mmio_next_event(void) {
-    return g_ai_dma_on ? g_ai_dma_next : ~0ull;
+    u64 a = g_ai_dma_on ? g_ai_dma_next : ~0ull, b = exi_next_event();
+    return a < b ? a : b;
 }
 
 void mmio_ai_dma_tick(CPUState* cpu) {

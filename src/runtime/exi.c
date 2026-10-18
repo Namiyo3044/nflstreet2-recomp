@@ -29,7 +29,25 @@
 
 typedef struct {
     u32 csr, mar, len, cr, data;
+    u64 tc_due;            /* a memory card DMA finishes at this time (0: none) */
+    u64 irq_due;           /* the card signals a finished erase/program at this time (0: none) */
 } Channel;
+
+/* Memory card timing. A card takes time to move data and to program and
+   erase its flash; the CARD library starts each step and carries on from
+   the interrupt when it's done. Finishing instantly would be faster, but
+   the game's save code isn't written for that: it starts a card read or
+   write, then records what to do once it completes. If the operation is
+   already complete in between and the game's other thread checks on it,
+   the follow-up is lost, and a save stops partway (or a load misses part of
+   the file). So the card takes about as long as real hardware does. */
+#define TIMEBASE_HZ        40500000ull
+#define CARD_READ_RATE     (512u * 1024u)       /* bytes per second */
+#define CARD_WRITE_RATE    (128u * 1024u)
+#define CARD_PROGRAM_TICKS (TIMEBASE_HZ / 10000u) /* 0.1 ms per page */
+#define CARD_ERASE_TICKS   (TIMEBASE_HZ / 1000u)  /* 1 ms per sector */
+
+static u64 g_now;          /* the timebase, as of the last EXI access or poll */
 
 static Channel g_ch[3];
 
@@ -135,19 +153,22 @@ static void card_select(Card* c) {
 /* Deselect ends a command; erase and program finish now (instantly) and
    signal with the card's interrupt, which the CARD library waits for. */
 static void card_deselect(Card* c, Channel* ch) {
+    u64 delay = CARD_PROGRAM_TICKS;
     if (c->cmd == 0xF1 && c->pos >= 3) {             /* sector erase */
         u32 a = card_address(c) & ~(SECTOR_SIZE - 1u) & (c->size - 1u);
         memset(c->data + a, 0xFF, SECTOR_SIZE);
         card_save(c, a, SECTOR_SIZE);
         c->erases++;
         c->pending_irq = true;
+        delay = CARD_ERASE_TICKS;
     } else if (c->cmd == 0xF4 && c->pos >= 3) {      /* chip erase */
         memset(c->data, 0xFF, c->size);
         card_save(c, 0, c->size);
         c->pending_irq = true;
+        delay = CARD_ERASE_TICKS * (c->size / SECTOR_SIZE);
     }
     if (c->pending_irq && c->irq_enabled)
-        ch->csr |= CSR_EXIINT;
+        ch->irq_due = g_now + delay;
     c->pending_irq = false;
     c->cmd = 0;
     c->pos = 0;
@@ -296,7 +317,11 @@ static void start_transfer(CPUState* cpu, u32 ch) {
     if (dma) {
         u32 mar = c->mar & 0x03FFFFE0u, len = c->len;
         if (d == 0) {
+            /* The bytes move now; the transfer reports done later. */
             card_dma(&g_card[ch], cpu, mar, len, rw == 0);
+            u64 rate = rw == 0 ? CARD_READ_RATE : CARD_WRITE_RATE;
+            c->tc_due = cpu->timebase + (u64)len * TIMEBASE_HZ / rate + 1u;
+            return;
         } else if (mar < cpu->ram_size && len <= cpu->ram_size - mar) {
             for (u32 i = 0; i < len; i++) {
                 u8 out = transfer_byte(ch, rw == 0 ? 0 : cpu->ram[mar + i]);
@@ -316,11 +341,40 @@ static void start_transfer(CPUState* cpu, u32 ch) {
     c->csr |= CSR_TCINT;
 }
 
-bool exi_read(u32 off, u8 size, u32* out) {
+static void finish_dma(Channel* c) {
+    c->tc_due = 0;
+    c->cr &= ~1u;
+    c->csr |= CSR_TCINT;
+}
+
+void exi_tick(u64 now) {
+    g_now = now;
+    for (u32 ch = 0; ch < 3; ch++) {
+        Channel* c = &g_ch[ch];
+        if (c->tc_due && now >= c->tc_due)
+            finish_dma(c);
+        if (c->irq_due && now >= c->irq_due) {
+            c->irq_due = 0;
+            c->csr |= CSR_EXIINT;
+        }
+    }
+}
+
+u64 exi_next_event(void) {
+    u64 next = ~0ull;
+    for (u32 ch = 0; ch < 3; ch++) {
+        if (g_ch[ch].tc_due && g_ch[ch].tc_due < next) next = g_ch[ch].tc_due;
+        if (g_ch[ch].irq_due && g_ch[ch].irq_due < next) next = g_ch[ch].irq_due;
+    }
+    return next;
+}
+
+bool exi_read(CPUState* cpu, u32 off, u8 size, u32* out) {
     if (off < 0x6800u || off >= 0x6800u + 3u * 0x14u || size != 4)
         return false;
     u32 ch = (off - 0x6800u) / 0x14u, r = (off - 0x6800u) % 0x14u;
     Channel* c = &g_ch[ch];
+    exi_tick(cpu->timebase);
     switch (r) {
     case 0x00: {
         u32 v = c->csr & ~CSR_EXT;
@@ -330,7 +384,13 @@ bool exi_read(u32 off, u8 size, u32* out) {
     }
     case 0x04: *out = c->mar; return true;
     case 0x08: *out = c->len; return true;
-    case 0x0C: *out = c->cr; return true;
+    case 0x0C:
+        /* Code waiting on the transfer in a loop: let it finish now (the
+           timebase may not move inside such a loop). */
+        if (c->tc_due)
+            finish_dma(c);
+        *out = c->cr;
+        return true;
     case 0x10: *out = c->data; return true;
     }
     return false;
@@ -341,6 +401,7 @@ bool exi_write(CPUState* cpu, u32 off, u32 value, u8 size) {
         return false;
     u32 ch = (off - 0x6800u) / 0x14u, r = (off - 0x6800u) % 0x14u;
     Channel* c = &g_ch[ch];
+    exi_tick(cpu->timebase);
     switch (r) {
     case 0x00: {
         u32 old = c->csr;

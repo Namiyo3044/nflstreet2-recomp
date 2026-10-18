@@ -10,6 +10,7 @@
  */
 #include "runtime/interrupts.h"
 #include "runtime/mmio.h"
+#include "runtime/exi.h"
 #include "gx/raster.h"
 
 #include <stdio.h>
@@ -100,6 +101,7 @@ void interrupts_poll(CPUState* cpu) {
     }
 
     mmio_ai_dma_tick(cpu);
+    exi_tick(cpu->timebase);
 
     if (!(cpu->msr & MSR_EE))
         return;
