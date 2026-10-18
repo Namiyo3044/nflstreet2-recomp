@@ -8,6 +8,7 @@
 #include "platform/settings.h"
 #include "platform/menu.h"
 #include "gx/hires.h"
+#include "gx/texture.h"
 
 #include <SDL3/SDL.h>
 
@@ -347,6 +348,7 @@ bool window_open(int scale) {
            "Tab fast-forward, F1 video menu, F7 free camera, F9 screen shape (auto/4:3/16:9), F10 screenshot, F11 fullscreen, F12 draw log\n",
            g_gpu ? "picture from the graphics card" : SDL_GetRendererName(g_renderer));
     open_audio();
+    gx_raster_set_target_shape(g_aspect_mode);
     update_aspect(true);
     if (g_settings.fullscreen) {
         g_fullscreen = true;
@@ -508,13 +510,14 @@ static void freecam_update(void) {
 /* F6: finds where in memory the game keeps a setting. Press F6, change the
    setting in the game's menu, press F6 again, change it back, F6, and so on:
    each press keeps only the bytes that switch between the same two values in
-   step with the setting. Shift+F6 starts over. Results go to the log
-   ("ramsearch:" lines). */
+   step with the setting. Ctrl+F6 without changing the setting keeps only the
+   bytes that stayed the same (drops things that just animate). Shift+F6
+   starts over. Results go to the log ("ramsearch:" lines). */
 static CPUState* g_cpu_ref;
 static u8 *g_rs_a, *g_rs_b, *g_rs_cand;
-static int g_rs_step;
+static int g_rs_step, g_rs_state;      /* g_rs_state: 0 = setting as in snapshot A, 1 = as in B */
 
-static void ram_search(bool restart) {
+static void ram_search(bool restart, bool same) {
     CPUState* cpu = g_cpu_ref;
     if (!cpu || !cpu->ram) return;
     u32 n = cpu->ram_size;
@@ -523,9 +526,13 @@ static void ram_search(bool restart) {
         g_rs_a = (u8*)malloc(n);
         g_rs_b = (u8*)malloc(n);
         g_rs_cand = (u8*)malloc(n);
-        g_rs_step = 0;
+        g_rs_step = g_rs_state = 0;
         if (!g_rs_a || !g_rs_b || !g_rs_cand) return;
         if (restart) { printf("ramsearch: started over\n"); return; }
+    }
+    if (same && g_rs_step < 2) {
+        printf("ramsearch: Ctrl+F6 works after the first two snapshots\n");
+        return;
     }
     const u8* ram = cpu->ram;
     u32 count = 0;
@@ -534,23 +541,53 @@ static void ram_search(bool restart) {
         printf("ramsearch: snapshot 1 taken; change the setting, then press F6 again\n");
     } else if (g_rs_step == 1) {
         memcpy(g_rs_b, ram, n);
+        g_rs_state = 1;
         for (u32 i = 0; i < n; i++) count += (g_rs_cand[i] = g_rs_a[i] != g_rs_b[i]);
     } else {
-        const u8* want = (g_rs_step & 1) ? g_rs_b : g_rs_a;
+        if (!same) g_rs_state ^= 1;
+        const u8* want = g_rs_state ? g_rs_b : g_rs_a;
         for (u32 i = 0; i < n; i++) {
             if (g_rs_cand[i] && ram[i] != want[i]) g_rs_cand[i] = 0;
             count += g_rs_cand[i];
         }
     }
     if (g_rs_step > 0) {
-        printf("ramsearch: snapshot %d: %u bytes still match%s\n", g_rs_step + 1, count,
-               count > 64 ? "; change the setting again and press F6" : "");
-        if (count <= 64)
-            for (u32 i = 0; i < n; i++)
-                if (g_rs_cand[i])
-                    printf("ramsearch:   0x%08X: %u <-> %u\n", 0x80000000u | i, g_rs_a[i], g_rs_b[i]);
+        printf("ramsearch: snapshot %d (%s, setting as in snapshot %c): %u bytes still match\n", g_rs_step + 1,
+               same ? "unchanged" : "changed", g_rs_state ? 'B' : 'A', count);
+        if (count <= 300) {
+            /* Likely flags first: both values small. */
+            for (int pass = 0; pass < 2; pass++)
+                for (u32 i = 0; i < n; i++)
+                    if (g_rs_cand[i] && ((g_rs_a[i] <= 3 && g_rs_b[i] <= 3) == (pass == 0)))
+                        printf("ramsearch:   0x%08X: %u <-> %u\n", 0x80000000u | i, g_rs_a[i], g_rs_b[i]);
+        }
     }
     g_rs_step++;
+}
+
+/* The game's own screen option ("option 6" of its option record, kept in
+   the record at 0x8030BAAC, 16 bytes per option: value, table tag, column
+   tag): 0 = 4:3, 1 = letterbox, 2 = 16:9. With the screen shape fixed to 4:3
+   or 16:9 in the port's menu, the game's option is kept at the same choice,
+   so the game draws for the screen the port shows. The game reads it when it
+   sets up a screen, so some parts follow from the next screen or match. */
+#define GAME_OPT_SCREEN 0x0030BB0Cu
+
+static u32 be32(const u8* p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
+
+static void sync_game_screen_option(CPUState* cpu) {
+    if (!cpu || !cpu->ram || GAME_OPT_SCREEN + 12 > cpu->ram_size || g_settings.screen_shape == 0)
+        return;
+    u8* p = cpu->ram + GAME_OPT_SCREEN;
+    if (be32(p + 4) != 0x5354504Fu || be32(p + 8) != 0x5349444Fu)
+        return;                        /* the record isn't set up yet */
+    u32 want = g_settings.screen_shape == 2 ? 2u : 0u;
+    u32 have = be32(p);
+    if (have == want)
+        return;
+    p[0] = p[1] = p[2] = 0;
+    p[3] = (u8)want;
+    printf("window: game's screen option set to %s (was %u)\n", want ? "16:9" : "4:3", have);
 }
 
 /* ------------------------------------------------------ settings menu --- */
@@ -565,6 +602,7 @@ static void set_window_size(void) {
 static void apply_settings(unsigned ch) {
     if (ch & (1u << MI_SHAPE)) {
         g_aspect_mode = g_settings.screen_shape;
+        gx_raster_set_target_shape(g_aspect_mode);
         update_aspect(true);
     }
     if (ch & (1u << MI_DISPLAY)) {
@@ -573,12 +611,16 @@ static void apply_settings(unsigned ch) {
     }
     if (ch & (1u << MI_WINSIZE))
         set_window_size();
-    if (ch & (1u << MI_TEXTURES))
+    if (ch & (1u << MI_TEXTURES)) {
+        /* Turning them on picks up files added, changed or removed since. */
+        if (g_settings.custom_textures && !hires_enabled())
+            gx_tex_reload_hires();
         hires_set_enabled(g_settings.custom_textures != 0);
+    }
 }
 
 static void open_menu(void) {
-    MenuInfo mi = {g_gpu, g_gpu_scale, hires_file_count() > 0};
+    MenuInfo mi = {g_gpu, g_gpu_scale, hires_has_folder()};
     menu_open(&mi);
 }
 
@@ -638,7 +680,7 @@ static void poll_events(void) {
             if (e.key.key == SDLK_F1 && !e.key.repeat) {
                 open_menu();
             } else if (e.key.key == SDLK_F6 && !e.key.repeat) {
-                ram_search((e.key.mod & SDL_KMOD_SHIFT) != 0);
+                ram_search((e.key.mod & SDL_KMOD_SHIFT) != 0, (e.key.mod & SDL_KMOD_CTRL) != 0);
             } else if (e.key.key == SDLK_ESCAPE) {
                 g_quit = true;
             } else if (e.key.key == SDLK_F7 && !e.key.repeat) {
@@ -654,6 +696,7 @@ static void poll_events(void) {
             } else if (e.key.key == SDLK_F9 && !e.key.repeat) {
                 static const int k_next[] = {1, 2, 0};   /* auto -> 4:3 -> 16:9 -> auto */
                 g_aspect_mode = k_next[g_aspect_mode];
+                gx_raster_set_target_shape(g_aspect_mode);
                 update_aspect(true);
                 g_settings.screen_shape = g_aspect_mode;
                 settings_save();
@@ -686,6 +729,10 @@ static void poll_events(void) {
         }
     }
 }
+
+/* After the menu closes, the key or button that closed it is usually still
+   held: the game sees nothing until everything has been let go. */
+static bool g_input_block;
 
 static void read_input(void) {
     if (g_freecam) {                   /* the keys fly the camera; the game sees nothing pressed */
@@ -744,6 +791,18 @@ static void read_input(void) {
         if (r > p.trigger_r) p.trigger_r = r;
         if (l > 230) p.buttons |= PAD_L;  /* the digital click at the end of the travel */
         if (r > 230) p.buttons |= PAD_R;
+    }
+    if (g_input_block) {
+        bool held = p.buttons || p.trigger_l > 30 || p.trigger_r > 30 || p.stick_x < 0x80 - 30 ||
+                    p.stick_x > 0x80 + 30 || p.stick_y < 0x80 - 30 || p.stick_y > 0x80 + 30 ||
+                    p.cstick_x < 0x80 - 30 || p.cstick_x > 0x80 + 30 || p.cstick_y < 0x80 - 30 ||
+                    p.cstick_y > 0x80 + 30;
+        if (held) {
+            PadLive idle = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
+            p = idle;
+        } else {
+            g_input_block = false;
+        }
     }
     pad_set_live(&p);
 }
@@ -917,6 +976,7 @@ static void menu_loop(CPUState* cpu) {
     }
     apply_settings(menu_take_changes());
     settings_save();
+    g_input_block = true;
     if (g_audio) SDL_ResumeAudioStreamDevice(g_audio);
     Uint64 now = SDL_GetTicksNS();
     g_base_ns = g_stat_ns = now;
@@ -931,6 +991,7 @@ void window_field(CPUState* cpu) {
     g_field++;
     g_cpu_ref = cpu;
     poll_events();
+    sync_game_screen_option(cpu);
     if (menu_is_open()) {
         menu_loop(cpu);
         return;

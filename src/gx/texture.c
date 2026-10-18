@@ -405,6 +405,28 @@ void gx_tex_invalidate(u32 addr, u32 size) {
 }
 
 /* Called once per displayed frame: starts a new validation round. */
+static void retire_hires(u32* texels) {
+    retire(texels);
+}
+
+void gx_tex_reload_hires(void) {
+    hires_rescan(retire_hires);
+    /* Every texture is decoded again on its next use, looking up its
+       replacement afresh. */
+    for (u32 n = 0; n < g_cache_count; n++) {
+        CacheEntry* e = &g_cache[n];
+        if (e->addr == 0xFFFFFFFFu) continue;
+        retire(e->data);
+        e->data = NULL;
+        e->tex.texels = NULL;
+        e->tex.hires = NULL;
+        e->tex.hires_entry = NULL;
+        e->addr = 0xFFFFFFFFu;
+        e->used_frame = 0;
+    }
+    g_index_ready = false;
+}
+
 void gx_tex_flush_cache(void) {
     g_frame++;
 }

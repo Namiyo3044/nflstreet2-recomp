@@ -6,7 +6,7 @@
 #   .\play.ps1 -Res 2          (graphics card's internal resolution, N x 640x528)
 #   .\play.ps1 -Debug          (extra diagnostics: call counts, file/stream logs, profile at exit; a little slower)
 #   .\play.ps1 -Software       (the old CPU renderer instead of the graphics card)
-#   .\play.ps1 -Textures D:\pack (custom textures in Dolphin's format; default C:\nfls2\textures, used if it exists)
+#   .\play.ps1 -Textures D:\pack (custom textures in Dolphin's format, .png or .dds; default C:\nfls2\textures, used if it exists)
 #   .\play.ps1 -NoTextures     (the game's own textures only)
 #   .\play.ps1 -DumpTextures   (save every texture the game uses to C:\nfls2\dump\textures, with Dolphin's names)
 #   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
@@ -36,6 +36,7 @@ param(
     [string]$Textures = "C:\nfls2\textures",
     [switch]$NoTextures,
     [switch]$DumpTextures,
+    [switch]$CardTrace,
     [string[]]$Press = @(),
     [string]$Disc = "C:\nfls2\disc",
     [string]$Map = "C:\nfls2\symbols\main.map"
@@ -96,6 +97,7 @@ if ($Software) { $gameArgs += @("--software") }
 elseif ($PSBoundParameters.ContainsKey("Res")) { $gameArgs += @("--gpu", "--res", $Res) }
 elseif ($GPU) { $gameArgs += @("--gpu") }
 if ($Debug) { $gameArgs += @("--debug") }
+if ($CardTrace) { $gameArgs += @("--cardtrace") }
 if (-not $NoTextures -and (Test-Path $Textures)) { $gameArgs += @("--textures", $Textures) }
 if ($DumpTextures) {
     New-Item -ItemType Directory -Force -Path "C:\nfls2\dump\textures" | Out-Null
@@ -118,6 +120,8 @@ $gpuLines = @($log | Select-String -Pattern "^gpu:|^custom textures:" | ForEach-
 $startup = @($log | Select-String -Pattern "^startup:" | ForEach-Object { $_.Line })
 $cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
 $txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })
+$ct = @($log | Select-String -Pattern "^cardtrace:" | ForEach-Object { $_.Line })
+if ($ct.Count -gt 0) { $report = @("card trace ($($ct.Count) lines):") + ($ct | Select-Object -First 1500) + $report }
 $rs = @($log | Select-String -Pattern "^ramsearch:" | ForEach-Object { $_.Line })
 if ($rs.Count -gt 0) { $report = @("memory search ($($rs.Count) lines):") + ($rs | Select-Object -Last 150) + $report }
 if ($txt.Count -gt 0) { $report = @("text search ($($txt.Count) lines):") + ($txt | Select-Object -Last 500) + $report }

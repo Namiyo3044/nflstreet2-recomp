@@ -244,8 +244,9 @@ static void item_value(int i, char* out, size_t cap) {
 
 static const char* item_help(int i) {
     switch (i) {
-    case MI_SHAPE: return "How the picture is shaped. Game's setting follows the widescreen option in the game's own "
-                          "menu; 4:3 and 16:9 keep that shape whatever the game is set to.";
+    case MI_SHAPE: return "How the picture is shaped. Game's setting follows the screen option in the game's own menu. "
+                          "4:3 and 16:9 also set the game's option to match; some screens pick up a change from the "
+                          "next screen or match.";
     case MI_DISPLAY: return "Play in a window or on the whole screen (F11 also switches).";
     case MI_WINSIZE: return "How big the window is when not playing full screen.";
     case MI_RENDERER: return "The graphics card draws faster and sharper than the software renderer. Takes effect "
@@ -253,8 +254,9 @@ static const char* item_help(int i) {
     case MI_RES: return "How sharply the graphics card draws the game, as a multiple of the GameCube's own picture. "
                         "Higher needs a faster card. Takes effect the next time the game starts.";
     case MI_TEXTURES: return g_info.textures_found
-                                 ? "Replacement textures from the custom texture folder (Dolphin's format)."
-                                 : "No custom textures were found. Put Dolphin-format texture packs in "
+                                 ? "Replacement textures from the custom texture folder (Dolphin's format, "
+                                   ".png or .dds). Turn off and on again to load files added or changed since."
+                                 : "No custom texture folder was found. Put Dolphin-format texture packs in "
                                    "C:\\nfls2\\textures to use them.";
     default: return "Close this menu and carry on playing.";
     }

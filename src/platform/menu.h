@@ -13,7 +13,7 @@
 typedef struct {
     bool gpu_running;                  /* the graphics card renderer is in use */
     int res_running;                   /* its internal resolution */
-    bool textures_found;               /* a custom texture folder with files was found */
+    bool textures_found;               /* the custom texture folder exists */
 } MenuInfo;
 
 enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_OK, MENU_BACK };

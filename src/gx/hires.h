@@ -5,13 +5,14 @@
 
 /* Custom (replacement) textures, in Dolphin's format.
  *
- * Files are PNGs named the way Dolphin names them:
- *   tex1_<w>x<h>[_m]_<texture hash>[_<palette hash>]_<format>.png
+ * Files are PNG or DDS images named the way Dolphin names them:
+ *   tex1_<w>x<h>[_m]_<texture hash>[_<palette hash>]_<format>.png (or .dds)
  * with optional _mip1, _mip2 ... files for the smaller levels, and $ in
  * place of the palette hash to match any palette. The hashes are XXH64 of
  * the texture's bytes and of the part of its palette it uses, so packs made
  * for Dolphin (found in Load/Textures/GN7E69) work as they are. Subfolders
- * are searched too.
+ * are searched too. DDS files may be BC1/BC2/BC3/BC7 compressed or
+ * uncompressed and carry their own mip levels.
  *
  * Images are loaded in the background the first time their texture is
  * used; the game's own texture is drawn until then. Only the GPU renderer
@@ -40,6 +41,12 @@ bool hires_active(void);
 void hires_set_enabled(bool on);
 bool hires_enabled(void);
 unsigned hires_file_count(void);
+bool hires_has_folder(void);
+
+/* Scans the folder again, picking up files added or removed. Images loaded
+   until now are handed to retire (freed once no frame uses them); the
+   caller must then drop every texture's hires / hires_entry. */
+void hires_rescan(void (*retire)(u32* texels));
 
 /* Looks up the replacement for a texture, starting its load if needed.
    data / size: the texture's level 0 bytes; tlut: its palette in TMEM

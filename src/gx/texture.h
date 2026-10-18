@@ -48,6 +48,10 @@ const GxTexture* gx_tex_get(CPUState* cpu, u32 map);
    RAM the first time it is used in the new frame. */
 void gx_tex_flush_cache(void);
 
+/* Custom textures: scans their folder again and redoes every texture's
+   replacement (call between frames, on the thread that records them). */
+void gx_tex_reload_hires(void);
+
 /* Frees decoded buffers that were replaced or evicted. Call only when no
    frame that may use them is still being drawn. */
 void gx_tex_collect_garbage(void);
