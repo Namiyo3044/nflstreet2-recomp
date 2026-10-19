@@ -639,6 +639,19 @@ static void apply_settings(unsigned ch) {
     }
 }
 
+/* F5: custom textures on / off, as the menu option does (turning them on
+   reloads the folder). */
+static void toggle_custom_textures(void) {
+    if (!g_gpu || !hires_has_folder()) {
+        printf("window: no custom textures to switch (no texture folder, or the software renderer)\n");
+        return;
+    }
+    g_settings.custom_textures = !g_settings.custom_textures;
+    apply_settings(1u << MI_TEXTURES);
+    settings_save();
+    printf("window: custom textures %s\n", g_settings.custom_textures ? "on" : "off");
+}
+
 static void open_menu(void) {
     MenuInfo mi = {g_gpu, g_gpu_scale, hires_has_folder()};
     menu_open(&mi);
@@ -699,6 +712,8 @@ static void poll_events(void) {
         case SDL_EVENT_KEY_DOWN:
             if (e.key.key == SDLK_F1 && !e.key.repeat) {
                 open_menu();
+            } else if (e.key.key == SDLK_F5 && !e.key.repeat) {
+                toggle_custom_textures();
             } else if (e.key.key == SDLK_F6 && !e.key.repeat) {
                 ram_search((e.key.mod & SDL_KMOD_SHIFT) != 0, (e.key.mod & SDL_KMOD_CTRL) != 0);
             } else if (e.key.key == SDLK_ESCAPE) {
@@ -948,6 +963,11 @@ static bool present_movie(CPUState* cpu) {
     if (ww <= 0 || wh <= 0) return true;
     update_aspect(false);
     gx_raster_present_pixels(px, w, h, ww, wh, g_aspect);   /* the shape the game shows its own movie at */
+    static long logged = -1000;
+    if (at < logged || at >= logged + 300) {   /* now and then, to check it's shown */
+        logged = at;
+        printf("movie: showing replacement frame %ld (%ux%u) in a %dx%d window\n", at, w, h, ww, wh);
+    }
     if (menu_is_open()) {
         bool dirty;
         const uint32_t* mp = menu_draw(ww, wh, &dirty);
@@ -975,6 +995,13 @@ static void present_black(void) {
 static void present(CPUState* cpu) {
     if (present_movie(cpu))
         return;
+    if (movie_is_open()) {
+        static u64 told;
+        if (g_field > told + 120) {
+            told = g_field;
+            printf("movie: replacement open but not shown (frame %ld)\n", g_movie_at);
+        }
+    }
     if (g_gpu) {
         present_gpu(cpu);
         return;

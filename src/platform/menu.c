@@ -255,7 +255,7 @@ static const char* item_help(int i) {
                         "Higher needs a faster card. Takes effect the next time the game starts.";
     case MI_TEXTURES: return g_info.textures_found
                                  ? "Replacement textures from the custom texture folder (Dolphin's format, "
-                                   ".png or .dds). Turn off and on again to load files added or changed since."
+                                   ".png or .dds). Turn off and on again (or press F5 twice) to load files added or changed since."
                                  : "No custom texture folder was found. Put Dolphin-format texture packs in "
                                    "C:\\nfls2\\textures to use them.";
     default: return "Close this menu and carry on playing.";
