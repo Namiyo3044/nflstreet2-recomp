@@ -26,10 +26,20 @@ static const struct { const char* name; uint32_t bits; } k_names[] = {
     {"SUP", STICK_UP}, {"SDOWN", STICK_DOWN}, {"SLEFT", STICK_LEFT}, {"SRIGHT", STICK_RIGHT},
 };
 
-static PadLive g_live = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
+static PadLive g_lives[PAD_PORTS] = {{0, 0x80, 0x80, 0x80, 0x80, 0, 0}, {0, 0x80, 0x80, 0x80, 0x80, 0, 0},
+                                      {0, 0x80, 0x80, 0x80, 0x80, 0, 0}, {0, 0x80, 0x80, 0x80, 0x80, 0, 0}};
+static bool g_connected[PAD_PORTS] = {true, false, false, false};
 
-void pad_set_live(const PadLive* live) {
-    g_live = *live;
+void pad_set_live(int port, const PadLive* live) {
+    if (port >= 0 && port < PAD_PORTS) g_lives[port] = *live;
+}
+
+void pad_set_connected(int port, bool connected) {
+    if (port >= 0 && port < PAD_PORTS) g_connected[port] = connected;
+}
+
+bool pad_connected(int port) {
+    return port >= 0 && port < PAD_PORTS && g_connected[port];
 }
 
 typedef struct { double at, hold; uint32_t bits; int state; } Press;
@@ -87,9 +97,10 @@ bool pad_add_press(const char* spec) {
     return true;
 }
 
-void pad_poll_response(double t, uint8_t out[8]) {
+void pad_poll_response(int port, double t, uint8_t out[8]) {
     uint32_t held = 0;
-    for (int i = 0; i < g_count; i++) {
+    const PadLive g_live = g_lives[port >= 0 && port < PAD_PORTS ? port : 0];
+    for (int i = 0; i < g_count && port == 0; i++) {
         Press* pr = &g_presses[i];
         bool down = t >= pr->at && t < pr->at + pr->hold;
         if (down)

@@ -4,11 +4,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Controller in port 1. Input comes from the live window (keyboard or a
- * gamepad, see pad_set_live) and/or from a script given on the command line,
- * e.g. --press 5.0:UP --press 5.5:A, which holds the named buttons for a
- * moment at that many seconds of game time. Both are combined.
+/* Controllers in ports 1-4. Input comes from the live window (keyboard and
+ * gamepads, see pad_set_live) and, for port 1, from a script given on the
+ * command line, e.g. --press 5.0:UP --press 5.5:A, which holds the named
+ * buttons for a moment at that many seconds of game time. Both are combined.
  */
+#define PAD_PORTS 4
 
 /* Live controller state, in GameCube terms. */
 typedef struct {
@@ -24,8 +25,12 @@ enum {
     PAD_A = 1u << 8, PAD_B = 1u << 9, PAD_X = 1u << 10, PAD_Y = 1u << 11, PAD_START = 1u << 12,
 };
 
-/* Sets the live state (called by the window once per video field). */
-void pad_set_live(const PadLive* live);
+/* Sets a port's live state (called by the window once per video field). */
+void pad_set_live(int port, const PadLive* live);
+
+/* Whether a controller is plugged into the port (at the start only port 1). */
+void pad_set_connected(int port, bool connected);
+bool pad_connected(int port);
 
 /* Parses "SECONDS:BUTTON[+BUTTON...][@HOLD]" (e.g. "5.5:A", "12:START",
    "8:DOWN+B", "9:A@0.2"). HOLD is how long to hold, in seconds (default one
@@ -34,7 +39,7 @@ bool pad_add_press(const char* spec);
 
 /* The 8-byte standard-controller poll response for the current game time:
    buttons, main stick, C-stick, analog triggers. */
-void pad_poll_response(double game_seconds, uint8_t out[8]);
+void pad_poll_response(int port, double game_seconds, uint8_t out[8]);
 
 /* Button names accepted by --press, for the usage text. */
 const char* pad_button_names(void);

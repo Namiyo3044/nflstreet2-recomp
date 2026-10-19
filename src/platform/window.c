@@ -29,6 +29,10 @@ static SDL_Texture* g_texture;
    player N (the keyboard joins whichever player the settings say). A
    controller unplugged leaves its slot empty, so the others keep theirs. */
 static SDL_Gamepad* g_pads[PAD_PORTS];
+/* A player whose controller was unplugged shows as unplugged in the game
+   (its "controller disconnected" screen), even if the keyboard also plays as
+   that player, until a controller is connected again or a key is pressed. */
+static bool g_lost[PAD_PORTS];
 static SDL_AudioStream* g_audio;
 static u32 g_audio_rate;
 static bool g_quit;
@@ -954,6 +958,7 @@ static void poll_events(void) {
             for (int i = 0; i < PAD_PORTS && !have; i++)
                 if (!g_pads[i]) {
                     g_pads[i] = SDL_OpenGamepad(e.gdevice.which);
+                    g_lost[i] = false;
                     if (g_pads[i])
                         printf("window: controller connected as player %d: %s\n", i + 1, SDL_GetGamepadName(g_pads[i]));
                     have = true;
@@ -966,6 +971,7 @@ static void poll_events(void) {
                 if (g_pads[i] && SDL_GetGamepadID(g_pads[i]) == e.gdevice.which) {
                     SDL_CloseGamepad(g_pads[i]);
                     g_pads[i] = NULL;
+                    g_lost[i] = true;
                     printf("window: player %d's controller disconnected\n", i + 1);
                 }
             update_players_text();
@@ -1019,13 +1025,28 @@ static void read_input(void) {
         freecam_update();
         return;
     }
+    /* Some controllers (Nintendo ones through SDL's own driver) can vanish
+       without a "removed" event: check each one is still there. */
+    bool gone = false;
+    for (int i = 0; i < PAD_PORTS; i++)
+        if (g_pads[i] && !SDL_GamepadConnected(g_pads[i])) {
+            printf("window: player %d's controller disconnected (%s)\n", i + 1, SDL_GetGamepadName(g_pads[i]));
+            SDL_CloseGamepad(g_pads[i]);
+            g_pads[i] = NULL;
+            g_lost[i] = true;
+            gone = true;
+        }
+    if (gone) update_players_text();
     PadLive st[PAD_PORTS];
     bool any_held = false;
     int kb = g_settings.keyboard_player;
     for (int i = 0; i < PAD_PORTS; i++) {
         bool keys = i == kb;
         st[i] = player_state(g_pads[i], keys);
-        pad_set_connected(i, g_pads[i] || keys);
+        if (g_lost[i] && keys && pad_held(&st[i])) g_lost[i] = false;   /* the keyboard takes over */
+        /* Port 1 is plugged in from the start (the game wants a controller
+           there), the others once something plays as them. */
+        pad_set_connected(i, g_pads[i] || (!g_lost[i] && (keys || i == 0)));
         if (pad_held(&st[i])) any_held = true;
     }
     if (g_input_block) {
