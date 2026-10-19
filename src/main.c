@@ -198,8 +198,107 @@ static void text_watch(CPUState* ctx, u32 address) {
     }
 }
 
+/* --cardtrace: logs the memory card side of loading and saving (the CARD
+   library calls, the save code's card-stream reads and writes with a
+   checksum of the bytes moved, and the stream open/close), to find where a
+   save is judged corrupted. */
+static bool g_cardtrace;
+static int g_ct_lines;
+static u32 g_ct_buf, g_ct_len, g_ct_pos;
+static bool g_ct_pending;
+static const char* g_ct_kind;
+
+static u32 ct_crc_msb(CPUState* ctx, u32 buf, u32 len) {
+    u32 c = 0xFFFFFFFFu;
+    for (u32 i = 0; i < len; i++) {
+        c ^= (u32)mem_read8(ctx, buf + i) << 24;
+        for (int k = 0; k < 8; k++) c = (c & 0x80000000u) ? (c << 1) ^ 0x04C11DB7u : c << 1;
+    }
+    return c;
+}
+
+static void ct_flush(CPUState* ctx) {
+    if (!g_ct_pending) return;
+    g_ct_pending = false;
+    char hex[3 * 16 + 1] = "";
+    for (u32 i = 0; i < g_ct_len && i < 16; i++) snprintf(hex + i * 3, 4, "%02X ", mem_read8(ctx, g_ct_buf + i));
+    printf("cardtrace: %7.2f s  stream %s %u bytes at %u: %s crc %08X\n", interrupts_game_seconds(), g_ct_kind, g_ct_len,
+           g_ct_pos, hex, ct_crc_msb(ctx, g_ct_buf, g_ct_len < 0x40000u ? g_ct_len : 0));
+}
+
+static void card_trace(CPUState* ctx, u32 address) {
+    if (g_ct_lines >= 1500) return;
+    if (address == 0x8002410Cu || address == 0x80024040u) {          /* card stream read / write */
+        ct_flush(ctx);
+        u32 posp = mem_read32(ctx, ctx->gpr[3] + 4);
+        g_ct_buf = ctx->gpr[4];
+        g_ct_len = ctx->gpr[5];
+        g_ct_pos = posp ? mem_read32(ctx, posp) : 0;
+        g_ct_kind = address == 0x8002410Cu ? "read" : "write";
+        g_ct_pending = true;
+        g_ct_lines++;
+        if (address == 0x80024040u) ct_flush(ctx);                   /* a write's bytes are there already */
+        return;
+    }
+    if (address == 0x80023E44u || address == 0x80023FD0u) {          /* stream open / close */
+        ct_flush(ctx);
+        u32 rec = ctx->gpr[address == 0x80023E44u ? 5 : 3];
+        if (address == 0x80023FD0u) rec = mem_read32(ctx, ctx->gpr[3] + 8);
+        printf("cardtrace: %7.2f s  stream %s (r3 %08X r4 %08X r5 %08X) record checksum %08X size %u\n",
+               interrupts_game_seconds(), address == 0x80023E44u ? "open" : "close", ctx->gpr[3], ctx->gpr[4],
+               ctx->gpr[5], rec ? mem_read32(ctx, rec) : 0, rec ? mem_read32(ctx, rec + 4) : 0);
+        g_ct_lines++;
+        return;
+    }
+    /* The CARD library's API-level files (not its low-level BIOS, block,
+       directory and read/write internals), when entered through the
+       dispatcher. CARDGetStatus only for file 0, with the status it filled
+       in shown at the next call. */
+    static u32 stat_buf;
+    if (stat_buf && address >= 0x80254CA8u && address < 0x80259B08u && !(ctx->lr >= 0x80252000u && ctx->lr < 0x8025A000u)) {
+        char hex[0x6C * 2 + 1];
+        for (u32 i = 0; i < 0x6C; i++) snprintf(hex + i * 2, 3, "%02X", mem_read8(ctx, stat_buf + i));
+        printf("cardtrace:          status of file 0: %s\n", hex);
+        stat_buf = 0;
+        g_ct_lines++;
+    }
+    if (address >= 0x80254CA8u && address < 0x80259B08u) {
+        static const struct { u32 lo, hi; const char* name; } k_files[] = {
+            {0x80254CA8u, 0x80255C38u, "CARDCheck"}, {0x80255C38u, 0x80256730u, "CARDMount"},
+            {0x80256730u, 0x80256F14u, "CARDFormat"}, {0x80256F14u, 0x802574E8u, "CARDOpen"},
+            {0x802574E8u, 0x80257880u, "CARDCreate"}, {0x80257880u, 0x80257CF4u, "CARDRead"},
+            {0x80257CF4u, 0x80258070u, "CARDWrite"}, {0x80258070u, 0x802583E0u, "CARDDelete"},
+            {0x802583E0u, 0x802588A8u, "CARDStat"}, {0x802588A8u, 0x80259B08u, "CARDUnlock"},
+        };
+        const char* file = NULL;
+        for (size_t i = 0; i < sizeof(k_files) / sizeof(k_files[0]); i++)
+            if (address >= k_files[i].lo && address < k_files[i].hi) { file = k_files[i].name; break; }
+        if (!file || strcmp(file, "CARDUnlock") == 0) return;
+        if (g_have_symbols && symbols_function_start(address) != address) return;
+        if (ctx->lr >= 0x80252000u && ctx->lr < 0x8025A000u) return;   /* calls from the game only, not internal ones */
+        if (address == 0x802585D8u) {                    /* CARDGetStatus */
+            if (ctx->gpr[4] != 0) return;
+            stat_buf = ctx->gpr[5];
+        }
+        ct_flush(ctx);
+        printf("cardtrace: %7.2f s  %s %08X(%08X, %08X, %08X, %08X) from %08X\n", interrupts_game_seconds(), file,
+               address, ctx->gpr[3], ctx->gpr[4], ctx->gpr[5], ctx->gpr[6], ctx->lr);
+        g_ct_lines++;
+        /* A file read (buffer, length, offset): its bytes are shown at the next event. */
+        if (strcmp(file, "CARDRead") == 0 && ctx->gpr[4] >= 0x80000000u && ctx->gpr[5] >= 0x200u &&
+            !(ctx->gpr[5] & 0x1FFu) && ctx->gpr[5] <= 0x100000u) {
+            g_ct_buf = ctx->gpr[4];
+            g_ct_len = ctx->gpr[5];
+            g_ct_pos = ctx->gpr[6];
+            g_ct_kind = "file read";
+            g_ct_pending = true;
+        }
+    }
+}
+
 int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
     g_trace[g_trace_pos++ % TRACE_LEN] = address;
+    if (g_cardtrace) card_trace(ctx, address);
     if (g_text_watch_until > 0) {
         if (interrupts_game_seconds() < g_text_watch_until) text_watch(ctx, address);
         else { g_text_watch_until = 0; printf("textcall: watch ended\n"); }
@@ -555,6 +654,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--settings") == 0 && i + 1 < argc) {
             i++;
+        } else if (strcmp(argv[i], "--cardtrace") == 0) {
+            g_cardtrace = true;
         } else if (strcmp(argv[i], "--software") == 0) {
             gpu_scale = 0;
         } else if (strcmp(argv[i], "--map") == 0 && i + 1 < argc) {

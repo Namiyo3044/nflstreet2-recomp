@@ -356,8 +356,33 @@ typedef struct {
     LightSetup light[8];
     bool lit, chan1, persp;
     u32 ntex;
+    float xs;                          /* horizontal correction of the projection (1 = none) */
 } DrawSetup;
 static DrawSetup g_setup;
+
+/* The screen shape the port shows when it is fixed (1 = 4:3, 2 = 16:9; 0 =
+   follow the game). Full-screen 3D the game still draws for the other shape
+   (for a moment after the setting changes, until the game sets up its next
+   screen) is narrowed or widened to fit, so it never looks stretched. */
+static volatile int g_target_shape;
+
+void gx_raster_set_target_shape(int shape) {
+    g_target_shape = shape;
+}
+
+static float projection_correction(void) {
+    int target = g_target_shape;
+    if (!target || XFR[0x26] != 0)
+        return 1.0f;
+    float p0 = fabsf(gx_f32(XFR[0x20])), p2 = fabsf(gx_f32(XFR[0x22]));
+    float vw = fabsf(gx_f32(XFR[0x1A])) * 2.0f, vh = fabsf(gx_f32(XFR[0x1B])) * 2.0f;
+    if (!(p0 > 1e-6f) || !(p2 > 1e-6f) || vw < 480.0f || vh < 300.0f)
+        return 1.0f;                   /* not a full-screen view (as in note_projection) */
+    float aspect = p2 / p0 * (vh / vw) * (4.0f / 3.0f);
+    if (target == 1 && fabsf(aspect - 16.0f / 9.0f) < 0.15f) return 4.0f / 3.0f;   /* made for 16:9, shown 4:3 */
+    if (target == 2 && fabsf(aspect - 4.0f / 3.0f) < 0.12f) return 3.0f / 4.0f;    /* made for 4:3, shown 16:9 */
+    return 1.0f;
+}
 
 static void draw_setup(void) {
     DrawSetup* d = &g_setup;
@@ -376,6 +401,7 @@ static void draw_setup(void) {
     d->chan1 = (XFR[0x09] & 3u) >= 2u;
     d->persp = XFR[0x26] == 0;
     d->ntex = XFR[0x3F] & 15u;
+    d->xs = projection_correction();
     for (u32 n = 0; n < 8; n++) {
         if (!(mask & (1u << n)))
             continue;
@@ -571,7 +597,7 @@ static void transform(const Vtx* in, SVtx* out) {
             qy = c[4] * ex + c[5] * ey + c[6] * ez + c[7];
             qz = c[8] * ex + c[9] * ey + c[10] * ez + c[11];
         }
-        cx = gx_f32(pr[0]) * qx + gx_f32(pr[1]) * qz;
+        cx = (gx_f32(pr[0]) * qx + gx_f32(pr[1]) * qz) * g_setup.xs;
         cy = gx_f32(pr[2]) * qy + gx_f32(pr[3]) * qz;
         cz = gx_f32(pr[4]) * qz + gx_f32(pr[5]);
         cw = -qz;

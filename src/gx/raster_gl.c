@@ -324,8 +324,29 @@ void glr_texture_freed(const u32* texels) {
     g_tex_tombs++;
 }
 
-static GLuint stage_texture(const Stage* s) {
+/* Custom textures can be big (a few MB each), and many show up at once when
+   a new scene starts; uploading them all in one frame stalls it. So each
+   frame uploads only so many bytes of them; the rest draw with the game's
+   own texture for a frame or two until their turn. */
+#define HIRES_UPLOAD_BUDGET (24u << 20)
+static size_t g_hires_budget_used;
+static unsigned long long g_hires_deferred;
+
+static GLuint stage_texture(const Stage* s, bool* used_hires) {
     const GxHires* hi = s->hires;
+    if (hi) {
+        size_t bytes = (size_t)(hi->off[hi->levels - 1] + hi->lw[hi->levels - 1] * hi->lh[hi->levels - 1]) * 4u;
+        TexSlot* have = tex_find(hi->texels, false);
+        if (!(have && have->tex)) {
+            if (g_hires_budget_used && g_hires_budget_used + bytes > HIRES_UPLOAD_BUDGET) {
+                hi = NULL;             /* next frame */
+                g_hires_deferred++;
+            } else {
+                g_hires_budget_used += bytes;
+            }
+        }
+    }
+    *used_hires = hi != NULL;
     TexSlot* slot = tex_find(hi ? hi->texels : s->texels, true);
     if (!slot) return 0;
     if (slot->tex) return slot->tex;
@@ -370,12 +391,12 @@ static GLint wrap_mode(u32 w) {
     return w == 0 ? GL_CLAMP_TO_EDGE : w == 2 ? GL_MIRRORED_REPEAT : GL_REPEAT;
 }
 
-static void set_sampler(int unit, const Stage* s) {
+static void set_sampler(int unit, const Stage* s, bool hires) {
     static const GLint k_min[8] = {GL_NEAREST, GL_LINEAR, GL_NEAREST_MIPMAP_NEAREST, GL_LINEAR_MIPMAP_NEAREST,
                                    GL_NEAREST_MIPMAP_LINEAR, GL_LINEAR_MIPMAP_LINEAR, GL_LINEAR, GL_LINEAR};
     SamplerState n = {k_min[s->min_filter & 7], s->mag_linear ? GL_LINEAR : GL_NEAREST, wrap_mode(s->wrap_s),
                       wrap_mode(s->wrap_t), s->lod_bias, s->min_lod, s->max_lod, true};
-    if (s->hires && (s->hires->levels > 1 || s->levels > 1)) {
+    if (hires && (s->hires->levels > 1 || s->levels > 1)) {
         n.maxl = 1000.0f;              /* a custom texture has more levels than the game's (as Dolphin does) */
     } else if (s->levels <= 1) {       /* no mipmaps: plain nearest / linear */
         n.min = (n.min == GL_NEAREST || n.min == GL_NEAREST_MIPMAP_NEAREST || n.min == GL_NEAREST_MIPMAP_LINEAR)
@@ -696,9 +717,10 @@ static void apply_state(const RenderState* ds) {
             continue;
         G(glActiveTexture)(GL_TEXTURE0 + n);     /* before any upload, which binds on the active unit */
         GLuint t = s->efb_copy ? tex_copy_texture(s->efb_copy) : 0;
-        if (!t) t = stage_texture(s);
+        bool hires = false;
+        if (!t) t = stage_texture(s, &hires);
         G(glBindTexture)(GL_TEXTURE_2D, t);
-        set_sampler((int)n, s);
+        set_sampler((int)n, s, hires);
     }
 }
 
@@ -795,6 +817,7 @@ void glr_run_list(const CmdList* l) {
         return;
     if (g_make_current) g_make_current();
     delete_dead_textures();
+    g_hires_budget_used = 0;
     if (!l->n)
         return;
     g_lists++;
@@ -1140,6 +1163,17 @@ void glr_present_overlay(const u32* px, int w, int h, bool dirty) {
     G(glDisable)(GL_BLEND);
 }
 
+void glr_present_black(int w, int h) {
+    if (!g_pready || w <= 0 || h <= 0)
+        return;
+    G(glBindFramebuffer)(GL_FRAMEBUFFER, g_present_fbo);
+    G(glViewport)(0, 0, w, h);
+    G(glDisable)(GL_SCISSOR_TEST);
+    G(glColorMask)(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    G(glClearColor)(0.0f, 0.0f, 0.0f, 1.0f);
+    G(glClear)(GL_COLOR_BUFFER_BIT);
+}
+
 void glr_report(void) {
     if (!g_ready)
         return;
@@ -1147,5 +1181,6 @@ void glr_report(void) {
            "read-backs, %llu TV-buffer copies kept on the GPU, %llu texture copies made on the GPU\n",
            g_lists, g_draw_calls, g_uploads, g_tex_n, g_readbacks, g_xfb_gpu_copies, g_tex_copies_gpu);
     if (g_hires_uploads)
-        printf("gpu: %llu custom textures uploaded\n", g_hires_uploads);
+        printf("gpu: %llu custom textures uploaded (%llu draws waited a frame for theirs)\n", g_hires_uploads,
+               g_hires_deferred);
 }

@@ -97,6 +97,11 @@ void gx_raster_xf_write(u32 addr, const u32* values, u32 n);
    positions of 3D draws before projection (on = false: the game's camera). */
 void gx_raster_set_free_camera(bool on, const float m[12]);
 
+/* The screen shape the window shows when fixed (1 = 4:3, 2 = 16:9, 0 =
+   following the game): full-screen 3D drawn for the other shape is corrected
+   to fit. */
+void gx_raster_set_target_shape(int shape);
+
 void gx_raster_report(void);
 
 #endif

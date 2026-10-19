@@ -74,6 +74,9 @@ void glr_present(const GlrPicture* pic, unsigned target_fbo, int win_w, int win_
    alpha, top row first) over it; dirty = it changed since the last call. */
 void glr_present_overlay(const u32* px, int w, int h, bool dirty);
 
+/* A plain black window (on the window's thread, instead of glr_present). */
+void glr_present_black(int w, int h);
+
 /* Tests: glr_present draws into this frame buffer when given target 0. */
 void glr_set_present_fbo(unsigned fbo);
 

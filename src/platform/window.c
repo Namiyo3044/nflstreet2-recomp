@@ -53,8 +53,15 @@ static u32 g_frames_at_stat;
 static bool g_turbo_forced, g_turbo_key;
 
 void window_set_turbo(bool on) {
-    if (on != g_turbo_forced)
-        printf("window: fast-forward %s\n", on ? "on (skipping the THX intro)" : "off");
+    static Uint64 since;
+    if (on != g_turbo_forced) {
+        if (on) {
+            since = SDL_GetTicksNS();
+            printf("window: fast-forward on (skipping the THX intro)\n");
+        } else {
+            printf("startup: THX intro skipped in %.1f s\n", (double)(SDL_GetTicksNS() - since) * 1e-9);
+        }
+    }
     g_turbo_forced = on;
 }
 
@@ -81,6 +88,13 @@ static void audio_sink(const u8* samples, u32 frames, u32 rate) {
        queued (the game ran ahead), drop the buffer to stay in sync. */
     int bytes_per_ms = (int)(rate * 4u / 1000u);
     int queued = SDL_GetAudioStreamQueued(g_audio);
+    /* The cushion: 50 ms, raised to 120 ms for a while after the sound ran
+       dry (a loading screen or a scene change stalling the game), so the
+       stalls that tend to come in groups don't each make a gap. */
+    static int cushion_ms = 50;
+    static Uint64 raised_at;
+    if (cushion_ms > 50 && SDL_GetTicksNS() - raised_at > 20000000000ull)
+        cushion_ms = 50;
     g_audio_sec_buffers++;
     if (queued < g_audio_sec_min_queue) g_audio_sec_min_queue = queued;
     if (queued > bytes_per_ms * 200) {
@@ -93,7 +107,7 @@ static void audio_sink(const u8* samples, u32 frames, u32 rate) {
        drop), and back at normal speed once it refills. */
     {
         static float ratio = 1.0f;
-        float fill = (float)queued / (float)(bytes_per_ms * 50);      /* 1 = at the 50 ms target */
+        float fill = (float)queued / (float)(bytes_per_ms * cushion_ms);  /* 1 = at the target */
         float want = fill >= 1.0f ? 1.0f : 0.95f + 0.05f * fill;
         ratio += (want - ratio) * 0.05f;                                  /* glide, no sudden pitch jumps */
         SDL_SetAudioStreamFrequencyRatio(g_audio, ratio);
@@ -106,7 +120,9 @@ static void audio_sink(const u8* samples, u32 frames, u32 rate) {
     const u32 fade = rate / 333u;      /* about 3 ms */
     if (queued < bytes_per_ms * 4) {
         s16 sil[2 * 800];
-        int want = (bytes_per_ms * 50 - queued) / 4;   /* frames */
+        cushion_ms = 120;
+        raised_at = SDL_GetTicksNS();
+        int want = (bytes_per_ms * cushion_ms - queued) / 4;   /* frames */
         u32 done = 0;
         while (want > 0) {
             int n = want > 800 ? 800 : want;
@@ -363,7 +379,7 @@ bool window_quit_requested(void) {
 }
 
 void window_close(void) {
-    printf("window: sound card ran dry %u times (each refilled with 50 ms of silence)\n", g_audio_underruns);
+    printf("window: sound card ran dry %u times\n", g_audio_underruns);
     mmio_set_audio_sink(NULL);
     if (g_audio) SDL_DestroyAudioStream(g_audio);
     g_audio = NULL;
@@ -833,6 +849,21 @@ static void present_gpu(CPUState* cpu) {
     SDL_GL_SwapWindow(g_window);
 }
 
+/* A black window: shown while the THX intro is skipped, so the cut from one
+   intro movie to the next looks like one instead of a frozen picture. */
+static void present_black(void) {
+    if (g_gpu) {
+        int ww = 0, wh = 0;
+        SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
+        glr_present_black(ww, wh);
+        SDL_GL_SwapWindow(g_window);
+        return;
+    }
+    SDL_SetRenderDrawColor(g_renderer, 0, 0, 0, 255);
+    SDL_RenderClear(g_renderer);
+    SDL_RenderPresent(g_renderer);
+}
+
 static void present(CPUState* cpu) {
     if (g_gpu) {
         present_gpu(cpu);
@@ -899,8 +930,24 @@ static void present(CPUState* cpu) {
     SDL_RenderPresent(g_renderer);
 }
 
+/* A field that took much longer than its 16.7 ms (the game stalled: a
+   loading screen, a scene change) is logged with where the time went. */
+static Uint64 g_hitch_last;           /* 0: start measuring afresh (after the menu) */
+
+static void log_hitch(Uint64 now) {
+    static Uint64 last_present;
+    Uint64 took = g_hitch_last ? now - g_hitch_last : 0;
+    Uint64 shown = g_present_ns >= last_present ? g_present_ns - last_present : g_present_ns;
+    g_hitch_last = now;
+    last_present = g_present_ns;
+    if (took > 50000000ull && !turbo() && g_field > 120)
+        printf("hitch: %5.1f s game time, one field took %3.0f ms (showing the picture %2.0f ms)\n",
+               interrupts_game_seconds(), (double)took * 1e-6, (double)shown * 1e-6);
+}
+
 static void pace_and_stats(void) {
     Uint64 now = SDL_GetTicksNS();
+    log_hitch(now);
     double target = (double)g_base_ns + (double)(g_field - g_base_field) * FIELD_NS;
     if (turbo()) {
         /* Fast-forward: run flat out, and restart the clock so normal speed
@@ -984,6 +1031,7 @@ static void menu_loop(CPUState* cpu) {
     g_stat_fields = 0;
     g_frames_at_stat = gx_raster_frames();
     g_slept_ns = g_present_ns = 0;
+    g_hitch_last = 0;
     printf("window: video menu closed\n");
 }
 
@@ -1002,9 +1050,13 @@ void window_field(CPUState* cpu) {
     Uint64 t0 = SDL_GetTicksNS();
     int prev = prof_enter(PROF_PRESENT);
     /* Fast-forward: show one field in eight; while skipping the THX intro,
-       nothing at all (the last picture stays up). */
-    if (!turbo() || (!g_turbo_forced && (g_field & 7u) == 0))
+       a black window. */
+    if (g_turbo_forced) {
+        if ((g_field & 7u) == 0)
+            present_black();
+    } else if (!turbo() || (g_field & 7u) == 0) {
         present(cpu);
+    }
     prof_leave(prev);
     g_present_ns += SDL_GetTicksNS() - t0;
     pace_and_stats();

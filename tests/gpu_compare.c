@@ -532,6 +532,7 @@ int main(int argc, char** argv) {
         float m[12] = {c, 0, -sn, -(c * tx - sn * tz), 0, 1, 0, -ty, sn, 0, c, -(sn * tx + c * tz)};
         gx_raster_set_free_camera(true, m);
     }
+    if (getenv("TARGET")) gx_raster_set_target_shape(atoi(getenv("TARGET")));   /* tests: shape correction */
     if (getenv("HIRES")) hires_init(getenv("HIRES"));            /* tests: custom textures */
     if (getenv("HIRES_DUMP")) hires_set_dump_dir(getenv("HIRES_DUMP"));
     for (size_t i = 0; i < sizeof(k_scenes) / sizeof(k_scenes[0]); i++)
