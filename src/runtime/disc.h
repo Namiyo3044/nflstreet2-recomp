@@ -12,6 +12,15 @@
  */
 bool disc_open(const char* disc_dir);
 
+/* Before disc_open: a folder of replacement files, laid out like files\
+   (e.g. DIR\moviedat.dat); each is read instead of the disc's, whatever its
+   size. */
+void disc_set_replace_dir(const char* dir);
+const char* disc_replace_dir(void);    /* "" if none */
+
+/* The PC file a disc file (by name, any case) is read from, or NULL. */
+const char* disc_host_path(const char* name);
+
 /* Reads len bytes at disc offset into dst. Gaps between files read as zero.
    Returns false if any part fell outside the known disc contents. */
 bool disc_read(uint64_t offset, void* dst, size_t len);

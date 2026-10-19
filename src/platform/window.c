@@ -9,6 +9,8 @@
 #include "platform/menu.h"
 #include "gx/hires.h"
 #include "gx/texture.h"
+#include "platform/movie.h"
+#include "runtime/disc.h"
 
 #include <SDL3/SDL.h>
 
@@ -120,8 +122,10 @@ static void audio_sink(const u8* samples, u32 frames, u32 rate) {
     const u32 fade = rate / 333u;      /* about 3 ms */
     if (queued < bytes_per_ms * 4) {
         s16 sil[2 * 800];
-        cushion_ms = 120;
-        raised_at = SDL_GetTicksNS();
+        if (g_field > 600) {           /* not for the start-up gap */
+            cushion_ms = 120;
+            raised_at = SDL_GetTicksNS();
+        }
         int want = (bytes_per_ms * cushion_ms - queued) / 4;   /* frames */
         u32 done = 0;
         while (want > 0) {
@@ -849,6 +853,110 @@ static void present_gpu(CPUState* cpu) {
     SDL_GL_SwapWindow(g_window);
 }
 
+/* --------------------------------------------------- replacement movies --- */
+/* Which frame the game's own movie is at. The game's player writes its
+   frames straight into the TV picture in RAM, in step with the TV, so: the
+   first change of that
+   picture is the movie's first visible frame, and from there the frame
+   number follows the game's clock: one frame every two fields (29.97 a
+   second; the NFL Street 2 intro's 2,132 visible frames take 71.2 s). */
+static long g_movie_at = -1;
+static u64 g_movie_last_hash;
+static double g_movie_t_first;
+static long g_movie_first;
+static bool g_movie_have_base;
+
+static u64 xfb_hash(CPUState* cpu) {
+    static u32 px[720 * 576];
+    u32 w = 0, h = 0;
+    if (!gx_raster_xfb_rgb(cpu, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2), mmio_reg(0x2000, 2), px, 720, 576, &w, &h))
+        return 0;
+    u64 v = 1469598103934665603ull;
+    for (u32 i = 0; i < w * h; i += 7) v = (v ^ px[i]) * 1099511628211ull;
+    return v;
+}
+
+/* How far behind the picture the sound is heard: what's queued for the sound
+   card, plus the card's own buffer (about 20 ms). */
+static double audio_delay(void) {
+    if (!g_audio || !g_audio_rate) return 0.0;
+    return (double)SDL_GetAudioStreamQueued(g_audio) / (g_audio_rate * 4.0) + 0.02;
+}
+
+static void movie_track(CPUState* cpu) {
+    double now = interrupts_game_seconds();
+    if (g_movie_at >= 0) {
+        /* The game's picture is shown at once but its sound is heard a
+           little later; show the replacement frame that goes with what's
+           being heard. */
+        now -= audio_delay();
+        long at = g_movie_first + (long)((now - g_movie_t_first) * (30000.0 / 1001.0) + 0.25);
+        g_movie_at = at > g_movie_first ? at : g_movie_first;
+        return;
+    }
+    u64 hsh = xfb_hash(cpu);
+    if (!g_movie_have_base) {          /* the picture before the movie's first frame */
+        g_movie_last_hash = hsh;
+        g_movie_have_base = true;
+        return;
+    }
+    if (hsh != g_movie_last_hash) {
+        g_movie_first = movie_first_visible();
+        g_movie_t_first = now;
+        g_movie_at = g_movie_first;
+    }
+}
+
+void window_movie_begin(int index) {
+    const char* dir = disc_replace_dir();
+    if (!dir || !*dir) return;
+    char path[1200];
+    snprintf(path, sizeof(path), "%s/moviedat_%d.mpg", dir, index);
+    FILE* f = fopen(path, "rb");
+    if (!f) { movie_close(); return; }
+    fclose(f);
+    if (movie_open(path)) {
+        g_movie_at = -1;
+        g_movie_have_base = false;
+    }
+}
+
+void window_movie_end(void) {
+    if (movie_is_open())
+        printf("movie: ended at frame %ld, %.2f s after its first visible frame\n", g_movie_at,
+               g_movie_at >= 0 ? interrupts_game_seconds() - g_movie_t_first : 0.0);
+    movie_close();
+}
+
+/* The replacement movie's frame instead of the game's picture; false when
+   there's none (or it has run out). */
+static bool present_movie(CPUState* cpu) {
+    if (!movie_is_open() || !g_gpu)
+        return false;
+    movie_track(cpu);
+    long at = g_movie_at;
+    if (at < 0)
+        return false;
+    u32 w, h;
+    const u32* px = movie_frame(at, &w, &h);
+    if (!px) {
+        movie_close();
+        return false;
+    }
+    int ww = 0, wh = 0;
+    SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return true;
+    update_aspect(false);
+    gx_raster_present_pixels(px, w, h, ww, wh, g_aspect);   /* the shape the game shows its own movie at */
+    if (menu_is_open()) {
+        bool dirty;
+        const uint32_t* mp = menu_draw(ww, wh, &dirty);
+        glr_present_overlay(mp, ww, wh, dirty);
+    }
+    SDL_GL_SwapWindow(g_window);
+    return true;
+}
+
 /* A black window: shown while the THX intro is skipped, so the cut from one
    intro movie to the next looks like one instead of a frozen picture. */
 static void present_black(void) {
@@ -865,6 +973,8 @@ static void present_black(void) {
 }
 
 static void present(CPUState* cpu) {
+    if (present_movie(cpu))
+        return;
     if (g_gpu) {
         present_gpu(cpu);
         return;

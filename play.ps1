@@ -8,6 +8,7 @@
 #   .\play.ps1 -Software       (the old CPU renderer instead of the graphics card)
 #   .\play.ps1 -Textures D:\pack (custom textures in Dolphin's format, .png or .dds; default C:\nfls2\textures, used if it exists)
 #   .\play.ps1 -NoTextures     (the game's own textures only)
+#   .\play.ps1 -Replace D:\dir (files there are read instead of the disc's, e.g. moviedat.dat; default C:\nfls2\replace, used if it exists)
 #   .\play.ps1 -DumpTextures   (save every texture the game uses to C:\nfls2\dump\textures, with Dolphin's names)
 #   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
@@ -34,6 +35,7 @@ param(
     [switch]$NoMemCard,
     [switch]$NoText,
     [string]$Textures = "C:\nfls2\textures",
+    [string]$Replace = "C:\nfls2\replace",
     [switch]$NoTextures,
     [switch]$DumpTextures,
     [switch]$CardTrace,
@@ -99,6 +101,7 @@ elseif ($GPU) { $gameArgs += @("--gpu") }
 if ($Debug) { $gameArgs += @("--debug") }
 if ($CardTrace) { $gameArgs += @("--cardtrace") }
 if (-not $NoTextures -and (Test-Path $Textures)) { $gameArgs += @("--textures", $Textures) }
+if (Test-Path $Replace) { $gameArgs += @("--replace", $Replace) }
 if ($DumpTextures) {
     New-Item -ItemType Directory -Force -Path "C:\nfls2\dump\textures" | Out-Null
     $gameArgs += @("--dump-textures", "C:\nfls2\dump\textures")
@@ -115,9 +118,9 @@ $log = Get-Content play.txt
 $start = ($log | Select-String -Pattern "^=== stopped" | Select-Object -Last 1).LineNumber
 if ($start) { $report = $log[($start - 1)..($log.Count - 1)] } else { $report = $log | Select-Object -Last 80 }
 # Slow stretches (the window logs a perf line each second the game runs below full speed).
-$perf = @($log | Select-String -Pattern "^perf:|^audio:" | ForEach-Object { $_.Line })
+$perf = @($log | Select-String -Pattern "^perf:|^audio:|^hitch:" | ForEach-Object { $_.Line })
 $gpuLines = @($log | Select-String -Pattern "^gpu:|^custom textures:" | ForEach-Object { $_.Line })
-$startup = @($log | Select-String -Pattern "^startup:" | ForEach-Object { $_.Line })
+$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:" | ForEach-Object { $_.Line })
 $cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
 $txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })
 $ct = @($log | Select-String -Pattern "^cardtrace:" | ForEach-Object { $_.Line })
@@ -126,7 +129,7 @@ $rs = @($log | Select-String -Pattern "^ramsearch:" | ForEach-Object { $_.Line }
 if ($rs.Count -gt 0) { $report = @("memory search ($($rs.Count) lines):") + ($rs | Select-Object -Last 150) + $report }
 if ($txt.Count -gt 0) { $report = @("text search ($($txt.Count) lines):") + ($txt | Select-Object -Last 500) + $report }
 if ($cbl.Count -gt 0) { $report = @("sound callback list ($($cbl.Count) lines, last 40):") + ($cbl | Select-Object -Last 40) + $report }
-if ($perf.Count -gt 0) { $report = @("slow seconds: $($perf.Count) (last 20 shown)") + ($perf | Select-Object -Last 20) + $report }
+if ($perf.Count -gt 0) { $report = @("slow seconds and hitches: $($perf.Count) lines (last 40 shown)") + ($perf | Select-Object -Last 40) + $report }
 if ($startup.Count -gt 0) { $report = $startup + $report }
 if ($gpuLines.Count -gt 0) { $report = ($gpuLines | Select-Object -First 30) + $report }
 $report -join "`r`n" | Set-Clipboard

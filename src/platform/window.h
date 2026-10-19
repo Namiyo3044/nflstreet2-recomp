@@ -49,4 +49,11 @@ bool window_take_text_search(void);
 
 void window_close(void);
 
+/* Replacement movies: the game started playing movie index (its place in
+   MOVIEDAT.DAT), or stopped. Shows replace\moviedat_<index>.mpg meanwhile,
+   if there is one. */
+void window_movie_begin(int index);
+void window_movie_end(void);
+void window_movie_frame(void);         /* the game decoded its next movie frame */
+
 #endif

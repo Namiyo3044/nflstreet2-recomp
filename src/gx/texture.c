@@ -352,6 +352,12 @@ static void retire(u32* data) {
     g_garbage[g_garbage_n++] = data;
 }
 
+static void (*g_decode_hook)(u32 w, u32 h, u32 fmt);
+
+void gx_tex_set_decode_hook(void (*hook)(u32 w, u32 h, u32 fmt)) {
+    g_decode_hook = hook;
+}
+
 static void (*g_free_hook)(const u32* texels);
 
 void gx_tex_set_free_hook(void (*hook)(const u32* texels)) {
@@ -722,6 +728,7 @@ static const GxTexture* tex_get(CPUState* cpu, u32 map) {
         e->full_hash = !preloaded && size > 16384u ? hash_bytes(src, size) : 0;
         e->tlut_hash = tsh;
         g_decodes++;
+        if (g_decode_hook) g_decode_hook(w, h, fmt);
         attach_hires(e, src, preloaded, even, mode0);
         return &e->tex;
     }
@@ -763,6 +770,7 @@ new_entry:
     e->tex.texels = e->data;
     last_hit[map & 7u] = slot;
     g_decodes++;
+    if (g_decode_hook) g_decode_hook(w, h, fmt);
     attach_hires(e, src, preloaded, even, mode0);
     return &e->tex;
 #undef SRC

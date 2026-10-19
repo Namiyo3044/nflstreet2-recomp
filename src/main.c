@@ -60,7 +60,36 @@ static u32* g_calls;
 static unsigned long long g_idle_skips, g_idle_ticks;
 
 /* File-open calls (path in r3) logged with the game time. */
-static u32 g_dvd_open, g_dvd_path;
+static u32 g_dvd_open, g_dvd_path, g_dvd_read, g_dvd_close;
+
+#ifdef NFLS2_HAVE_WINDOW
+/* Replacement movies: which part of MOVIEDAT.DAT the game is reading tells
+   which movie it is playing (the file's own directory gives each movie's
+   place); closing the file ends it. */
+static u32 g_movie_fi;                 /* the game's DVDFileInfo for MOVIEDAT.DAT */
+static int g_movie_count = -1;         /* -1: directory not read yet */
+static u32 g_movie_off[16], g_movie_len[16];
+static int g_movie_cur = -1;
+
+static u32 rd_be32(const u8* p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
+
+static void movie_read_directory(void) {
+    g_movie_count = 0;
+    const char* path = disc_host_path("moviedat.dat");
+    FILE* f = path ? fopen(path, "rb") : NULL;
+    if (!f) return;
+    u8 h[0xC0];
+    if (fread(h, 1, sizeof(h), f) == sizeof(h) && memcmp(h, "TERF", 4) == 0 && memcmp(h + 0x40, "DIR1", 4) == 0) {
+        u32 n = ((u32)h[0x0E] << 8) | h[0x0F];
+        for (u32 i = 0; i < n && i < 16 && 0x48 + 8 * i + 8 <= 0x80; i++) {
+            g_movie_off[i] = 0x80u + rd_be32(h + 0x48 + 8 * i);
+            g_movie_len[i] = rd_be32(h + 0x4C + 8 * i);
+            g_movie_count = (int)i + 1;
+        }
+    }
+    fclose(f);
+}
+#endif
 static u32 g_open_lines;
 static bool g_skip_intros;             /* --skip-thx: fast-forward through the THX intro movie */
 static u32 g_movie_opens;
@@ -361,6 +390,8 @@ int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
            in turn (EA SPORTS BIG, THX, NFL Street 2). Fast-forward, unseen
            and unheard, from the second open to the third. */
         if (address == g_dvd_open && (strstr(path, "MOVIEDAT") || strstr(path, "moviedat"))) {
+            g_movie_fi = ctx->gpr[4];
+            if (g_movie_count < 0) movie_read_directory();
             g_movie_opens++;
             if (g_skip_intros && g_movie_opens == 2) window_set_turbo(true);
             if (g_movie_opens == 3) {
@@ -371,6 +402,27 @@ int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
         }
 #endif
     }
+
+#ifdef NFLS2_HAVE_WINDOW
+    if (g_movie_fi && address && address == g_dvd_read && ctx->gpr[3] == g_movie_fi) {
+        u32 off = ctx->gpr[6];
+        for (int i = 0; i < g_movie_count; i++)
+            if (off >= g_movie_off[i] && off < g_movie_off[i] + g_movie_len[i]) {
+                if (i != g_movie_cur) {
+                    g_movie_cur = i;
+                    window_movie_begin(i);
+                }
+                break;
+            }
+    }
+    if (address == 0x801D9E40u && g_movie_cur >= 0)   /* the game's movie player decoding a frame */
+        window_movie_frame();
+    if (g_movie_fi && address && address == g_dvd_close && ctx->gpr[3] == g_movie_fi) {
+        g_movie_fi = 0;
+        g_movie_cur = -1;
+        window_movie_end();
+    }
+#endif
 
     if (g_tracing && g_have_symbols && symbols_function_start(address) == address) {
         const char* name = symbols_lookup(address, NULL);
@@ -610,6 +662,7 @@ static void usage(const char* argv0) {
             "         [--draw-log-at SECONDS (write two frames of draw calls and GPU state to drawlog.txt)]\n"
             "         [--window (play in a window at real-time speed)] [--scale N (window size, default 2)]\n"
             "         [--skip-thx (window: skip the THX intro movie)]\n"
+            "         [--replace DIR (files there are read instead of the disc's, e.g. DIR/moviedat.dat)]\n"
             "         [--memcard FILE (memory card image in slot A; created if missing)]\n"
             "         [--text FILE (game text replacements, default text-replacements.txt) | --no-text]\n"
             "         [--aspect auto|4:3|16:9 (screen shape; auto follows the game's widescreen option)]\n"
@@ -712,6 +765,8 @@ int main(int argc, char** argv) {
             xfb_every = (u32)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--stop-at") == 0 && i + 1 < argc) {
             stop_at = strtod(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--replace") == 0 && i + 1 < argc) {
+            disc_set_replace_dir(argv[++i]);
         } else if (strcmp(argv[i], "--textures") == 0 && i + 1 < argc) {
             textures_dir = argv[++i];
         } else if (strcmp(argv[i], "--dump-textures") == 0 && i + 1 < argc) {
@@ -744,6 +799,8 @@ int main(int argc, char** argv) {
     if (g_have_symbols) {
         g_dvd_open = symbols_address("DVDOpen");
         g_dvd_path = symbols_address("DVDConvertPathToEntrynum");
+        g_dvd_read = symbols_address("DVDReadAsyncPrio");
+        g_dvd_close = symbols_address("DVDClose");
     }
     if (textures_dir) {
         if (gpu_scale) {

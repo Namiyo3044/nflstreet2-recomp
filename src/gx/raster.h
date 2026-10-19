@@ -104,4 +104,8 @@ void gx_raster_set_target_shape(int shape);
 
 void gx_raster_report(void);
 
+/* Shows a w x h picture (0xAARRGGBB) instead of the TV picture (GPU mode,
+   window thread). */
+void gx_raster_present_pixels(const u32* px, u32 w, u32 h, int win_w, int win_h, float aspect);
+
 #endif

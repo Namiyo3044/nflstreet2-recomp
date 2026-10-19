@@ -21,6 +21,15 @@ static size_t g_count, g_cap;
 static uint8_t* g_fst;
 static size_t g_fst_size;
 static unsigned long long g_reads, g_bytes, g_misses;
+static char g_replace_dir[1024];
+
+void disc_set_replace_dir(const char* dir) {
+    snprintf(g_replace_dir, sizeof(g_replace_dir), "%s", dir ? dir : "");
+}
+
+static void put_be32(uint8_t* p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
 
 /* A few open file handles, so streaming reads don't reopen files each time. */
 #define HANDLE_CACHE 16
@@ -131,6 +140,13 @@ bool disc_open(const char* disc_dir) {
     size_t names_size = g_fst_size - (size_t)n * 12;
 
     char* files_root = join(disc_dir, "files");
+    size_t root_len = strlen(files_root);
+    /* Replacement files (--replace): a file at the same path under that
+       folder is read instead of the disc's. One bigger than the original
+       is moved past the end of the disc, and the file table the game sees
+       is changed to match. */
+    struct { uint32_t entry; char* path; uint64_t size; } moved[64];
+    int n_moved = 0;
     struct { uint32_t end; char* path; } stack[64];
     int depth = 0;
     stack[0].end = n;
@@ -155,12 +171,50 @@ bool disc_open(const char* disc_dir) {
                 free(path);
             }
         } else {                              /* file: word 1 = disc offset, word 2 = length */
+            if (g_replace_dir[0]) {
+                char* alt = join(g_replace_dir, path + root_len + 1);
+                long long sz = file_size(alt);
+                if (sz > 0 && sz < 0xFFFFFFFFll) {
+                    uint8_t* we = g_fst + (size_t)i * 12;
+                    printf("disc: replacement %s (%lld bytes; the disc's is %u)\n", alt, sz, be32(e + 8));
+                    free(path);
+                    path = alt;
+                    if ((uint64_t)sz <= be32(e + 8)) {
+                        put_be32(we + 8, (uint32_t)sz);
+                    } else if (n_moved < 64) {
+                        moved[n_moved].entry = i;
+                        moved[n_moved].path = path;
+                        moved[n_moved].size = (uint64_t)sz;
+                        n_moved++;
+                        continue;
+                    }
+                } else {
+                    free(alt);
+                }
+            }
             add_range(be32(e + 4), be32(e + 8), path);
         }
     }
     while (depth > 0)
         free(stack[depth--].path);
     free(files_root);
+    if (n_moved) {
+        uint64_t end = 0;
+        for (size_t k = 0; k < g_count; k++)
+            if (g_ranges[k].offset + g_ranges[k].length > end) end = g_ranges[k].offset + g_ranges[k].length;
+        for (int k = 0; k < n_moved; k++) {
+            end = (end + 0x7FFFu) & ~(uint64_t)0x7FFFu;
+            if (end + moved[k].size > 0xFFFFFFFFull) {
+                fprintf(stderr, "disc: no room for %s\n", moved[k].path);
+                continue;
+            }
+            uint8_t* we = g_fst + (size_t)moved[k].entry * 12;
+            put_be32(we + 4, (uint32_t)end);
+            put_be32(we + 8, (uint32_t)moved[k].size);
+            add_range(end, moved[k].size, moved[k].path);
+            end += moved[k].size;
+        }
+    }
 
     qsort(g_ranges, g_count, sizeof(Range), cmp_range);
     printf("disc: %zu files mapped from %s\n", g_count, disc_dir);
@@ -254,6 +308,25 @@ void disc_report_files(void) {
             printf("  %-40s %6llu %8llu  %7.2f %7.2f\n", name, r->reads, r->bytes / 1024, r->first, r->last);
         }
     }
+}
+
+const char* disc_replace_dir(void) {
+    return g_replace_dir;
+}
+
+const char* disc_host_path(const char* name) {
+    size_t n = strlen(name);
+    for (size_t i = 0; i < g_count; i++) {
+        const char* p = g_ranges[i].path;
+        size_t l = strlen(p);
+        if (l < n + 1 || (p[l - n - 1] != '/' && p[l - n - 1] != '\\'))
+            continue;
+        size_t k = 0;
+        while (k < n && (p[l - n + k] | 0x20) == (name[k] | 0x20)) k++;
+        if (k == n)
+            return p;
+    }
+    return NULL;
 }
 
 const char* disc_file_at(uint64_t offset, uint64_t* file_offset) {

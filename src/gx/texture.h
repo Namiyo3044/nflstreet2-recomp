@@ -60,6 +60,10 @@ void gx_tex_collect_garbage(void);
    drops its copy). */
 void gx_tex_set_free_hook(void (*hook)(const u32* texels));
 
+/* Called whenever a texture from RAM is decoded (new, or its contents
+   changed): its size and format. */
+void gx_tex_set_decode_hook(void (*hook)(u32 w, u32 h, u32 fmt));
+
 /* Prints cache statistics. */
 void gx_tex_report(void);
 
