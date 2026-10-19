@@ -263,14 +263,14 @@ typedef struct {
     u32* data;
 } CacheEntry;
 
-#define CACHE_MAX 2048
+#define CACHE_MAX 4096
 static CacheEntry g_cache[CACHE_MAX];
 static u32 g_cache_count;
 static u32 g_frame = 1;
 
 /* Index from a texture's key to its cache entry (open addressing). Rebuilt
    whenever an entry is created or replaced. */
-#define INDEX_SIZE 4096u
+#define INDEX_SIZE 8192u
 static int g_index[INDEX_SIZE];
 static bool g_index_ready;
 
@@ -424,6 +424,7 @@ void gx_tex_reload_hires(void) {
         e->addr = 0xFFFFFFFFu;
         e->used_frame = 0;
     }
+    g_cache_count = 0;                 /* all slots free again */
     g_index_ready = false;
 }
 
@@ -523,6 +524,15 @@ static void attach_hires(CacheEntry* e, const u8* src, bool preloaded, u32 even,
     bool mipmaps = ((mode0 >> 5) & 3u) != 0;
     e->tex.hires_entry = hires_find(fmt, w, h, mipmaps, data, size0, tlut, e->data);
     e->tex.hires = hires_ready(e->tex.hires_entry);
+}
+
+/* The least recently used entry, unless every entry is used this frame. */
+static int lru_slot(void) {
+    u32 slot = 0;
+    for (u32 k = 1; k < g_cache_count; k++)
+        if (g_cache[k].used_frame < g_cache[slot].used_frame)
+            slot = k;
+    return g_cache_count && g_cache[slot].used_frame != g_frame ? (int)slot : -1;
 }
 
 static const GxTexture* tex_get(CPUState* cpu, u32 map) {
@@ -690,7 +700,9 @@ static const GxTexture* tex_get(CPUState* cpu, u32 map) {
                     return &v->tex;
                 }
             }
-            if (g_cache_count < CACHE_MAX) {
+            /* (With the cache full, the least recently used texture makes
+               room, so switching back and forth doesn't decode every time.) */
+            if (g_cache_count < CACHE_MAX || lru_slot() >= 0) {
                 g_variants++;
                 goto new_entry;
             }
@@ -719,12 +731,10 @@ new_entry:
     if (!SRC()) return NULL;
     u32 slot = g_cache_count;
     if (slot >= CACHE_MAX) {
-        slot = 0;
-        for (u32 k = 1; k < CACHE_MAX; k++)
-            if (g_cache[k].used_frame < g_cache[slot].used_frame)
-                slot = k;
-        if (g_cache[slot].used_frame == g_frame)
+        int lru = lru_slot();
+        if (lru < 0)
             return NULL;               /* every entry is in use this frame */
+        slot = (u32)lru;
         retire(g_cache[slot].data);
     } else {
         g_cache_count++;
