@@ -520,7 +520,7 @@ static void si_transfer(void) {
     u8 cmd = g_regs[SI_IOBUF];
     u8 resp[128];
     u32 n = 0;
-    bool present = (ch == 0);
+    bool present = pad_connected((int)ch);
 
     memset(resp, 0, sizeof(resp));
     if (present) {
@@ -538,7 +538,7 @@ static void si_transfer(void) {
             n = 10;
             break;
         case 0x40:   /* direct poll */
-            pad_poll_response(interrupts_game_seconds(), resp);
+            pad_poll_response((int)ch, interrupts_game_seconds(), resp);
             n = 8;
             break;
         default:
@@ -570,12 +570,12 @@ void mmio_si_field(void) {
     for (u32 ch = 0; ch < 4; ch++) {
         if (!(poll & (0x80u >> ch)))
             continue;
-        if (ch != 0) {
+        if (!pad_connected((int)ch)) {
             g_si_sr |= 0x08u << ((3 - ch) * 8);
             continue;
         }
         u8 r[8];
-        pad_poll_response(interrupts_game_seconds(), r);
+        pad_poll_response((int)ch, interrupts_game_seconds(), r);
         g_si_inbuf[ch][0] = ((u32)r[0] << 24) | ((u32)r[1] << 16) | ((u32)r[2] << 8) | r[3];
         g_si_inbuf[ch][1] = ((u32)r[4] << 24) | ((u32)r[5] << 16) | ((u32)r[6] << 8) | r[7];
         g_si_sr |= 0x20u << ((3 - ch) * 8);         /* RDST: new data ready */

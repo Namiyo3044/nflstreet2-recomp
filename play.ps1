@@ -10,6 +10,7 @@
 #   .\play.ps1 -NoTextures     (the game's own textures only)
 #   .\play.ps1 -Replace D:\dir (files there are read instead of the disc's, e.g. moviedat.dat; default C:\nfls2\replace, used if it exists)
 #   .\play.ps1 -DumpAudio     (record the sound to C:\nfls2\dump\audio.wav)
+#   .\play.ps1 -UisLog        (log each kind of call the menu scripts make, "uis: call" lines)
 #   .\play.ps1 -DumpTextures   (save every texture the game uses to C:\nfls2\dump\textures, with Dolphin's names)
 #   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
@@ -40,6 +41,7 @@ param(
     [switch]$NoTextures,
     [switch]$DumpTextures,
     [switch]$DumpAudio,
+    [switch]$UisLog,
     [switch]$CardTrace,
     [string[]]$Press = @(),
     [string]$Disc = "C:\nfls2\disc",
@@ -102,6 +104,7 @@ elseif ($PSBoundParameters.ContainsKey("Res")) { $gameArgs += @("--gpu", "--res"
 elseif ($GPU) { $gameArgs += @("--gpu") }
 if ($Debug) { $gameArgs += @("--debug") }
 if ($CardTrace) { $gameArgs += @("--cardtrace") }
+if ($UisLog) { $gameArgs += @("--uis-log") }
 if (-not $NoTextures -and (Test-Path $Textures)) { $gameArgs += @("--textures", $Textures) }
 if (Test-Path $Replace) { $gameArgs += @("--replace", $Replace) }
 if ($DumpAudio) {

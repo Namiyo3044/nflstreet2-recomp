@@ -19,13 +19,27 @@ typedef struct {
 enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_OK, MENU_BACK };
 
 /* Settings items, as bits in menu_take_changes(). */
-enum { MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RENDERER, MI_RES, MI_TEXTURES, MI_CLOSE, MI_COUNT };
+enum { MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RENDERER, MI_RES, MI_TEXTURES, MI_CONTROLS, MI_CLOSE, MI_COUNT };
 
 void menu_open(const MenuInfo* info);
 bool menu_is_open(void);
 void menu_action(int action);
 
-/* Items changed since the last call (1 << MI_...). */
+/* The controls page: names for key and controller codes (from the window). */
+void menu_set_binding_names(const char* (*key_name)(int code), const char* (*pad_name)(int code));
+
+/* Waiting for a key (1) or a controller button / stick (2) to bind, else 0.
+   The window then sends the next one with menu_bind (-1: clear the binding,
+   0: cancel). */
+int menu_capturing(void);
+
+/* A line about who plays as whom (controllers connected), shown on the
+   controls page; the window updates it. */
+void menu_set_players_text(const char* text);
+void menu_bind(int code);
+
+/* Items changed since the last call (1 << MI_...; MI_CONTROLS for bindings,
+   which are left 0 where they should be the default). */
 unsigned menu_take_changes(void);
 
 /* The menu picture for a w x h window; *dirty is set when it changed since
