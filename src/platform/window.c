@@ -1392,7 +1392,8 @@ static void pace_and_stats(void) {
 /* The Previews menu's trailers (the game's own trailer code isn't in the
    GameCube version, main.c answers the menu): replace\previews\<name>.mpg,
    converted from the Xbox / PS2 MOVIEDAT.DAT, in its order. The game stands
-   still while one plays, its sound paused; any button stops it. */
+   still while one plays, its sound paused; any button stops it. Shown at
+   the screen's shape (stretched for 16:9, like the intro movies). */
 static const char* const k_previews[11] = {
     "madden_nfl_2005", "nba_live_2005", "nba_street_v3", "fifa_street", "fifa_soccer_2005",
     "ncaa_football_2005", "ncaa_march_madness_2005", "nascar_2005", "nhl_2005", "tiger_woods_2005",
@@ -1475,7 +1476,8 @@ static void preview_loop(CPUState* cpu) {
         int ww = 0, wh = 0;
         SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
         if (ww > 0 && wh > 0) {
-            if (px) gx_raster_present_pixels(px, w, h, ww, wh, 4.0f / 3.0f);   /* the trailers are 4:3 */
+            update_aspect(false);
+            if (px) gx_raster_present_pixels(px, w, h, ww, wh, g_aspect);   /* the shape the game's own movies get */
             else glr_present_black(ww, wh);
             SDL_GL_SwapWindow(g_window);
         }
