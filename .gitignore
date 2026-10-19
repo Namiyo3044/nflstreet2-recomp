@@ -1,36 +1,8 @@
-# Never commit game data or anything derived from it
-*.dol
-*.iso
-*.gcm
-*.rvz
-/generated/
-/recomp/
-/disc/
-
-# Build output
-/build/
-/out/
-.vs/
-*.user
-
-# Run logs
-/run*.txt
-
-# Frame dumps
-/frames/
-/summary.txt
-/play.txt
-/play.txt
-/play.txt
-/play.txt
-/play.txt
-/drawlog*.txt
-/shot_*.bmp
-/tex_*.bmp
-/tex_*.bmp
-/tex_*.bmp
-
+memdump.bin
+MemoryCardA.raw
 nfls2-screen.txt
 text-replacements.txt
-drawlog.txt
-*.zip
+drawlog*.txt
+play.txt
+*.mpg
+build/
