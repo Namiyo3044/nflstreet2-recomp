@@ -9,13 +9,14 @@
 #   .\play.ps1 -Textures D:\pack (custom textures in Dolphin's format, .png or .dds; default C:\nfls2\textures, used if it exists)
 #   .\play.ps1 -NoTextures     (the game's own textures only)
 #   .\play.ps1 -Replace D:\dir (files there are read instead of the disc's, e.g. moviedat.dat; default C:\nfls2\replace, used if it exists)
+#   .\play.ps1 -DumpAudio     (record the sound to C:\nfls2\dump\audio.wav)
 #   .\play.ps1 -DumpTextures   (save every texture the game uses to C:\nfls2\dump\textures, with Dolphin's names)
 #   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
 #   .\play.ps1 -ShowTHX        (keep the THX intro; it is skipped by default)
 #   .\play.ps1 -Aspect 16:9    (screen shape: auto (follows the game's widescreen option), 4:3, 16:9)
 #
-# Keyboard: arrows = stick, X = A, Z = B, C = X, S = Y, D = Z, Q / W = L / R,
+# Keyboard (the defaults; change them in the F1 menu under Controls): arrows = stick, X = A, Z = B, C = X, S = Y, D = Z, Q / W = L / R,
 #           Enter = START, I J K L = C-stick, T F G H = D-pad
 #           Esc = quit, F1 (or the controller's Back / View button) = video menu, F5 = custom textures on / off, Tab (hold) = fast-forward, F9 = screen shape (auto / 4:3 / 16:9), F10 = screenshot (shot_NNN.bmp), F11 = fullscreen,
 #           F12 = draw log of two frames (drawlog.txt, drawlog-short.txt).
@@ -38,6 +39,7 @@ param(
     [string]$Replace = "C:\nfls2\replace",
     [switch]$NoTextures,
     [switch]$DumpTextures,
+    [switch]$DumpAudio,
     [switch]$CardTrace,
     [string[]]$Press = @(),
     [string]$Disc = "C:\nfls2\disc",
@@ -102,6 +104,10 @@ if ($Debug) { $gameArgs += @("--debug") }
 if ($CardTrace) { $gameArgs += @("--cardtrace") }
 if (-not $NoTextures -and (Test-Path $Textures)) { $gameArgs += @("--textures", $Textures) }
 if (Test-Path $Replace) { $gameArgs += @("--replace", $Replace) }
+if ($DumpAudio) {
+    New-Item -ItemType Directory -Force -Path "C:\nfls2\dump" | Out-Null
+    $gameArgs += @("--dump-audio", "C:\nfls2\dump\audio.wav")
+}
 if ($DumpTextures) {
     New-Item -ItemType Directory -Force -Path "C:\nfls2\dump\textures" | Out-Null
     $gameArgs += @("--dump-textures", "C:\nfls2\dump\textures")
@@ -120,7 +126,7 @@ if ($start) { $report = $log[($start - 1)..($log.Count - 1)] } else { $report = 
 # Slow stretches (the window logs a perf line each second the game runs below full speed).
 $perf = @($log | Select-String -Pattern "^perf:|^audio:|^hitch:" | ForEach-Object { $_.Line })
 $gpuLines = @($log | Select-String -Pattern "^gpu:|^custom textures:" | ForEach-Object { $_.Line })
-$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:" | ForEach-Object { $_.Line })
+$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:|^window: player|^window: controller" | ForEach-Object { $_.Line })
 $cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
 $txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })
 $ct = @($log | Select-String -Pattern "^cardtrace:" | ForEach-Object { $_.Line })

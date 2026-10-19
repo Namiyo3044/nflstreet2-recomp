@@ -25,7 +25,10 @@
 static SDL_Window* g_window;
 static SDL_Renderer* g_renderer;
 static SDL_Texture* g_texture;
-static SDL_Gamepad* g_pad;
+/* Controllers, in the order they were connected: controller N plays as
+   player N (the keyboard joins whichever player the settings say). A
+   controller unplugged leaves its slot empty, so the others keep theirs. */
+static SDL_Gamepad* g_pads[PAD_PORTS];
 static SDL_AudioStream* g_audio;
 static u32 g_audio_rate;
 static bool g_quit;
@@ -73,6 +76,35 @@ static bool turbo(void) {
 
 static unsigned g_audio_underruns, g_audio_sec_underruns, g_audio_sec_buffers, g_audio_sec_dropped;
 static int g_audio_sec_min_queue = 1 << 30;
+
+/* --dump-audio: everything sent to the speakers, as a .wav file. */
+static FILE* g_wav;
+static u32 g_wav_bytes, g_wav_rate = 32000;
+
+static void wav_header(FILE* f, u32 bytes, u32 rate) {
+    u8 h[44];
+    memcpy(h, "RIFF", 4);
+    u32 v = 36 + bytes; memcpy(h + 4, &v, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    v = 16; memcpy(h + 16, &v, 4);
+    u16 w = 1; memcpy(h + 20, &w, 2);          /* PCM */
+    w = 2; memcpy(h + 22, &w, 2);              /* stereo */
+    memcpy(h + 24, &rate, 4);
+    v = rate * 4; memcpy(h + 28, &v, 4);
+    w = 4; memcpy(h + 32, &w, 2);
+    w = 16; memcpy(h + 34, &w, 2);
+    memcpy(h + 36, "data", 4);
+    memcpy(h + 40, &bytes, 4);
+    fseek(f, 0, SEEK_SET);
+    fwrite(h, 1, 44, f);
+}
+
+void window_set_audio_dump(const char* path) {
+    g_wav = fopen(path, "wb");
+    if (!g_wav) { printf("window: couldn't create %s\n", path); return; }
+    wav_header(g_wav, 0, g_wav_rate);
+    printf("window: recording the sound to %s\n", path);
+}
 
 static void audio_sink(const u8* samples, u32 frames, u32 rate) {
     if (!g_audio || !frames || turbo())
@@ -161,6 +193,11 @@ static void audio_sink(const u8* samples, u32 frames, u32 rate) {
             last_r = r;
         }
         SDL_PutAudioStreamData(g_audio, buf, (int)(n * 4));
+        if (g_wav) {
+            g_wav_rate = rate;
+            fwrite(buf, 4, n, g_wav);
+            g_wav_bytes += n * 4;
+        }
         samples += n * 4;
         frames -= n;
     }
@@ -322,7 +359,10 @@ static bool gpu_setup(void) {
     return true;
 }
 
+static void bindings_resolve(void);
+
 bool window_open(int scale) {
+    bindings_resolve();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         fprintf(stderr, "error: SDL_Init failed: %s\n", SDL_GetError());
         return false;
@@ -384,17 +424,23 @@ bool window_quit_requested(void) {
 
 void window_close(void) {
     printf("window: sound card ran dry %u times\n", g_audio_underruns);
+    if (g_wav) {
+        wav_header(g_wav, g_wav_bytes, g_wav_rate);
+        fclose(g_wav);
+        g_wav = NULL;
+    }
     mmio_set_audio_sink(NULL);
     if (g_audio) SDL_DestroyAudioStream(g_audio);
     g_audio = NULL;
-    if (g_pad) SDL_CloseGamepad(g_pad);
+    for (int i = 0; i < PAD_PORTS; i++)
+        if (g_pads[i]) SDL_CloseGamepad(g_pads[i]);
     if (g_texture) SDL_DestroyTexture(g_texture);
     if (g_renderer) SDL_DestroyRenderer(g_renderer);
     gx_raster_sync();
     gpu_teardown();
     if (g_window) SDL_DestroyWindow(g_window);
     SDL_Quit();
-    g_pad = NULL;
+    memset(g_pads, 0, sizeof(g_pads));
     g_texture = NULL;
     g_renderer = NULL;
     g_window = NULL;
@@ -431,13 +477,6 @@ static void save_screenshot(void) {
 }
 
 /* ------------------------------------------------------------- input --- */
-static u8 axis_to_gc(Sint16 v, bool invert) {
-    int x = (int)v * 100 / 32767;      /* a real stick reaches about +/-100 */
-    if (x > -8 && x < 8) x = 0;        /* small dead zone */
-    if (invert) x = -x;
-    int r = 128 + x;
-    return (u8)(r < 0 ? 0 : r > 255 ? 255 : r);
-}
 
 static bool g_text_search;
 static bool g_shot_pending;            /* GPU mode: save the next picture shown */
@@ -610,6 +649,119 @@ static void sync_game_screen_option(CPUState* cpu) {
     printf("window: game's screen option set to %s (was %u)\n", want ? "16:9" : "4:3", have);
 }
 
+/* ------------------------------------------------------------ controls --- */
+/* Defaults: the keys listed in play.ps1, and a standard controller laid out
+   like a GameCube pad (sticks on sticks, L / R on the triggers, Z on the
+   right shoulder). Controller codes: button + 1, or 64 + axis * 2 (+1 for
+   the positive direction). */
+#define PAD_AXIS(a, pos) (64 + (a) * 2 + ((pos) ? 1 : 0))
+static const int k_default_keys[GCI_COUNT] = {
+    SDL_SCANCODE_X, SDL_SCANCODE_Z, SDL_SCANCODE_C, SDL_SCANCODE_S, SDL_SCANCODE_D, SDL_SCANCODE_RETURN,
+    SDL_SCANCODE_Q, SDL_SCANCODE_W,
+    SDL_SCANCODE_T, SDL_SCANCODE_G, SDL_SCANCODE_F, SDL_SCANCODE_H,
+    SDL_SCANCODE_UP, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_RIGHT,
+    SDL_SCANCODE_I, SDL_SCANCODE_K, SDL_SCANCODE_J, SDL_SCANCODE_L,
+};
+static const int k_default_pads[GCI_COUNT] = {
+    SDL_GAMEPAD_BUTTON_SOUTH + 1, SDL_GAMEPAD_BUTTON_EAST + 1, SDL_GAMEPAD_BUTTON_WEST + 1,
+    SDL_GAMEPAD_BUTTON_NORTH + 1, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER + 1, SDL_GAMEPAD_BUTTON_START + 1,
+    PAD_AXIS(SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 1), PAD_AXIS(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 1),
+    SDL_GAMEPAD_BUTTON_DPAD_UP + 1, SDL_GAMEPAD_BUTTON_DPAD_DOWN + 1, SDL_GAMEPAD_BUTTON_DPAD_LEFT + 1,
+    SDL_GAMEPAD_BUTTON_DPAD_RIGHT + 1,
+    PAD_AXIS(SDL_GAMEPAD_AXIS_LEFTY, 0), PAD_AXIS(SDL_GAMEPAD_AXIS_LEFTY, 1),
+    PAD_AXIS(SDL_GAMEPAD_AXIS_LEFTX, 0), PAD_AXIS(SDL_GAMEPAD_AXIS_LEFTX, 1),
+    PAD_AXIS(SDL_GAMEPAD_AXIS_RIGHTY, 0), PAD_AXIS(SDL_GAMEPAD_AXIS_RIGHTY, 1),
+    PAD_AXIS(SDL_GAMEPAD_AXIS_RIGHTX, 0), PAD_AXIS(SDL_GAMEPAD_AXIS_RIGHTX, 1),
+};
+
+/* Who plays as whom, for the controls page. */
+static void update_players_text(void) {
+    char t[256] = "";
+    size_t n = 0;
+    for (int i = 0; i < PAD_PORTS; i++) {
+        bool keys = g_settings.keyboard_player == i;
+        if (!g_pads[i] && !keys) continue;
+        const char* name = g_pads[i] ? SDL_GetGamepadName(g_pads[i]) : NULL;
+        char one[96];
+        snprintf(one, sizeof(one), "%sPLAYER %d: %s%s%s", n ? "     " : "", i + 1, keys ? "KEYBOARD" : "",
+                 keys && name ? " + " : "", name ? name : "");
+        for (char* c = one; *c; c++) if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
+        int w = snprintf(t + n, sizeof(t) - n, "%s", one);
+        if (w < 0 || (size_t)w >= sizeof(t) - n) break;
+        n += (size_t)w;
+    }
+    menu_set_players_text(t);
+}
+
+/* Bindings left at 0 ("the default") get their default code. */
+static void bindings_resolve(void) {
+    for (int i = 0; i < GCI_COUNT; i++) {
+        if (!g_settings.key_bind[i]) g_settings.key_bind[i] = k_default_keys[i];
+        if (!g_settings.pad_bind[i]) g_settings.pad_bind[i] = k_default_pads[i];
+    }
+}
+
+static const char* key_name(int code) {
+    static char buf[64];
+    const char* n = SDL_GetScancodeName((SDL_Scancode)code);
+    if (!n || !*n) { snprintf(buf, sizeof(buf), "KEY %d", code); return buf; }
+    size_t i = 0;
+    for (; n[i] && i + 1 < sizeof(buf); i++) buf[i] = (char)((n[i] >= 'a' && n[i] <= 'z') ? n[i] - 32 : n[i]);
+    buf[i] = 0;
+    return buf;
+}
+
+static const char* pad_name(int code) {
+    static const char* const k_buttons[] = {
+        "A / CROSS", "B / CIRCLE", "X / SQUARE", "Y / TRIANGLE", "BACK / VIEW", "GUIDE", "START / MENU",
+        "LEFT STICK PRESS", "RIGHT STICK PRESS", "LB / L1", "RB / R1", "D-PAD UP", "D-PAD DOWN", "D-PAD LEFT",
+        "D-PAD RIGHT", "MISC", "PADDLE 1", "PADDLE 2", "PADDLE 3", "PADDLE 4", "TOUCHPAD"};
+    static const char* const k_axes[] = {"LEFT STICK LEFT", "LEFT STICK RIGHT", "LEFT STICK UP", "LEFT STICK DOWN",
+                                         "RIGHT STICK LEFT", "RIGHT STICK RIGHT", "RIGHT STICK UP",
+                                         "RIGHT STICK DOWN", "LT / L2", "LT / L2", "RT / R2", "RT / R2"};
+    static char buf[32];
+    if (code >= 64 && code < 64 + 12) return k_axes[code - 64];
+    if (code >= 1 && code <= (int)(sizeof(k_buttons) / sizeof(k_buttons[0]))) return k_buttons[code - 1];
+    snprintf(buf, sizeof(buf), "BUTTON %d", code);
+    return buf;
+}
+
+/* How hard GameCube input i is pressed, 0-1: its key (all or nothing) or its
+   controller binding (a stick or trigger gives the amount; buttons all or
+   nothing), whichever is more. */
+static float binding_amount(int i, SDL_Gamepad* pad, bool keys) {
+    float a = 0.0f;
+    int kc = g_settings.key_bind[i];
+    if (keys && kc > 0 && kc < SDL_SCANCODE_COUNT) {
+        const bool* k = SDL_GetKeyboardState(NULL);
+        if (k && k[kc]) a = 1.0f;
+    }
+    int pc = g_settings.pad_bind[i];
+    if (pad && pc > 0) {
+        float v = 0.0f;
+        if (pc >= 64) {
+            int axis = (pc - 64) / 2, pos = (pc - 64) & 1;
+            float x = (float)SDL_GetGamepadAxis(pad, (SDL_GamepadAxis)axis) / 32767.0f;
+            if (!pos) x = -x;
+            /* small dead zone; a stick reaches a GameCube stick's full travel at 100% */
+            v = x < 0.08f ? 0.0f : x > 1.0f ? 1.0f : x;
+        } else if (SDL_GetGamepadButton(pad, (SDL_GamepadButton)(pc - 1))) {
+            v = 1.0f;
+        }
+        if (v > a) a = v;
+    }
+    return a;
+}
+
+/* A stick axis from -1..1 to the GameCube's range (a real stick reaches
+   about +/-100 around the centre, 128). */
+static u8 stick_value(float v) {
+    if (v > 1.0f) v = 1.0f;
+    if (v < -1.0f) v = -1.0f;
+    int r = 128 + (int)(v * 100.0f + (v < 0 ? -0.5f : 0.5f));
+    return (u8)(r < 0 ? 0 : r > 255 ? 255 : r);
+}
+
 /* ------------------------------------------------------ settings menu --- */
 static void set_window_size(void) {
     if (g_fullscreen) return;
@@ -631,6 +783,10 @@ static void apply_settings(unsigned ch) {
     }
     if (ch & (1u << MI_WINSIZE))
         set_window_size();
+    if (ch & (1u << MI_CONTROLS)) {
+        bindings_resolve();            /* "reset" leaves them at 0 */
+        update_players_text();
+    }
     if (ch & (1u << MI_TEXTURES)) {
         /* Turning them on picks up files added, changed or removed since. */
         if (g_settings.custom_textures && !hires_enabled())
@@ -652,7 +808,17 @@ static void toggle_custom_textures(void) {
     printf("window: custom textures %s\n", g_settings.custom_textures ? "on" : "off");
 }
 
+static void open_menu_controls_setup(void) {
+    static bool done;
+    if (!done) {
+        menu_set_binding_names(key_name, pad_name);
+        done = true;
+    }
+}
+
 static void open_menu(void) {
+    open_menu_controls_setup();
+    update_players_text();
     MenuInfo mi = {g_gpu, g_gpu_scale, hires_has_folder()};
     menu_open(&mi);
 }
@@ -660,6 +826,21 @@ static void open_menu(void) {
 /* Keys and controller buttons while the menu is open. */
 static void menu_event(const SDL_Event* e) {
     static int axis_dir[2];
+    int cap = menu_capturing();
+    if (cap) {                         /* waiting for a key or button to bind */
+        if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {
+            if (e->key.key == SDLK_ESCAPE) menu_bind(0);
+            else if (e->key.key == SDLK_DELETE || e->key.key == SDLK_BACKSPACE) menu_bind(-1);
+            else if (cap == 1) menu_bind((int)e->key.scancode);
+        } else if (cap == 2 && e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+            menu_bind((int)e->gbutton.button + 1);
+        } else if (cap == 2 && e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+                   (e->gaxis.value > 24000 || e->gaxis.value < -24000)) {
+            menu_bind(PAD_AXIS(e->gaxis.axis, e->gaxis.value > 0));
+        }
+        if (cap == 2 && !menu_capturing()) axis_dir[0] = axis_dir[1] = 2;   /* ignore the stick until it's let go */
+        return;
+    }
     if (e->type == SDL_EVENT_KEY_DOWN) {
         switch (e->key.key) {
         case SDLK_UP: menu_action(MENU_UP); break;
@@ -688,6 +869,10 @@ static void menu_event(const SDL_Event* e) {
                (e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX || e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY)) {
         int i = e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY;
         int d = e->gaxis.value > 20000 ? 1 : e->gaxis.value < -20000 ? -1 : 0;
+        if (axis_dir[i] == 2) {        /* after binding a stick: wait for it to centre */
+            if (!d) axis_dir[i] = 0;
+            return;
+        }
         if (d && d != axis_dir[i])
             menu_action(i ? (d < 0 ? MENU_UP : MENU_DOWN) : (d < 0 ? MENU_LEFT : MENU_RIGHT));
         axis_dir[i] = d;
@@ -745,19 +930,28 @@ static void poll_events(void) {
         case SDL_EVENT_MOUSE_WHEEL:
             if (g_freecam) g_cam_wheel += e.wheel.y > 0 ? 1 : e.wheel.y < 0 ? -1 : 0;
             break;
-        case SDL_EVENT_GAMEPAD_ADDED:
-            if (!g_pad) {
-                g_pad = SDL_OpenGamepad(e.gdevice.which);
-                if (g_pad)
-                    printf("window: controller connected: %s\n", SDL_GetGamepadName(g_pad));
-            }
+        case SDL_EVENT_GAMEPAD_ADDED: {
+            bool have = false;
+            for (int i = 0; i < PAD_PORTS; i++)
+                if (g_pads[i] && SDL_GetGamepadID(g_pads[i]) == e.gdevice.which) have = true;
+            for (int i = 0; i < PAD_PORTS && !have; i++)
+                if (!g_pads[i]) {
+                    g_pads[i] = SDL_OpenGamepad(e.gdevice.which);
+                    if (g_pads[i])
+                        printf("window: controller connected as player %d: %s\n", i + 1, SDL_GetGamepadName(g_pads[i]));
+                    have = true;
+                }
+            update_players_text();
             break;
+        }
         case SDL_EVENT_GAMEPAD_REMOVED:
-            if (g_pad && SDL_GetGamepadID(g_pad) == e.gdevice.which) {
-                SDL_CloseGamepad(g_pad);
-                g_pad = NULL;
-                printf("window: controller disconnected\n");
-            }
+            for (int i = 0; i < PAD_PORTS; i++)
+                if (g_pads[i] && SDL_GetGamepadID(g_pads[i]) == e.gdevice.which) {
+                    SDL_CloseGamepad(g_pads[i]);
+                    g_pads[i] = NULL;
+                    printf("window: player %d's controller disconnected\n", i + 1);
+                }
+            update_players_text();
             break;
         default:
             break;
@@ -769,77 +963,74 @@ static void poll_events(void) {
    held: the game sees nothing until everything has been let go. */
 static bool g_input_block;
 
+/* One player's controller state from a gamepad and / or the keyboard. */
+static PadLive player_state(SDL_Gamepad* pad, bool keys) {
+    PadLive p = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
+    /* How hard each GameCube input is pressed (0-1). */
+    float amt[GCI_COUNT];
+    for (int i = 0; i < GCI_COUNT; i++) amt[i] = binding_amount(i, pad, keys);
+    static const u16 k_bits[] = {PAD_A, PAD_B, PAD_X, PAD_Y, PAD_Z, PAD_START, 0, 0,
+                                 PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT};
+    for (int i = 0; i < 12; i++)
+        if (k_bits[i] && amt[i] > 0.5f) p.buttons |= k_bits[i];
+    p.trigger_l = (u8)(amt[GCI_L] * 255.0f + 0.5f);
+    p.trigger_r = (u8)(amt[GCI_R] * 255.0f + 0.5f);
+    if (amt[GCI_L] > 0.9f) p.buttons |= PAD_L;   /* the digital click at the end of the travel */
+    if (amt[GCI_R] > 0.9f) p.buttons |= PAD_R;
+    p.stick_x = stick_value(amt[GCI_SRIGHT] - amt[GCI_SLEFT]);
+    p.stick_y = stick_value(amt[GCI_SUP] - amt[GCI_SDOWN]);
+    p.cstick_x = stick_value(amt[GCI_CRIGHT] - amt[GCI_CLEFT]);
+    p.cstick_y = stick_value(amt[GCI_CUP] - amt[GCI_CDOWN]);
+    return p;
+}
+
+static bool pad_held(const PadLive* p) {
+    return p->buttons || p->trigger_l > 30 || p->trigger_r > 30 || p->stick_x < 0x80 - 30 ||
+           p->stick_x > 0x80 + 30 || p->stick_y < 0x80 - 30 || p->stick_y > 0x80 + 30 ||
+           p->cstick_x < 0x80 - 30 || p->cstick_x > 0x80 + 30 || p->cstick_y < 0x80 - 30 ||
+           p->cstick_y > 0x80 + 30;
+}
+
+static void all_idle(void) {
+    PadLive idle = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
+    for (int i = 0; i < PAD_PORTS; i++) pad_set_live(i, &idle);
+}
+
 static void read_input(void) {
     if (g_freecam) {                   /* the keys fly the camera; the game sees nothing pressed */
-        PadLive idle = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
-        pad_set_live(&idle);
+        all_idle();
         freecam_update();
         return;
     }
-    PadLive p = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
-    const bool* k = SDL_GetKeyboardState(NULL);
-
-    if (k[SDL_SCANCODE_X]) p.buttons |= PAD_A;
-    if (k[SDL_SCANCODE_Z]) p.buttons |= PAD_B;
-    if (k[SDL_SCANCODE_C]) p.buttons |= PAD_X;
-    if (k[SDL_SCANCODE_S]) p.buttons |= PAD_Y;
-    if (k[SDL_SCANCODE_D]) p.buttons |= PAD_Z;
-    if (k[SDL_SCANCODE_RETURN]) p.buttons |= PAD_START;
-    if (k[SDL_SCANCODE_Q]) { p.buttons |= PAD_L; p.trigger_l = 0xFF; }
-    if (k[SDL_SCANCODE_W]) { p.buttons |= PAD_R; p.trigger_r = 0xFF; }
-    if (k[SDL_SCANCODE_T]) p.buttons |= PAD_UP;
-    if (k[SDL_SCANCODE_G]) p.buttons |= PAD_DOWN;
-    if (k[SDL_SCANCODE_F]) p.buttons |= PAD_LEFT;
-    if (k[SDL_SCANCODE_H]) p.buttons |= PAD_RIGHT;
-    if (k[SDL_SCANCODE_LEFT]) p.stick_x = 0x80 - 100;
-    if (k[SDL_SCANCODE_RIGHT]) p.stick_x = 0x80 + 100;
-    if (k[SDL_SCANCODE_UP]) p.stick_y = 0x80 + 100;
-    if (k[SDL_SCANCODE_DOWN]) p.stick_y = 0x80 - 100;
-    if (k[SDL_SCANCODE_J]) p.cstick_x = 0x80 - 100;
-    if (k[SDL_SCANCODE_L]) p.cstick_x = 0x80 + 100;
-    if (k[SDL_SCANCODE_I]) p.cstick_y = 0x80 + 100;
-    if (k[SDL_SCANCODE_K]) p.cstick_y = 0x80 - 100;
-
-    if (g_pad) {
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_SOUTH)) p.buttons |= PAD_A;
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_EAST)) p.buttons |= PAD_B;
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_WEST)) p.buttons |= PAD_X;
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_NORTH)) p.buttons |= PAD_Y;
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_START)) p.buttons |= PAD_START;
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) p.buttons |= PAD_Z;
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_DPAD_UP)) p.buttons |= PAD_UP;
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_DPAD_DOWN)) p.buttons |= PAD_DOWN;
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_DPAD_LEFT)) p.buttons |= PAD_LEFT;
-        if (SDL_GetGamepadButton(g_pad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) p.buttons |= PAD_RIGHT;
-        Sint16 lx = SDL_GetGamepadAxis(g_pad, SDL_GAMEPAD_AXIS_LEFTX);
-        Sint16 ly = SDL_GetGamepadAxis(g_pad, SDL_GAMEPAD_AXIS_LEFTY);
-        Sint16 rx = SDL_GetGamepadAxis(g_pad, SDL_GAMEPAD_AXIS_RIGHTX);
-        Sint16 ry = SDL_GetGamepadAxis(g_pad, SDL_GAMEPAD_AXIS_RIGHTY);
-        if (p.stick_x == 0x80) p.stick_x = axis_to_gc(lx, false);
-        if (p.stick_y == 0x80) p.stick_y = axis_to_gc(ly, true);     /* SDL: down is positive */
-        if (p.cstick_x == 0x80) p.cstick_x = axis_to_gc(rx, false);
-        if (p.cstick_y == 0x80) p.cstick_y = axis_to_gc(ry, true);
-        Sint16 lt = SDL_GetGamepadAxis(g_pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER);
-        Sint16 rt = SDL_GetGamepadAxis(g_pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
-        u8 l = (u8)(lt > 0 ? lt * 255 / 32767 : 0), r = (u8)(rt > 0 ? rt * 255 / 32767 : 0);
-        if (l > p.trigger_l) p.trigger_l = l;
-        if (r > p.trigger_r) p.trigger_r = r;
-        if (l > 230) p.buttons |= PAD_L;  /* the digital click at the end of the travel */
-        if (r > 230) p.buttons |= PAD_R;
+    PadLive st[PAD_PORTS];
+    bool any_held = false;
+    int kb = g_settings.keyboard_player;
+    for (int i = 0; i < PAD_PORTS; i++) {
+        bool keys = i == kb;
+        st[i] = player_state(g_pads[i], keys);
+        pad_set_connected(i, g_pads[i] || keys);
+        if (pad_held(&st[i])) any_held = true;
     }
     if (g_input_block) {
-        bool held = p.buttons || p.trigger_l > 30 || p.trigger_r > 30 || p.stick_x < 0x80 - 30 ||
-                    p.stick_x > 0x80 + 30 || p.stick_y < 0x80 - 30 || p.stick_y > 0x80 + 30 ||
-                    p.cstick_x < 0x80 - 30 || p.cstick_x > 0x80 + 30 || p.cstick_y < 0x80 - 30 ||
-                    p.cstick_y > 0x80 + 30;
-        if (held) {
-            PadLive idle = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
-            p = idle;
-        } else {
-            g_input_block = false;
+        /* Wait for everything to be let go, but not for ever: something
+           that reads as held all the time (a trigger or stick that doesn't
+           rest at zero) would otherwise lock the game out. */
+        static int waited;
+        if (any_held && ++waited < 45) {
+            all_idle();
+            return;
         }
+        if (any_held) {
+            for (int i = 0; i < PAD_PORTS; i++)
+                if (pad_held(&st[i]))
+                    printf("window: player %d still reads as held after the menu (buttons %04X, stick %d/%d, "
+                           "c-stick %d/%d, triggers %d/%d)\n", i + 1, st[i].buttons, st[i].stick_x, st[i].stick_y,
+                           st[i].cstick_x, st[i].cstick_y, st[i].trigger_l, st[i].trigger_r);
+        }
+        waited = 0;
+        g_input_block = false;
     }
-    pad_set_live(&p);
+    for (int i = 0; i < PAD_PORTS; i++) pad_set_live(i, &st[i]);
 }
 
 /* ------------------------------------------------------------ output --- */
@@ -1150,8 +1341,7 @@ static void pace_and_stats(void) {
 static void menu_loop(CPUState* cpu) {
     printf("window: video menu open\n");
     if (g_audio) SDL_PauseAudioStreamDevice(g_audio);
-    PadLive idle = {0, 0x80, 0x80, 0x80, 0x80, 0, 0};
-    pad_set_live(&idle);
+    all_idle();
     while (menu_is_open() && !g_quit) {
         poll_events();
         apply_settings(menu_take_changes());
