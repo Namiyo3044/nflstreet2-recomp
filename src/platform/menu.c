@@ -20,6 +20,43 @@ static int g_sel;
 static unsigned g_changes;
 static bool g_dirty = true;
 static MenuInfo g_info;
+/* The controls page: rows are the GameCube inputs, then "reset" and "back";
+   column 0 is the keyboard, 1 the controller. */
+static bool g_controls;
+static int g_crow, g_ccol, g_capture;
+#define CROW_KBPLAYER GCI_COUNT
+#define CROW_NINTENDO (GCI_COUNT + 1)
+#define CROW_RESET (GCI_COUNT + 2)
+#define CROW_BACK (GCI_COUNT + 3)
+#define CROWS (GCI_COUNT + 4)
+static char g_players[256];
+
+void menu_set_players_text(const char* text) {
+    if (strcmp(g_players, text) != 0) {
+        snprintf(g_players, sizeof(g_players), "%s", text);
+        g_dirty = true;
+    }
+}
+static const char* (*g_key_name)(int);
+static const char* (*g_pad_name)(int);
+
+void menu_set_binding_names(const char* (*key_name)(int), const char* (*pad_name)(int)) {
+    g_key_name = key_name;
+    g_pad_name = pad_name;
+}
+
+int menu_capturing(void) { return g_open && g_controls ? g_capture : 0; }
+
+void menu_bind(int code) {
+    if (!g_capture) return;
+    if (code) {
+        int* b = g_capture == 1 ? g_settings.key_bind : g_settings.pad_bind;
+        b[g_crow] = code;
+        g_changes |= 1u << MI_CONTROLS;
+    }
+    g_capture = 0;
+    g_dirty = true;
+}
 
 static bool item_enabled(int i) {
     switch (i) {
@@ -34,6 +71,8 @@ void menu_open(const MenuInfo* info) {
     g_info = *info;
     g_open = true;
     g_sel = 0;
+    g_controls = false;
+    g_capture = 0;
     g_dirty = true;
 }
 
@@ -59,8 +98,49 @@ static void change(int item, int dir) {
     g_changes |= 1u << item;
 }
 
+static void controls_action(int a) {
+    if (g_capture) return;             /* the window sends the key / button instead */
+    switch (a) {
+    case MENU_UP: g_crow = (g_crow + CROWS - 1) % CROWS; break;
+    case MENU_DOWN: g_crow = (g_crow + 1) % CROWS; break;
+    case MENU_LEFT: case MENU_RIGHT:
+        if (g_crow == CROW_KBPLAYER) {
+            g_settings.keyboard_player = (g_settings.keyboard_player + (a == MENU_LEFT ? 3 : 1)) % 4;
+            g_changes |= 1u << MI_CONTROLS;
+        } else if (g_crow == CROW_NINTENDO) {
+            g_settings.nintendo_labels = !g_settings.nintendo_labels;
+            g_changes |= 1u << MI_CONTROLS;
+        } else {
+            g_ccol ^= 1;
+        }
+        break;
+    case MENU_OK:
+        if (g_crow == CROW_BACK) g_controls = false;
+        else if (g_crow == CROW_KBPLAYER) {
+            g_settings.keyboard_player = (g_settings.keyboard_player + 1) % 4;
+            g_changes |= 1u << MI_CONTROLS;
+        } else if (g_crow == CROW_NINTENDO) {
+            g_settings.nintendo_labels = !g_settings.nintendo_labels;
+            g_changes |= 1u << MI_CONTROLS;
+        }
+        else if (g_crow == CROW_RESET) {
+            for (int i = 0; i < GCI_COUNT; i++) g_settings.key_bind[i] = g_settings.pad_bind[i] = 0;
+            g_changes |= 1u << MI_CONTROLS;
+        } else {
+            g_capture = g_ccol + 1;
+        }
+        break;
+    case MENU_BACK: g_controls = false; break;
+    }
+    g_dirty = true;
+}
+
 void menu_action(int a) {
     if (!g_open) return;
+    if (g_controls) {
+        controls_action(a);
+        return;
+    }
     switch (a) {
     case MENU_UP:
     case MENU_DOWN: {
@@ -73,10 +153,12 @@ void menu_action(int a) {
     }
     case MENU_LEFT:
     case MENU_RIGHT:
+        if (g_sel == MI_CONTROLS) { if (a == MENU_RIGHT) menu_action(MENU_OK); return; }
         if (item_enabled(g_sel)) change(g_sel, a == MENU_LEFT ? -1 : 1);
         break;
     case MENU_OK:
         if (g_sel == MI_CLOSE) g_open = false;
+        else if (g_sel == MI_CONTROLS) { g_controls = true; g_crow = 0; g_ccol = 0; g_capture = 0; }
         else if (item_enabled(g_sel)) change(g_sel, 1);
         break;
     case MENU_BACK:
@@ -220,7 +302,8 @@ static int text_wrapped(const char* s, float x, int y, float maxw, int size, int
 
 static const char* item_label(int i) {
     static const char* const k[MI_COUNT] = {"SCREEN SHAPE", "DISPLAY", "WINDOW SIZE", "RENDERER",
-                                            "INTERNAL RESOLUTION", "CUSTOM TEXTURES", "BACK TO THE GAME"};
+                                            "INTERNAL RESOLUTION", "CUSTOM TEXTURES", "CONTROLS",
+                                            "BACK TO THE GAME"};
     return k[i];
 }
 
@@ -238,6 +321,7 @@ static void item_value(int i, char* out, size_t cap) {
     case MI_TEXTURES:
         snprintf(out, cap, "%s", !g_info.textures_found ? "NONE FOUND" : s->custom_textures ? "ON" : "OFF");
         break;
+    case MI_CONTROLS: snprintf(out, cap, "KEYBOARD AND CONTROLLER"); break;
     default: out[0] = 0; break;
     }
 }
@@ -258,6 +342,7 @@ static const char* item_help(int i) {
                                    ".png or .dds). Turn off and on again (or press F5 twice) to load files added or changed since."
                                  : "No custom texture folder was found. Put Dolphin-format texture packs in "
                                    "C:\\nfls2\\textures to use them.";
+    case MI_CONTROLS: return "Choose which keys and controller buttons work each GameCube button and stick.";
     default: return "Close this menu and carry on playing.";
     }
 }
@@ -268,6 +353,8 @@ static bool needs_restart(int i) {
     if (i == MI_RES) return g_info.gpu_running && s->renderer == 0 && s->resolution != g_info.res_running;
     return false;
 }
+
+static void draw_controls(int w, int h, float u);
 
 #define COL_ORANGE 0xFF7A00u
 #define COL_YELLOW 0xFFD21Fu
@@ -298,8 +385,12 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
     if ((float)w / 1920.0f < u * 0.75f) u = (float)w / 1920.0f / 0.75f;
 #define U(v) ((int)((v) * u + 0.5f))
     fill_rect(0, 0, w, h, 0, 150);                     /* the game, dimmed */
+    if (g_controls) {
+        draw_controls(w, h, u);
+        return g_px;
+    }
 
-    int pw = U(980), ph = U(820);
+    int pw = U(980), ph = U(890);
     int px0 = (w - pw) / 2, py0 = (h - ph) / 2;
     fill_rect(px0, py0, px0 + pw, py0 + ph, COL_PANEL, 232);
     fill_rect(px0, py0 + ph - U(6), px0 + pw, py0 + ph, COL_ORANGE, 255);   /* bottom edge */
@@ -346,4 +437,74 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
          U(26), COL_GREY, 230, 2);
 #undef U
     return g_px;
+}
+
+/* ------------------------------------------------------ controls page --- */
+static const char* const k_input_labels[GCI_COUNT] = {
+    "A", "B", "X", "Y", "Z", "START", "L", "R",
+    "D-PAD UP", "D-PAD DOWN", "D-PAD LEFT", "D-PAD RIGHT",
+    "STICK UP", "STICK DOWN", "STICK LEFT", "STICK RIGHT",
+    "C-STICK UP", "C-STICK DOWN", "C-STICK LEFT", "C-STICK RIGHT",
+};
+
+static void draw_controls(int w, int h, float u) {
+#define U(v) ((int)((v) * u + 0.5f))
+    int pw = U(1100), ph = U(1010);
+    int px0 = (w - pw) / 2, py0 = (h - ph) / 2;
+    fill_rect(px0, py0, px0 + pw, py0 + ph, COL_PANEL, 232);
+    fill_rect(px0, py0 + ph - U(6), px0 + pw, py0 + ph, COL_ORANGE, 255);
+    int by0 = py0 - U(30), by1 = py0 + U(70);
+    fill_slant(px0 - U(24), by0, px0 + U(380), by1, U(24), COL_ORANGE, 255);
+    fill_slant(px0 + U(390), by0 + U(16), px0 + U(416), by1, U(22), COL_YELLOW, 255);
+    text("CONTROLS", (float)(px0 + U(28)), by1 - U(20), U(68), 0x111111u, 255, 0);
+
+    int lx = px0 + U(60), c0 = px0 + U(560), c1 = px0 + U(880);
+    int top = py0 + U(100), row_h = U(34), fs = U(25);
+    text("KEYBOARD", (float)c0, top, U(26), COL_ORANGE, 255, 2);
+    text("CONTROLLER", (float)c1, top, U(26), COL_ORANGE, 255, 2);
+    int ry = top + U(14);
+    for (int r = 0; r < CROWS; r++) {
+        int y0 = ry + r * row_h + (r >= CROW_KBPLAYER ? U(12) : 0);
+        int base = y0 + U(27);
+        bool sel = r == g_crow;
+        if (sel) fill_rect(px0 + U(24), y0, px0 + pw - U(24), y0 + row_h - U(4), COL_ORANGE, 30);
+        if (r == CROW_KBPLAYER || r == CROW_NINTENDO) {
+            text(r == CROW_KBPLAYER ? "KEYBOARD PLAYS AS" : "NINTENDO CONTROLLERS", (float)lx, base, fs,
+                 sel ? COL_YELLOW : COL_GREY, 255, 0);
+            char v[40];
+            if (r == CROW_KBPLAYER) snprintf(v, sizeof(v), "PLAYER %d", g_settings.keyboard_player + 1);
+            else snprintf(v, sizeof(v), "%s", g_settings.nintendo_labels ? "BY LABEL (A = A)" : "BY POSITION");
+            text(v, (float)c0, base, fs, sel ? COL_WHITE : 0xD2D2D2u, 255, 2);
+            if (sel) {
+                int vw = (int)text_width(v, fs);
+                arrow(c0 - vw / 2 - U(22), base - U(10), U(8), -1, COL_YELLOW, 255);
+                arrow(c0 + vw / 2 + U(22), base - U(10), U(8), 1, COL_YELLOW, 255);
+            }
+            continue;
+        }
+        if (r >= CROW_RESET) {
+            text(r == CROW_RESET ? "RESET ALL TO DEFAULTS" : "BACK", (float)lx, base, fs, sel ? COL_YELLOW : COL_GREY,
+                 255, 0);
+            if (sel) fill_rect(px0 + U(24), y0, px0 + U(32), y0 + row_h - U(4), COL_ORANGE, 255);
+            continue;
+        }
+        text(k_input_labels[r], (float)lx, base, fs, sel ? COL_YELLOW : COL_GREY, 255, 0);
+        for (int c = 0; c < 2; c++) {
+            int cx = c ? c1 : c0;
+            int code = c ? g_settings.pad_bind[r] : g_settings.key_bind[r];
+            const char* name = code < 0 ? "-" : c ? (g_pad_name ? g_pad_name(code) : "?") : (g_key_name ? g_key_name(code) : "?");
+            bool cell = sel && c == g_ccol;
+            if (cell) {
+                fill_rect(cx - U(150), y0 + U(2), cx + U(150), y0 + row_h - U(6), COL_ORANGE, g_capture ? 200 : 90);
+                if (g_capture) name = c ? "PRESS A BUTTON" : "PRESS A KEY";
+            }
+            text(name, (float)cx, base, fs, cell ? COL_WHITE : 0xD2D2D2u, 255, 2);
+        }
+    }
+    if (g_players[0])
+        text(g_players, (float)(w / 2), py0 + ph - U(50), U(22), COL_ORANGE, 255, 2);
+    const char* help = g_capture ? "ESC: CANCEL     DELETE: NO BINDING"
+                                 : "UP / DOWN: CHOOSE     LEFT / RIGHT: KEYBOARD OR CONTROLLER     ENTER OR A: CHANGE     ESC OR B: BACK";
+    text(help, (float)(w / 2), py0 + ph - U(24), U(22), COL_GREY, 230, 2);
+#undef U
 }

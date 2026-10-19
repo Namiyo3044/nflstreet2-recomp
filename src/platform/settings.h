@@ -7,6 +7,17 @@
  * when started from play.ps1) and changed from the in-game video menu (F1).
  * Command-line switches override them for one run.
  */
+/* GameCube controller inputs that can be bound to a key and a controller
+   button or stick direction. */
+enum {
+    GCI_A, GCI_B, GCI_X, GCI_Y, GCI_Z, GCI_START, GCI_L, GCI_R,
+    GCI_DUP, GCI_DDOWN, GCI_DLEFT, GCI_DRIGHT,
+    GCI_SUP, GCI_SDOWN, GCI_SLEFT, GCI_SRIGHT,
+    GCI_CUP, GCI_CDOWN, GCI_CLEFT, GCI_CRIGHT,
+    GCI_COUNT
+};
+extern const char* const k_gc_input_names[GCI_COUNT];   /* "a", "dpad_up", ... (settings file keys) */
+
 typedef struct {
     int renderer;                      /* 0 = graphics card, 1 = software */
     int resolution;                    /* graphics card's internal resolution, 1-8 x the GameCube's */
@@ -14,6 +25,13 @@ typedef struct {
     int fullscreen;                    /* 0 / 1 */
     int window_size;                   /* 1-4 x 640x480 */
     int custom_textures;               /* 0 / 1 */
+    /* Bindings: 0 = the default, -1 = nothing. Keys are SDL scancodes;
+       controller codes are SDL gamepad button + 1, or 64 + axis * 2
+       (+1 for the positive direction). */
+    int key_bind[GCI_COUNT];
+    int pad_bind[GCI_COUNT];
+    int keyboard_player;               /* 0-3: the player the keyboard controls */
+    int nintendo_labels;               /* 1: Nintendo-style controllers by their labels (A = A), 0: by position */
 } Settings;
 
 extern Settings g_settings;

@@ -4,7 +4,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-Settings g_settings = {0, 4, 0, 0, 2, 1};
+Settings g_settings = {0, 4, 0, 0, 2, 1, {0}, {0}, 0, 1};
+
+const char* const k_gc_input_names[GCI_COUNT] = {
+    "a", "b", "x", "y", "z", "start", "l", "r",
+    "dpad_up", "dpad_down", "dpad_left", "dpad_right",
+    "stick_up", "stick_down", "stick_left", "stick_right",
+    "cstick_up", "cstick_down", "cstick_left", "cstick_right",
+};
 static char g_path[1024];
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -30,6 +37,15 @@ bool settings_load(const char* path) {
         else if (strcmp(key, "fullscreen") == 0) s->fullscreen = atoi(val) != 0;
         else if (strcmp(key, "window_size") == 0) s->window_size = clampi(atoi(val), 1, 4);
         else if (strcmp(key, "custom_textures") == 0) s->custom_textures = atoi(val) != 0;
+        else if (strcmp(key, "keyboard_player") == 0) s->keyboard_player = clampi(atoi(val), 1, 4) - 1;
+        else if (strcmp(key, "nintendo_labels") == 0) s->nintendo_labels = atoi(val) != 0;
+        else if (strncmp(key, "key_", 4) == 0 || strncmp(key, "pad_", 4) == 0) {
+            for (int i = 0; i < GCI_COUNT; i++)
+                if (strcmp(key + 4, k_gc_input_names[i]) == 0) {
+                    if (key[0] == 'k') s->key_bind[i] = atoi(val);
+                    else s->pad_bind[i] = atoi(val);
+                }
+        }
     }
     fclose(f);
     return true;
@@ -51,5 +67,11 @@ void settings_save(void) {
     fprintf(f, "fullscreen=%d\n", s->fullscreen);
     fprintf(f, "window_size=%d\n", s->window_size);
     fprintf(f, "custom_textures=%d\n", s->custom_textures);
+    fprintf(f, "keyboard_player=%d\n", s->keyboard_player + 1);
+    fprintf(f, "nintendo_labels=%d\n", s->nintendo_labels);
+    fprintf(f, "# Controls (set from the menu): key_ = keyboard key code, pad_ = controller button / stick code,\n"
+               "# -1 = nothing, 0 = the default.\n");
+    for (int i = 0; i < GCI_COUNT; i++) fprintf(f, "key_%s=%d\n", k_gc_input_names[i], s->key_bind[i]);
+    for (int i = 0; i < GCI_COUNT; i++) fprintf(f, "pad_%s=%d\n", k_gc_input_names[i], s->pad_bind[i]);
     fclose(f);
 }

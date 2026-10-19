@@ -726,6 +726,23 @@ static const char* pad_name(int code) {
     return buf;
 }
 
+/* Controller buttons are bound by Xbox-style names (A at the bottom, B on
+   the right, X left, Y top). Nintendo controllers have A on the right and B
+   at the bottom (X top, Y left): matched by label, their A plays as A. The
+   swap works both ways, so it also turns a pressed button into its name. */
+static int face_button(SDL_Gamepad* pad, int button) {
+    if (!pad || !g_settings.nintendo_labels ||
+        SDL_GetGamepadButtonLabel(pad, SDL_GAMEPAD_BUTTON_SOUTH) != SDL_GAMEPAD_BUTTON_LABEL_B)
+        return button;
+    switch (button) {
+    case SDL_GAMEPAD_BUTTON_SOUTH: return SDL_GAMEPAD_BUTTON_EAST;
+    case SDL_GAMEPAD_BUTTON_EAST: return SDL_GAMEPAD_BUTTON_SOUTH;
+    case SDL_GAMEPAD_BUTTON_WEST: return SDL_GAMEPAD_BUTTON_NORTH;
+    case SDL_GAMEPAD_BUTTON_NORTH: return SDL_GAMEPAD_BUTTON_WEST;
+    default: return button;
+    }
+}
+
 /* How hard GameCube input i is pressed, 0-1: its key (all or nothing) or its
    controller binding (a stick or trigger gives the amount; buttons all or
    nothing), whichever is more. */
@@ -745,7 +762,7 @@ static float binding_amount(int i, SDL_Gamepad* pad, bool keys) {
             if (!pos) x = -x;
             /* small dead zone; a stick reaches a GameCube stick's full travel at 100% */
             v = x < 0.08f ? 0.0f : x > 1.0f ? 1.0f : x;
-        } else if (SDL_GetGamepadButton(pad, (SDL_GamepadButton)(pc - 1))) {
+        } else if (SDL_GetGamepadButton(pad, (SDL_GamepadButton)face_button(pad, pc - 1))) {
             v = 1.0f;
         }
         if (v > a) a = v;
@@ -833,7 +850,7 @@ static void menu_event(const SDL_Event* e) {
             else if (e->key.key == SDLK_DELETE || e->key.key == SDLK_BACKSPACE) menu_bind(-1);
             else if (cap == 1) menu_bind((int)e->key.scancode);
         } else if (cap == 2 && e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
-            menu_bind((int)e->gbutton.button + 1);
+            menu_bind(face_button(SDL_GetGamepadFromID(e->gbutton.which), e->gbutton.button) + 1);
         } else if (cap == 2 && e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
                    (e->gaxis.value > 24000 || e->gaxis.value < -24000)) {
             menu_bind(PAD_AXIS(e->gaxis.axis, e->gaxis.value > 0));
@@ -854,7 +871,7 @@ static void menu_event(const SDL_Event* e) {
         default: break;
         }
     } else if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
-        switch (e->gbutton.button) {
+        switch (face_button(SDL_GetGamepadFromID(e->gbutton.which), e->gbutton.button)) {   /* A confirms on any pad */
         case SDL_GAMEPAD_BUTTON_DPAD_UP: menu_action(MENU_UP); break;
         case SDL_GAMEPAD_BUTTON_DPAD_DOWN: menu_action(MENU_DOWN); break;
         case SDL_GAMEPAD_BUTTON_DPAD_LEFT: menu_action(MENU_LEFT); break;
