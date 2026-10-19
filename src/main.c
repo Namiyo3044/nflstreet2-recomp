@@ -339,6 +339,63 @@ static void card_trace(CPUState* ctx, u32 address) {
 #define UIS_FN_PLATFORM 1u
 static int g_uis_ok = -1;              /* the code looks as expected (checked once) */
 
+/* Edits to the main menu's scripts (menu group 0), each a comparison with
+   the console value the menu keeps (Xbox 1, GameCube 2):
+   - the Options list says "Audio Settings" (and its help line "Adjust audio
+     settings.") where the value is 1, else "Audio/Visual": compared with 2
+     instead while the screen shape is fixed, matching the Audio Settings
+     screen (uis_native_hook);
+   - the main menu leaves out Online, the Credits list leaves out Previews
+     and Madden NFL 2005, and picking Credits goes straight to the credits,
+     where the value is 2: compared with 0x7F (never) instead, so the menus
+     have the entries of the other versions. What the GameCube game does when
+     they are picked: Online and Madden NFL 2005 lead to features it doesn't
+     have; Previews to the trailer screen.
+   Each edit: the script bytes around the compared number (byte 11). */
+typedef struct { const u8 sig[26]; u8 len; u8 off, on; bool screen_shape; const char* what; } UisEdit;
+static const UisEdit k_uis_edits[] = {
+    {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x1C,0x3F,0x41,0x10,0,0,0x01,0x65,0x6F}, 26, 1, 2, true,
+     "Options list: Audio Settings"},
+    {{0x55,0,0,0,0xA0,0xFF,0xFA,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x26,0x3F,0x41,0x10,0,0,0x01,0x81,0x6F}, 26, 1, 2, true,
+     "Options help: Adjust audio settings."},
+    {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x02,0x36,0x41,0x10,0,0,0x01,0x36,0x10,0,0,0,0,0x0B}, 25, 2, 0x7F, false,
+     "main menu: Online"},
+    {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x02,0x36,0x10,0,0,0,0x1C,0x3F,0x41,0x10,0,0,0x01,0x67,0x6F}, 26, 2, 0x7F, false,
+     "Credits list: Previews, Madden NFL 2005"},
+    {{0x55,0,0,0,0xA0,0xFF,0xF7,0x10,0,0,0,0x02,0x36,0x10,0,0,0,0x68,0x3F}, 19, 2, 0x7F, false,
+     "Credits: choice of the three"},
+};
+#define UIS_EDITS (int)(sizeof(k_uis_edits) / sizeof(k_uis_edits[0]))
+
+static bool uis_edit_at(const u8* ram, u32 o, const UisEdit* e) {
+    return memcmp(ram + o, e->sig, 11) == 0 && (ram[o + 11] == e->off || ram[o + 11] == e->on) &&
+           memcmp(ram + o + 12, e->sig + 12, e->len - 12u) == 0;
+}
+
+static void uis_main_menu_edits(CPUState* ctx) {
+    static u32 at[UIS_EDITS];          /* where each was found last */
+    if (!ctx->ram || ctx->ram_size < 0x01000000u) return;
+    u8* ram = ctx->ram;
+    u32 n = ctx->ram_size - 32u;
+    bool search = false;
+    for (int i = 0; i < UIS_EDITS; i++)
+        if (!(at[i] && at[i] <= n && uis_edit_at(ram, at[i], &k_uis_edits[i]))) { at[i] = 0; search = true; }
+    if (search)                        /* menu scripts live in the upper heap */
+        for (u32 o = 0x00800000u; o < n; o++)
+            if (ram[o] == 0x55 && ram[o + 4] == 0xA0)
+                for (int i = 0; i < UIS_EDITS; i++)
+                    if (!at[i] && uis_edit_at(ram, o, &k_uis_edits[i])) at[i] = o;
+    for (int i = 0; i < UIS_EDITS; i++) {
+        const UisEdit* e = &k_uis_edits[i];
+        if (!at[i]) continue;
+        u8 want = (!e->screen_shape || g_settings.screen_shape != 0) ? e->on : e->off;
+        if (ram[at[i] + 11] != want) {
+            ram[at[i] + 11] = want;
+            printf("uis: %s %s\n", e->what, want == e->on ? "on" : "off");
+        }
+    }
+}
+
 static int uis_native_hook(CPUState* ctx) {
     if (g_uis_ok < 0)
         g_uis_ok = mem_read32(ctx, UIS_NATIVE_DISPATCH) == 0x9421FFE8u &&    /* stwu r1, -0x18(r1) */
@@ -346,6 +403,7 @@ static int uis_native_hook(CPUState* ctx) {
     if (!g_uis_ok || ctx->gpr[3] != UIS_FN_PLATFORM)
         return 0;
     u32 group = ctx->gpr[4], screen = ctx->gpr[5];
+    if (group == 0) uis_main_menu_edits(ctx);
     static u32 seen[16];
     if (group < 16 && screen < 32 && !(seen[group] & (1u << screen))) {
         seen[group] |= 1u << screen;
