@@ -19,7 +19,7 @@
 # Keyboard (the defaults; change them in the F1 menu under Controls): arrows = stick, X = A, Z = B, C = X, S = Y, D = Z, Q / W = L / R,
 #           Enter = START, I J K L = C-stick, T F G H = D-pad
 #           Esc = quit, F1 (or the controller's Back / View button) = video menu, F5 = custom textures on / off, Tab (hold) = fast-forward, F9 = screen shape (auto / 4:3 / 16:9), F10 = screenshot (shot_NNN.bmp), F11 = fullscreen,
-#           F12 = draw log of two frames (drawlog.txt, drawlog-short.txt).
+#           F12 = draw log of two frames (drawlog.txt, drawlog-short.txt), Shift+F8 = memory dump (memdump.bin, for debugging).
 #           A USB/XInput controller also works.
 # The log (and the end-of-run report) goes to play.txt.
 param(
@@ -126,7 +126,7 @@ if ($start) { $report = $log[($start - 1)..($log.Count - 1)] } else { $report = 
 # Slow stretches (the window logs a perf line each second the game runs below full speed).
 $perf = @($log | Select-String -Pattern "^perf:|^audio:|^hitch:" | ForEach-Object { $_.Line })
 $gpuLines = @($log | Select-String -Pattern "^gpu:|^custom textures:" | ForEach-Object { $_.Line })
-$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:|^window: player|^window: controller" | ForEach-Object { $_.Line })
+$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:|^window: player|^window: controller|^window: wrote memdump|^uis:|^window: game.s screen option" | ForEach-Object { $_.Line })
 $cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
 $txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })
 $ct = @($log | Select-String -Pattern "^cardtrace:" | ForEach-Object { $_.Line })

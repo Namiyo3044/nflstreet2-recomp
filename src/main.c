@@ -325,7 +325,42 @@ static void card_trace(CPUState* ctx, u32 address) {
     }
 }
 
+/* The game's menus are small scripts (EA's UIS). A script calls the game's
+   C code through one dispatcher (0x80064690: r3 = function, r4 = menu group,
+   r5 = screen, r8 = where the result goes). Function 1 answers which console
+   the game runs on (2 = GameCube). The Audio/Visual screen (group 5 OPTIONS,
+   screen 5) asks it to choose its layout: on Xbox (1) the screen is "Audio
+   Settings" without the Video (Normal / Letterbox / Widescreen) row, since
+   the Xbox sets that in its own dashboard. With the screen shape fixed in
+   the port's menu, that screen is told "Xbox", so the row is gone, like
+   it is there; the port keeps the setting itself in step
+   (sync_game_screen_option). Other screens and questions are untouched. */
+#define UIS_NATIVE_DISPATCH 0x80064690u
+#define UIS_FN_PLATFORM 1u
+static int g_uis_ok = -1;              /* the code looks as expected (checked once) */
+
+static int uis_native_hook(CPUState* ctx) {
+    if (g_uis_ok < 0)
+        g_uis_ok = mem_read32(ctx, UIS_NATIVE_DISPATCH) == 0x9421FFE8u &&    /* stwu r1, -0x18(r1) */
+                   mem_read32(ctx, 0x8017FDF0u) == 0x38600002u;               /* platform: li r3, 2 */
+    if (!g_uis_ok || ctx->gpr[3] != UIS_FN_PLATFORM)
+        return 0;
+    u32 group = ctx->gpr[4], screen = ctx->gpr[5];
+    static u32 seen[16];
+    if (group < 16 && screen < 32 && !(seen[group] & (1u << screen))) {
+        seen[group] |= 1u << screen;
+        printf("uis: menu group %u screen %u checks the console\n", group, screen);
+    }
+    if (!(group == 5 && screen == 5 && g_settings.screen_shape != 0))
+        return 0;
+    mem_write32(ctx, ctx->gpr[8], 1);  /* "Xbox" */
+    ctx->gpr[3] = 1;                   /* handled */
+    ctx->pc = ctx->lr;
+    return 1;
+}
+
 int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
+    if (address == UIS_NATIVE_DISPATCH && uis_native_hook(ctx)) return 1;
     g_trace[g_trace_pos++ % TRACE_LEN] = address;
     if (g_cardtrace) card_trace(ctx, address);
     if (g_text_watch_until > 0) {
@@ -415,8 +450,6 @@ int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
                 break;
             }
     }
-    if (address == 0x801D9E40u && g_movie_cur >= 0)   /* the game's movie player decoding a frame */
-        window_movie_frame();
     if (g_movie_fi && address && address == g_dvd_close && ctx->gpr[3] == g_movie_fi) {
         g_movie_fi = 0;
         g_movie_cur = -1;
@@ -681,6 +714,7 @@ int main(int argc, char** argv) {
     bool want_window = false;
     int window_scale = 2;
     int gpu_scale = 0;                 /* 0 = software renderer */
+    const char* dump_audio = NULL;
     const char* textures_dir = NULL;
     const char* dump_textures_dir = NULL;
     int aspect_mode = 0;
@@ -765,6 +799,8 @@ int main(int argc, char** argv) {
             xfb_every = (u32)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--stop-at") == 0 && i + 1 < argc) {
             stop_at = strtod(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--dump-audio") == 0 && i + 1 < argc) {
+            dump_audio = argv[++i];
         } else if (strcmp(argv[i], "--replace") == 0 && i + 1 < argc) {
             disc_set_replace_dir(argv[++i]);
         } else if (strcmp(argv[i], "--textures") == 0 && i + 1 < argc) {
@@ -818,6 +854,7 @@ int main(int argc, char** argv) {
     if (want_window) {
 #ifdef NFLS2_HAVE_WINDOW
         window_set_aspect_mode(aspect_mode);
+        if (dump_audio) window_set_audio_dump(dump_audio);
         window_set_gpu(gpu_scale);
         if (!window_open(window_scale))
             return 1;
