@@ -653,6 +653,18 @@ static void sync_game_screen_option(CPUState* cpu) {
     printf("window: game's screen option set to %s (was %u)\n", want ? "16:9" : "4:3", have);
 }
 
+/* Shift+F8: writes the game's main memory to memdump.bin (debug: lets the
+   menus' data be studied as the game holds it). Each press overwrites it. */
+static void dump_memory(void) {
+    CPUState* cpu = g_cpu_ref;
+    if (!cpu || !cpu->ram) return;
+    FILE* f = fopen("memdump.bin", "wb");
+    if (!f) { printf("window: couldn't write memdump.bin\n"); return; }
+    size_t n = fwrite(cpu->ram, 1, cpu->ram_size, f);
+    fclose(f);
+    printf("window: wrote memdump.bin (%u KB) at %.1f s\n", (unsigned)(n >> 10), interrupts_game_seconds());
+}
+
 /* ------------------------------------------------------------ controls --- */
 /* Defaults: the keys listed in play.ps1, and a standard controller laid out
    like a GameCube pad (sticks on sticks, L / R on the triggers, Z on the
@@ -926,6 +938,8 @@ static void poll_events(void) {
                 g_quit = true;
             } else if (e.key.key == SDLK_F7 && !e.key.repeat) {
                 freecam_toggle();
+            } else if (e.key.key == SDLK_F8 && !e.key.repeat && (e.key.mod & SDL_KMOD_SHIFT)) {
+                dump_memory();
             } else if (e.key.key == SDLK_F8 && !e.key.repeat) {
                 g_text_search = true;
             } else if (e.key.key == SDLK_F10 && !e.key.repeat) {
@@ -1374,6 +1388,110 @@ static void pace_and_stats(void) {
     }
 }
 
+/* ------------------------------------------------------------ trailers --- */
+/* The Previews menu's trailers (the game's own trailer code isn't in the
+   GameCube version, main.c answers the menu): replace\previews\<name>.mpg,
+   converted from the Xbox / PS2 MOVIEDAT.DAT, in its order. The game stands
+   still while one plays, its sound paused; any button stops it. */
+static const char* const k_previews[11] = {
+    "madden_nfl_2005", "nba_live_2005", "nba_street_v3", "fifa_street", "fifa_soccer_2005",
+    "ncaa_football_2005", "ncaa_march_madness_2005", "nascar_2005", "nhl_2005", "tiger_woods_2005",
+    "nfs_underground_2",
+};
+static int g_preview_req = -1;
+
+void window_preview_request(int index) {
+    g_preview_req = index;
+}
+
+static bool any_button_held(void) {
+    int kb = g_settings.keyboard_player;
+    for (int i = 0; i < PAD_PORTS; i++) {
+        PadLive st = player_state(g_pads[i], i == kb);
+        if (st.buttons) return true;
+    }
+    return false;
+}
+
+static void restart_pacing(void) {
+    Uint64 now = SDL_GetTicksNS();
+    g_base_ns = g_stat_ns = now;
+    g_base_field = g_field;
+    g_stat_fields = 0;
+    g_frames_at_stat = gx_raster_frames();
+    g_slept_ns = g_present_ns = 0;
+    g_hitch_last = 0;
+}
+
+static void preview_loop(CPUState* cpu) {
+    (void)cpu;
+    int idx = g_preview_req;
+    g_preview_req = -1;
+    if (idx < 0 || idx > 10) return;
+    const char* dir = disc_replace_dir();
+    if (!dir || !g_gpu) {
+        printf("movie: trailer %s not played (%s)\n", k_previews[idx], !dir ? "no replace folder" : "needs the GPU renderer");
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/previews/%s.mpg", dir, k_previews[idx]);
+    int rate = 0;
+    if (!preview_open(path, &rate)) {
+        printf("movie: no trailer at %s\n", path);
+        return;
+    }
+    SDL_AudioStream* as = NULL;
+    if (rate > 0) {
+        SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, rate};
+        as = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+        if (as) SDL_ResumeAudioStreamDevice(as);
+    }
+    if (g_audio) SDL_PauseAudioStreamDevice(g_audio);
+    all_idle();
+    const double bytes_per_s = rate * 8.0;
+    double fed = 0.0, t = 0.0;
+    bool sound_done = !as, armed = false, stopped = false;
+    Uint64 last = SDL_GetTicksNS();
+    while (!g_quit) {
+        poll_events();
+        Uint64 now = SDL_GetTicksNS();
+        double dt = (double)(now - last) * 1e-9;
+        last = now;
+        while (as && !sound_done && SDL_GetAudioStreamQueued(as) < (int)(bytes_per_s * 0.25)) {
+            const float* s = preview_audio();
+            if (!s) { sound_done = true; break; }
+            SDL_PutAudioStreamData(as, s, 1152 * 8);
+            fed += 1152.0 / rate;
+        }
+        int queued = as ? SDL_GetAudioStreamQueued(as) : 0;
+        if (as && (!sound_done || queued > 0))
+            t = fed - queued / bytes_per_s;   /* the picture follows the sound */
+        else
+            t += dt;                          /* no sound (left): the clock */
+        u32 w = 0, h = 0;
+        bool pictures_done;
+        const u32* px = preview_frame(t, &w, &h, &pictures_done);
+        if (pictures_done && sound_done && queued == 0) break;
+        int ww = 0, wh = 0;
+        SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
+        if (ww > 0 && wh > 0) {
+            if (px) gx_raster_present_pixels(px, w, h, ww, wh, 4.0f / 3.0f);   /* the trailers are 4:3 */
+            else glr_present_black(ww, wh);
+            SDL_GL_SwapWindow(g_window);
+        }
+        if (!any_button_held()) armed = true;   /* the press that picked it, let go first */
+        else if (armed) { stopped = true; break; }
+        if (menu_is_open()) { stopped = true; break; }
+        SDL_Delay(4);
+    }
+    printf("movie: trailer %s %s after %.1f s\n", k_previews[idx], stopped ? "stopped" : "ended", t);
+    preview_close();
+    if (as) SDL_DestroyAudioStream(as);
+    if (g_audio) SDL_ResumeAudioStreamDevice(g_audio);
+    g_input_block = true;              /* the stopping press doesn't reach the game */
+    restart_pacing();
+}
+
 /* The game stands still while the menu is open: the last picture stays up
    under it, the sound pauses, and real-time pacing restarts afterwards. */
 static void menu_loop(CPUState* cpu) {
@@ -1407,6 +1525,10 @@ void window_field(CPUState* cpu) {
     sync_game_screen_option(cpu);
     if (menu_is_open()) {
         menu_loop(cpu);
+        return;
+    }
+    if (g_preview_req >= 0) {
+        preview_loop(cpu);
         return;
     }
     read_input();

@@ -86,3 +86,69 @@ const uint32_t* movie_frame(long want, uint32_t* w, uint32_t* h) {
     *h = g_h;
     return g_px;
 }
+
+/* ------------------------------------------------------------ trailers --- */
+/* A movie played on its own, with its sound: the trailers of the Previews
+   menu, which the GameCube game doesn't have (window.c plays them). */
+static plm_t* g_pv;
+static uint32_t* g_pv_px;
+static uint32_t g_pv_w, g_pv_h;
+static plm_frame_t* g_pv_next;         /* decoded, not yet due */
+static bool g_pv_video_done, g_pv_have;
+
+bool preview_open(const char* path, int* rate) {
+    preview_close();
+    g_pv = plm_create_with_filename(path);
+    if (!g_pv)
+        return false;
+    plm_set_loop(g_pv, 0);
+    g_pv_w = (uint32_t)plm_get_width(g_pv);
+    g_pv_h = (uint32_t)plm_get_height(g_pv);
+    if (!g_pv_w || !g_pv_h || g_pv_w > 1920 || g_pv_h > 1080) {
+        printf("movie: %s is %ux%u, not a size that can be shown\n", path, g_pv_w, g_pv_h);
+        preview_close();
+        return false;
+    }
+    g_pv_px = (uint32_t*)malloc((size_t)g_pv_w * g_pv_h * 4);
+    if (!g_pv_px) { preview_close(); return false; }
+    bool sound = plm_get_num_audio_streams(g_pv) > 0;
+    plm_set_audio_enabled(g_pv, sound ? 1 : 0);
+    *rate = sound ? plm_get_samplerate(g_pv) : 0;
+    g_pv_next = NULL;
+    g_pv_video_done = g_pv_have = false;
+    printf("movie: playing trailer %s (%ux%u, %s)\n", path, g_pv_w, g_pv_h, sound ? "with sound" : "no sound");
+    return true;
+}
+
+void preview_close(void) {
+    if (g_pv) plm_destroy(g_pv);
+    g_pv = NULL;
+    free(g_pv_px);
+    g_pv_px = NULL;
+    g_pv_next = NULL;
+}
+
+const float* preview_audio(void) {
+    if (!g_pv) return NULL;
+    plm_samples_t* s = plm_decode_audio(g_pv);
+    return s ? s->interleaved : NULL;
+}
+
+const uint32_t* preview_frame(double t, uint32_t* w, uint32_t* h, bool* ended) {
+    *ended = true;
+    if (!g_pv) return NULL;
+    while (!g_pv_video_done) {
+        if (!g_pv_next) {
+            g_pv_next = plm_decode_video(g_pv);
+            if (!g_pv_next) { g_pv_video_done = true; break; }
+        }
+        if (g_pv_next->time > t) break;
+        plm_frame_to_bgra(g_pv_next, (uint8_t*)g_pv_px, (int)(g_pv_w * 4));
+        g_pv_have = true;
+        g_pv_next = NULL;
+    }
+    *ended = g_pv_video_done;
+    *w = g_pv_w;
+    *h = g_pv_h;
+    return g_pv_have ? g_pv_px : NULL;
+}

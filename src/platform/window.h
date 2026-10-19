@@ -34,6 +34,9 @@ void window_set_aspect_mode(int mode);
 /* Fast-forward on or off (also on while Tab is held). */
 void window_set_turbo(bool on);
 
+/* Records everything sent to the speakers to a .wav file. */
+void window_set_audio_dump(const char* path);
+
 /* From now on, follow the game's detected widescreen setting (until then the
    shape remembered from the last run is used). */
 void window_trust_screen_shape(void);
@@ -54,6 +57,10 @@ void window_close(void);
    if there is one. */
 void window_movie_begin(int index);
 void window_movie_end(void);
-void window_movie_frame(void);         /* the game decoded its next movie frame */
+
+/* The Previews menu asked for trailer index (its place in the Xbox / PS2
+   MOVIEDAT.DAT, 0-10): plays replace\previews\<name>.mpg at the next video
+   field, the game standing still meanwhile. */
+void window_preview_request(int index);
 
 #endif

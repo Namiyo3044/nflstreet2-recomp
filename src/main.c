@@ -327,7 +327,7 @@ static void card_trace(CPUState* ctx, u32 address) {
 
 /* The game's menus are small scripts (EA's UIS). A script calls the game's
    C code through one dispatcher (0x80064690: r3 = function, r4 = menu group,
-   r5 = screen, r8 = where the result goes). Function 1 answers which console
+   r5 = screen, r7 = the arguments, r8 = where the result goes). Function 1 answers which console
    the game runs on (2 = GameCube). The Audio/Visual screen (group 5 OPTIONS,
    screen 5) asks it to choose its layout: on Xbox (1) the screen is "Audio
    Settings" without the Video (Normal / Letterbox / Widescreen) row, since
@@ -337,7 +337,9 @@ static void card_trace(CPUState* ctx, u32 address) {
    (sync_game_screen_option). Other screens and questions are untouched. */
 #define UIS_NATIVE_DISPATCH 0x80064690u
 #define UIS_FN_PLATFORM 1u
+#define UIS_FN_SCREEN_OK 0x38u          /* (screen) -> whether that screen can be shown */
 static int g_uis_ok = -1;              /* the code looks as expected (checked once) */
+static bool g_uis_log;                /* --uis-log */
 
 /* Edits to the main menu's scripts (menu group 0), each a comparison with
    the console value the menu keeps (Xbox 1, GameCube 2):
@@ -400,9 +402,62 @@ static int uis_native_hook(CPUState* ctx) {
     if (g_uis_ok < 0)
         g_uis_ok = mem_read32(ctx, UIS_NATIVE_DISPATCH) == 0x9421FFE8u &&    /* stwu r1, -0x18(r1) */
                    mem_read32(ctx, 0x8017FDF0u) == 0x38600002u;               /* platform: li r3, 2 */
-    if (!g_uis_ok || ctx->gpr[3] != UIS_FN_PLATFORM)
+    if (!g_uis_ok)
         return 0;
     u32 group = ctx->gpr[4], screen = ctx->gpr[5];
+    if (g_uis_log) {                   /* --uis-log: each distinct call once */
+        static u32 seen_calls[1024];
+        static int n_seen;
+        u32 key = (group & 0xFFu) << 24 | (screen & 0xFFu) << 16 | (ctx->gpr[3] & 0xFFFFu) |
+                  (ctx->gpr[3] & 0x80000000u ? 0x8000u : 0);
+        int i = 0;
+        while (i < n_seen && seen_calls[i] != key) i++;
+        if (i == n_seen && n_seen < 1024) {
+            seen_calls[n_seen++] = key;
+            u32 argc = ctx->gpr[6];
+            printf("uis: call %s%X  group %u screen %u  args %u:", ctx->gpr[3] & 0x80000000u ? "K" : "",
+                   ctx->gpr[3] & 0x7FFFFFFFu, group, screen, argc);
+            for (u32 k = 0; k < argc && k < 4; k++) printf(" %d", (int)mem_read32(ctx, ctx->gpr[7] + 4 * k));
+            printf("  (%.1f s)\n", interrupts_game_seconds());
+        }
+    }
+    if (ctx->gpr[3] == UIS_FN_SCREEN_OK && group == 0) {
+        /* The restored main menu entries whose screens aren't in the GameCube
+           game (uis_main_menu_edits): Online (0x12C; going on would also award
+           the "online match" feat, then hang) and Madden NFL 2005 (0x9C, the
+           PS2 demo). "Not available", so picking them does nothing. */
+        u32 target = mem_read32(ctx, ctx->gpr[7]);
+        if (target == 0x12Cu || target == 0x9Cu) {
+            mem_write32(ctx, ctx->gpr[8], 0);
+            ctx->gpr[3] = 1;
+            ctx->pc = ctx->lr;
+            return 1;
+        }
+        return 0;
+    }
+    if (group == 5 && screen == 3 && ctx->gpr[3] == 0x80000003u && ctx->gpr[6] == 1) {
+        /* The Previews menu (OPTIONS screen 3, restored above): each entry
+           calls the screen's function 3 with n (1-11), which hands n - 1 to the
+           trailer player the GameCube version left empty (0x8001F500). The
+           window plays the trailer instead, from its place in the Xbox / PS2
+           MOVIEDAT.DAT. */
+        /* n numbers the games about alphabetically (FIFA Soccer, FIFA Street,
+           Madden, March Madness, NASCAR, NBA Street, NBA Live, NCAA Football,
+           Need for Speed, NHL, Tiger Woods); the movie file has its own order. */
+        static const int k_trailer[12] = {-1, 4, 3, 0, 6, 7, 2, 1, 5, 10, 8, 9};
+        u32 n = mem_read32(ctx, ctx->gpr[7]);
+        int idx = n >= 1 && n <= 11 ? k_trailer[n] : -1;
+        printf("uis: Previews entry %u -> trailer %d\n", n, idx);
+#ifdef NFLS2_HAVE_WINDOW
+        if (idx >= 0) window_preview_request(idx);
+#endif
+        mem_write32(ctx, ctx->gpr[8], 1);
+        ctx->gpr[3] = 1;
+        ctx->pc = ctx->lr;
+        return 1;
+    }
+    if (ctx->gpr[3] != UIS_FN_PLATFORM)
+        return 0;
     if (group == 0) uis_main_menu_edits(ctx);
     static u32 seen[16];
     if (group < 16 && screen < 32 && !(seen[group] & (1u << screen))) {
@@ -859,6 +914,8 @@ int main(int argc, char** argv) {
             stop_at = strtod(argv[++i], NULL);
         } else if (strcmp(argv[i], "--dump-audio") == 0 && i + 1 < argc) {
             dump_audio = argv[++i];
+        } else if (strcmp(argv[i], "--uis-log") == 0) {
+            g_uis_log = true;
         } else if (strcmp(argv[i], "--replace") == 0 && i + 1 < argc) {
             disc_set_replace_dir(argv[++i]);
         } else if (strcmp(argv[i], "--textures") == 0 && i + 1 < argc) {

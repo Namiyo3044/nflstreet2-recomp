@@ -22,4 +22,14 @@ long movie_first_visible(void);
    call. */
 const uint32_t* movie_frame(long n, uint32_t* w, uint32_t* h);
 
+/* A movie on its own with its sound (the Previews menu's trailers). rate:
+   the sound's sample rate, 0 when it has none. */
+bool preview_open(const char* path, int* rate);
+void preview_close(void);
+/* The next 1152 stereo frames of sound (float, interleaved), NULL at the end. */
+const float* preview_audio(void);
+/* The picture due at t seconds (NULL before the first); ended once the
+   pictures have run out. */
+const uint32_t* preview_frame(double t, uint32_t* w, uint32_t* h, bool* ended);
+
 #endif
