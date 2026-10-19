@@ -30,6 +30,9 @@ static int g_crow, g_ccol, g_capture;
 #define CROW_BACK (GCI_COUNT + 3)
 #define CROWS (GCI_COUNT + 4)
 static char g_players[256];
+/* The quit page: 0 = YES, 1 = NO. */
+static bool g_quit_page, g_quit_yes;
+static int g_qsel;
 
 void menu_set_players_text(const char* text) {
     if (strcmp(g_players, text) != 0) {
@@ -70,10 +73,26 @@ static bool item_enabled(int i) {
 void menu_open(const MenuInfo* info) {
     g_info = *info;
     g_open = true;
+    g_quit_page = false;
     g_sel = 0;
     g_controls = false;
     g_capture = 0;
     g_dirty = true;
+}
+
+void menu_open_quit(void) {
+    g_open = true;
+    g_quit_page = true;
+    g_qsel = 1;                        /* NO to start with */
+    g_controls = false;
+    g_capture = 0;
+    g_dirty = true;
+}
+
+bool menu_take_quit(void) {
+    bool q = g_quit_yes;
+    g_quit_yes = false;
+    return q;
 }
 
 bool menu_is_open(void) { return g_open; }
@@ -137,6 +156,18 @@ static void controls_action(int a) {
 
 void menu_action(int a) {
     if (!g_open) return;
+    if (g_quit_page) {
+        switch (a) {
+        case MENU_UP: case MENU_DOWN: case MENU_LEFT: case MENU_RIGHT: g_qsel ^= 1; break;
+        case MENU_OK:
+            if (g_qsel == 0) g_quit_yes = true;
+            g_open = g_quit_page = false;
+            break;
+        case MENU_BACK: g_open = g_quit_page = false; break;
+        }
+        g_dirty = true;
+        return;
+    }
     if (g_controls) {
         controls_action(a);
         return;
@@ -385,6 +416,31 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
     if ((float)w / 1920.0f < u * 0.75f) u = (float)w / 1920.0f / 0.75f;
 #define U(v) ((int)((v) * u + 0.5f))
     fill_rect(0, 0, w, h, 0, 150);                     /* the game, dimmed */
+    if (g_quit_page) {
+        int pw = U(760), ph = U(330);
+        int px0 = (w - pw) / 2, py0 = (h - ph) / 2;
+        fill_rect(px0, py0, px0 + pw, py0 + ph, COL_PANEL, 232);
+        fill_rect(px0, py0 + ph - U(6), px0 + pw, py0 + ph, COL_ORANGE, 255);
+        int by0 = py0 - U(36), by1 = py0 + U(78);
+        fill_slant(px0 - U(24), by0, px0 + U(420), by1, U(28), COL_ORANGE, 255);
+        fill_slant(px0 + U(430), by0 + U(18), px0 + U(460), by1, U(26), COL_YELLOW, 255);
+        text("QUIT GAME?", (float)(px0 + U(28)), by1 - U(24), U(78), 0x111111u, 255, 0);
+        text("Anything not saved will be lost.", (float)(w / 2), py0 + U(160), U(34), COL_GREY, 255, 2);
+        static const char* const k_q[2] = {"YES", "NO"};
+        for (int i = 0; i < 2; i++) {
+            int cx = w / 2 + (i == 0 ? -U(150) : U(150));
+            int y0 = py0 + U(205), y1 = y0 + U(76);
+            bool sel = g_qsel == i;
+            if (sel) {
+                fill_rect(cx - U(120), y0, cx + U(120), y1, COL_ORANGE, 46);
+                fill_rect(cx - U(120), y1 - U(6), cx + U(120), y1, COL_ORANGE, 255);
+            }
+            text(k_q[i], (float)cx, y0 + U(56), U(46), sel ? COL_YELLOW : COL_GREY, 255, 2);
+        }
+        text("LEFT / RIGHT: CHOOSE     A / ENTER: CONFIRM     B / ESC: BACK", (float)(w / 2), py0 + ph + U(50), U(26),
+             COL_GREY, 230, 2);
+        return g_px;
+    }
     if (g_controls) {
         draw_controls(w, h, u);
         return g_px;

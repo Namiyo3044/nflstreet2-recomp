@@ -22,6 +22,10 @@ enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_OK, MENU_BACK };
 enum { MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RENDERER, MI_RES, MI_TEXTURES, MI_CONTROLS, MI_CLOSE, MI_COUNT };
 
 void menu_open(const MenuInfo* info);
+/* Opens on its own page asking whether to quit (the main menu's Quit Game);
+   menu_take_quit() is true once after YES. */
+void menu_open_quit(void);
+bool menu_take_quit(void);
 bool menu_is_open(void);
 void menu_action(int action);
 

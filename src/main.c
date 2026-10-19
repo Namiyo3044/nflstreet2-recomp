@@ -398,6 +398,10 @@ static void uis_main_menu_edits(CPUState* ctx) {
     }
 }
 
+/* Function UIS_FN_QUIT: not one of the game's; script bytes the port adds
+   call it to ask "quit?" (window_quit_request). */
+#define UIS_FN_QUIT 0x7A51u
+
 static int uis_native_hook(CPUState* ctx) {
     if (g_uis_ok < 0)
         g_uis_ok = mem_read32(ctx, UIS_NATIVE_DISPATCH) == 0x9421FFE8u &&    /* stwu r1, -0x18(r1) */
@@ -420,6 +424,16 @@ static int uis_native_hook(CPUState* ctx) {
             for (u32 k = 0; k < argc && k < 4; k++) printf(" %d", (int)mem_read32(ctx, ctx->gpr[7] + 4 * k));
             printf("  (%.1f s)\n", interrupts_game_seconds());
         }
+    }
+    if (ctx->gpr[3] == UIS_FN_QUIT && group == 0) {
+        printf("uis: Quit Game picked\n");
+#ifdef NFLS2_HAVE_WINDOW
+        window_quit_request();
+#endif
+        mem_write32(ctx, ctx->gpr[8], 0);
+        ctx->gpr[3] = 1;
+        ctx->pc = ctx->lr;
+        return 1;
     }
     if (ctx->gpr[3] == UIS_FN_SCREEN_OK && group == 0) {
         /* The restored main menu entries whose screens aren't in the GameCube

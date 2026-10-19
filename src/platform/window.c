@@ -1400,6 +1400,11 @@ static const char* const k_previews[11] = {
     "nfs_underground_2",
 };
 static int g_preview_req = -1;
+static bool g_quit_req;
+
+void window_quit_request(void) {
+    g_quit_req = true;
+}
 
 void window_preview_request(int index) {
     g_preview_req = index;
@@ -1531,6 +1536,16 @@ void window_field(CPUState* cpu) {
     }
     if (g_preview_req >= 0) {
         preview_loop(cpu);
+        return;
+    }
+    if (g_quit_req) {
+        g_quit_req = false;
+        menu_open_quit();
+        menu_loop(cpu);
+        if (menu_take_quit()) {
+            printf("window: quitting from the game's main menu\n");
+            g_quit = true;
+        }
         return;
     }
     read_input();

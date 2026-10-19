@@ -63,4 +63,7 @@ void window_movie_end(void);
    field, the game standing still meanwhile. */
 void window_preview_request(int index);
 
+/* The main menu's Quit Game was picked: asks "quit?" at the next field. */
+void window_quit_request(void);
+
 #endif
