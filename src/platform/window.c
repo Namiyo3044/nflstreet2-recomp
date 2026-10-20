@@ -277,6 +277,21 @@ static void save_shape(int wide) {
     }
 }
 
+/* Screen shape changes are only taken in the game's menus: a match lays
+   out its HUD when it starts, so a shape changed mid-match would leave the
+   HUD in the old layout (cut off going to 4:3). The menus count as up
+   while a menu script (main menu, options screens) has made a call to the
+   game in the last few seconds. */
+static u64 g_front_end_field;
+static bool g_front_end_seen;
+
+void window_note_front_end(void) {
+    g_front_end_field = g_field;
+    g_front_end_seen = true;
+}
+
+static bool in_front_end(void) { return !g_front_end_seen || g_field - g_front_end_field < 180; }
+
 static void update_aspect(bool announce) {
     int detected = g_shape_trusted || g_saved_wide < 0 ? gx_raster_widescreen() : -1;
     if (g_aspect_mode == 0 && detected >= 0 && g_shape_trusted)
@@ -629,6 +644,13 @@ static void ram_search(bool restart, bool same) {
     g_rs_step++;
 }
 
+/* A new screen shape setting (0 auto, 1 4:3, 2 16:9), from the menu or F9. */
+static void set_shape_mode(int mode) {
+    g_aspect_mode = mode;
+    gx_raster_set_target_shape(mode);
+    update_aspect(true);
+}
+
 /* The game's own screen option ("option 6" of its option record, kept in
    the record at 0x8030BAAC, 16 bytes per option: value, table tag, column
    tag): 0 = 4:3, 1 = letterbox, 2 = 16:9. With the screen shape fixed to 4:3
@@ -807,9 +829,7 @@ static void set_window_size(void) {
 
 static void apply_settings(unsigned ch) {
     if (ch & (1u << MI_SHAPE)) {
-        g_aspect_mode = g_settings.screen_shape;
-        gx_raster_set_target_shape(g_aspect_mode);
-        update_aspect(true);
+        set_shape_mode(g_settings.screen_shape);
     }
     if (ch & (1u << MI_DISPLAY)) {
         g_fullscreen = g_settings.fullscreen != 0;
@@ -951,11 +971,13 @@ static void poll_events(void) {
                 printf("window: logging the next two frames to drawlog.txt and drawlog-short.txt\n");
             } else if (e.key.key == SDLK_F9 && !e.key.repeat) {
                 static const int k_next[] = {1, 2, 0};   /* auto -> 4:3 -> 16:9 -> auto */
-                g_aspect_mode = k_next[g_aspect_mode];
-                gx_raster_set_target_shape(g_aspect_mode);
-                update_aspect(true);
-                g_settings.screen_shape = g_aspect_mode;
-                settings_save();
+                if (!in_front_end()) {
+                    printf("window: the screen shape can only be changed in the game's menus, not during a match\n");
+                } else {
+                    set_shape_mode(k_next[g_aspect_mode]);
+                    g_settings.screen_shape = g_aspect_mode;
+                    settings_save();
+                }
             } else if (e.key.key == SDLK_F11 && !e.key.repeat) {
                 g_fullscreen = !g_fullscreen;
                 SDL_SetWindowFullscreen(g_window, g_fullscreen);
@@ -1549,6 +1571,7 @@ void window_field(CPUState* cpu) {
     poll_events();
     sync_game_screen_option(cpu);
     uicolors_frame(cpu);
+    menu_set_shape_locked(!in_front_end());
     static bool live;                  /* the colours page was open last field */
     if (menu_is_open() && menu_live()) {
         /* The game carries on (its controllers idle) so the colours picked

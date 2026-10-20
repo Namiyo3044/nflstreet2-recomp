@@ -43,6 +43,9 @@ int menu_capturing(void);
 /* A line about who plays as whom (controllers connected), shown on the
    controls page; the window updates it. */
 void menu_set_players_text(const char* text);
+
+/* The screen shape can't be changed now (during a match). */
+void menu_set_shape_locked(bool locked);
 void menu_bind(int code);
 
 /* Items changed since the last call (1 << MI_...; MI_CONTROLS for bindings,

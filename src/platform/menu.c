@@ -31,6 +31,14 @@ static int g_crow, g_ccol, g_capture;
 #define CROW_BACK (GCI_COUNT + 3)
 #define CROWS (GCI_COUNT + 4)
 static char g_players[256];
+static bool g_shape_locked;
+
+void menu_set_shape_locked(bool locked) {
+    if (g_shape_locked == locked) return;
+    g_shape_locked = locked;
+    if (locked && g_sel == MI_SHAPE) g_sel = MI_DISPLAY;   /* off the item that can't change */
+    g_dirty = true;
+}
 /* The menu colours page: rows are the colours, then "reset" and "back";
    g_kedit while changing red / green / blue (g_kch) of the selected one. */
 static bool g_colors_page, g_kedit;
@@ -68,6 +76,7 @@ void menu_bind(int code) {
 
 static bool item_enabled(int i) {
     switch (i) {
+    case MI_SHAPE: return !g_shape_locked;
     case MI_WINSIZE: return !g_settings.fullscreen;
     case MI_RES: return g_settings.renderer == 0;
     case MI_TEXTURES: return g_info.textures_found && g_settings.renderer == 0;
@@ -79,7 +88,7 @@ void menu_open(const MenuInfo* info) {
     g_info = *info;
     g_open = true;
     g_quit_page = false;
-    g_sel = 0;
+    g_sel = g_shape_locked ? MI_DISPLAY : 0;
     g_controls = false;
     g_colors_page = false;
     g_capture = 0;
@@ -429,8 +438,8 @@ static void item_value(int i, char* out, size_t cap) {
 static const char* item_help(int i) {
     switch (i) {
     case MI_SHAPE: return "How the picture is shaped. Game's setting follows the screen option in the game's own menu. "
-                          "4:3 and 16:9 also set the game's option to match; some screens pick up a change from the "
-                          "next screen or match.";
+                          "4:3 and 16:9 also set the game's option to match. Can't be changed during a match (the "
+                          "match lays out its scoreboard when it starts); change it in the game's menus.";
     case MI_DISPLAY: return "Play in a window or on the whole screen (F11 also switches).";
     case MI_WINSIZE: return "How big the window is when not playing full screen.";
     case MI_RENDERER: return "The graphics card draws faster and sharper than the software renderer. Takes effect "
@@ -557,6 +566,8 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
             }
             if (needs_restart(i))
                 text("AFTER RESTART", (float)(vx - vw - U(56)), base, U(24), COL_ORANGE, 255, 1);
+            else if (i == MI_SHAPE && g_shape_locked)
+                text("CHANGE IT IN THE MENUS", (float)(vx - vw - U(30)), base, U(24), COL_ORANGE, 255, 1);
         }
     }
 

@@ -69,4 +69,8 @@ void window_quit_request(void);
 /* The game's Options list picked Video Settings: opens the port's menu. */
 void window_video_request(void);
 
+/* The game's main menu script is running (called from its function calls):
+   screen shape changes there needn't wait for a new screen. */
+void window_note_front_end(void);
+
 #endif

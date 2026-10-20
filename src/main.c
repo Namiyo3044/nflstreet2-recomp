@@ -407,6 +407,9 @@ static int uis_native_hook(CPUState* ctx) {
     if (!g_uis_ok)
         return 0;
     u32 group = ctx->gpr[4], screen = ctx->gpr[5];
+#ifdef NFLS2_HAVE_WINDOW
+    if (group == 0 || group == 5) window_note_front_end();   /* a menu is up (main menu, options screens) */
+#endif
     if (g_uis_log) {                   /* --uis-log: each distinct call once */
         static u32 seen_calls[1024];
         static int n_seen;
