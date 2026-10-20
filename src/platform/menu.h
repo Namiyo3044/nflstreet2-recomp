@@ -19,7 +19,7 @@ typedef struct {
 enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_OK, MENU_BACK };
 
 /* Settings items, as bits in menu_take_changes(). */
-enum { MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RENDERER, MI_RES, MI_TEXTURES, MI_CONTROLS, MI_CLOSE, MI_COUNT };
+enum { MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RENDERER, MI_RES, MI_TEXTURES, MI_COLORS, MI_CONTROLS, MI_CLOSE, MI_COUNT };
 
 void menu_open(const MenuInfo* info);
 /* Opens on its own page asking whether to quit (the main menu's Quit Game);
@@ -27,6 +27,9 @@ void menu_open(const MenuInfo* info);
 void menu_open_quit(void);
 bool menu_take_quit(void);
 bool menu_is_open(void);
+/* The menu colours page is open: the game keeps running behind it (its
+   input held idle) so picked colours show as they change. */
+bool menu_live(void);
 void menu_action(int action);
 
 /* The controls page: names for key and controller codes (from the window). */

@@ -23,6 +23,8 @@
 #include "runtime/textscan.h"
 #include "runtime/textpatch.h"
 #include "runtime/exi.h"
+#include "runtime/uismenu.h"
+#include "runtime/uicolors.h"
 #ifdef NFLS2_HAVE_WINDOW
 #include "platform/window.h"
 #endif
@@ -398,10 +400,6 @@ static void uis_main_menu_edits(CPUState* ctx) {
     }
 }
 
-/* Function UIS_FN_QUIT: not one of the game's; script bytes the port adds
-   call it to ask "quit?" (window_quit_request). */
-#define UIS_FN_QUIT 0x7A51u
-
 static int uis_native_hook(CPUState* ctx) {
     if (g_uis_ok < 0)
         g_uis_ok = mem_read32(ctx, UIS_NATIVE_DISPATCH) == 0x9421FFE8u &&    /* stwu r1, -0x18(r1) */
@@ -429,6 +427,16 @@ static int uis_native_hook(CPUState* ctx) {
         printf("uis: Quit Game picked\n");
 #ifdef NFLS2_HAVE_WINDOW
         window_quit_request();
+#endif
+        mem_write32(ctx, ctx->gpr[8], 0);
+        ctx->gpr[3] = 1;
+        ctx->pc = ctx->lr;
+        return 1;
+    }
+    if (ctx->gpr[3] == UIS_FN_VIDEO && group == 0) {
+        printf("uis: Video Settings picked\n");
+#ifdef NFLS2_HAVE_WINDOW
+        window_video_request();
 #endif
         mem_write32(ctx, ctx->gpr[8], 0);
         ctx->gpr[3] = 1;
@@ -472,7 +480,7 @@ static int uis_native_hook(CPUState* ctx) {
     }
     if (ctx->gpr[3] != UIS_FN_PLATFORM)
         return 0;
-    if (group == 0) uis_main_menu_edits(ctx);
+    if (group == 0) { uis_main_menu_edits(ctx); uismenu_add_quit(ctx); }
     static u32 seen[16];
     if (group < 16 && screen < 32 && !(seen[group] & (1u << screen))) {
         seen[group] |= 1u << screen;
@@ -825,6 +833,7 @@ static void usage(const char* argv0) {
             "         [--replace DIR (files there are read instead of the disc's, e.g. DIR/moviedat.dat)]\n"
             "         [--memcard FILE (memory card image in slot A; created if missing)]\n"
             "         [--text FILE (game text replacements, default text-replacements.txt) | --no-text]\n"
+            "         [--ui-colors FILE (menu shape colours, default ui-colors.txt) | --no-ui-colors]\n"
             "         [--aspect auto|4:3|16:9 (screen shape; auto follows the game's widescreen option)]\n"
             "         [--gpu (draw with the graphics card) [--res N (its internal resolution, N x 640x528)]]\n"
             "         [--settings FILE (saved video settings; switches override them)] [--software]\n"
@@ -849,6 +858,7 @@ int main(int argc, char** argv) {
     bool idle_skip = true;
     const char* memcard_path = NULL;
     const char* text_path = "text-replacements.txt";
+    const char* colors_path = "ui-colors.txt";
     bool skip_hash = false;
     const char* dump_dir = "frames";
     u32 dump_every = 60;
@@ -883,6 +893,10 @@ int main(int argc, char** argv) {
             text_path = argv[++i];
         } else if (strcmp(argv[i], "--no-text") == 0) {
             text_path = NULL;
+        } else if (strcmp(argv[i], "--ui-colors") == 0 && i + 1 < argc) {
+            colors_path = argv[++i];
+        } else if (strcmp(argv[i], "--no-ui-colors") == 0) {
+            colors_path = NULL;
         } else if (strcmp(argv[i], "--memcard") == 0 && i + 1 < argc) {
             memcard_path = argv[++i];
         } else if (strcmp(argv[i], "--skip-thx") == 0) {
@@ -1000,6 +1014,16 @@ int main(int argc, char** argv) {
     static CPUState cpu;
     if (!cpu_init(&cpu))
         return 1;
+    {
+        /* The port's own memory past the GameCube's 24 MB (uismenu.h): the
+           game is told it has 24 MB and never goes there. */
+        u8* more = (u8*)realloc(cpu.ram, (size_t)cpu.ram_size + PORT_RAM_SIZE);
+        if (more) {
+            memset(more + cpu.ram_size, 0, PORT_RAM_SIZE);
+            cpu.ram = more;
+            cpu.ram_size += PORT_RAM_SIZE;
+        }
+    }
 
     hle_cpu_install(&cpu);
     prof_start(&cpu);
@@ -1013,6 +1037,7 @@ int main(int argc, char** argv) {
     if (!boot_globals_init(&cpu, disc_dir))
         return 1;
     textpatch_apply(&cpu, text_path);
+    uicolors_load(colors_path);
     if (!disc_open(disc_dir) || !boot_place_fst(&cpu))
         return 1;
 

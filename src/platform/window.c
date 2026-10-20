@@ -11,6 +11,7 @@
 #include "gx/texture.h"
 #include "platform/movie.h"
 #include "runtime/disc.h"
+#include "runtime/uicolors.h"
 
 #include <SDL3/SDL.h>
 
@@ -1401,9 +1402,14 @@ static const char* const k_previews[11] = {
 };
 static int g_preview_req = -1;
 static bool g_quit_req;
+static bool g_video_req;
 
 void window_quit_request(void) {
     g_quit_req = true;
+}
+
+void window_video_request(void) {
+    g_video_req = true;
 }
 
 void window_preview_request(int index) {
@@ -1505,11 +1511,23 @@ static void menu_loop(CPUState* cpu) {
     printf("window: video menu open\n");
     if (g_audio) SDL_PauseAudioStreamDevice(g_audio);
     all_idle();
-    while (menu_is_open() && !g_quit) {
+    while (menu_is_open() && !menu_live() && !g_quit) {
         poll_events();
         apply_settings(menu_take_changes());
         present(cpu);
         SDL_Delay(15);
+    }
+    if (menu_live()) {                 /* the colours page: the game runs on behind it (live_field) */
+        apply_settings(menu_take_changes());
+        if (g_audio) SDL_ResumeAudioStreamDevice(g_audio);
+        Uint64 now = SDL_GetTicksNS();
+        g_base_ns = g_stat_ns = now;
+        g_base_field = g_field;
+        g_stat_fields = 0;
+        g_frames_at_stat = gx_raster_frames();
+        g_slept_ns = g_present_ns = 0;
+        g_hitch_last = 0;
+        return;
     }
     apply_settings(menu_take_changes());
     settings_save();
@@ -1530,12 +1548,32 @@ void window_field(CPUState* cpu) {
     g_cpu_ref = cpu;
     poll_events();
     sync_game_screen_option(cpu);
+    uicolors_frame(cpu);
+    static bool live;                  /* the colours page was open last field */
+    if (menu_is_open() && menu_live()) {
+        /* The game carries on (its controllers idle) so the colours picked
+           show on it; the menu is drawn over it. */
+        live = true;
+        all_idle();
+        apply_settings(menu_take_changes());
+        present(cpu);
+        pace_and_stats();
+        return;
+    }
+    if (live && !menu_is_open()) g_input_block = true;   /* closed from the colours page */
+    live = false;
     if (menu_is_open()) {
         menu_loop(cpu);
         return;
     }
     if (g_preview_req >= 0) {
         preview_loop(cpu);
+        return;
+    }
+    if (g_video_req) {                 /* the game's Options list: Video Settings */
+        g_video_req = false;
+        open_menu();
+        menu_loop(cpu);
         return;
     }
     if (g_quit_req) {

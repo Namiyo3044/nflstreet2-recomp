@@ -66,4 +66,7 @@ void window_preview_request(int index);
 /* The main menu's Quit Game was picked: asks "quit?" at the next field. */
 void window_quit_request(void);
 
+/* The game's Options list picked Video Settings: opens the port's menu. */
+void window_video_request(void);
+
 #endif

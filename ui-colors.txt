@@ -1,0 +1,25 @@
+# Colour swaps for the game's flat-coloured menu shapes, the ones custom
+# textures can't change because they have no texture (the music ticker's
+# bar, border and tab; the red bars behind the main menu's buttons).
+#
+#   RRGGBB => RRGGBB          (the shape keeps its own see-through-ness)
+#   RRGGBB => RRGGBBAA        (AA sets it: 00 invisible, FF solid)
+#
+# - Colours are hex, red green blue, like in an image editor ("#" in front
+#   is fine: #DC3D00 => #2060C0).
+# - Every shape in that exact colour changes, on any screen.
+# - Each colour changes once: "A => B" and "B => C" turn A into B, not C.
+# - Lines starting with "# " (hash and a space) are ignored. Remove the "# "
+#   from a line to use it. Changes take effect the next time the game starts.
+# - The startup report says how many swaps were read ("ui colors:").
+
+# The music ticker:
+ DC3D00 => 002080    # the bar (orange)
+# DCA500 => DCA500    # the border (gold)
+# A80000 => 002080    # the tab on the right (red)
+# 740000 => 740000    # the tab's shaded side (dark red)
+# B45153 => B45153    # the tab's lit edge (pink)
+
+# The main menu's red bars behind the button rows (outer see-through part
+# and inner solid part share this colour):
+ 500000 => 002080

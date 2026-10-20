@@ -1,5 +1,6 @@
 #include "platform/menu.h"
 #include "platform/settings.h"
+#include "runtime/uicolors.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -30,6 +31,10 @@ static int g_crow, g_ccol, g_capture;
 #define CROW_BACK (GCI_COUNT + 3)
 #define CROWS (GCI_COUNT + 4)
 static char g_players[256];
+/* The menu colours page: rows are the colours, then "reset" and "back";
+   g_kedit while changing red / green / blue (g_kch) of the selected one. */
+static bool g_colors_page, g_kedit;
+static int g_krow, g_kch;
 /* The quit page: 0 = YES, 1 = NO. */
 static bool g_quit_page, g_quit_yes;
 static int g_qsel;
@@ -76,6 +81,7 @@ void menu_open(const MenuInfo* info) {
     g_quit_page = false;
     g_sel = 0;
     g_controls = false;
+    g_colors_page = false;
     g_capture = 0;
     g_dirty = true;
 }
@@ -85,6 +91,7 @@ void menu_open_quit(void) {
     g_quit_page = true;
     g_qsel = 1;                        /* NO to start with */
     g_controls = false;
+    g_colors_page = false;
     g_capture = 0;
     g_dirty = true;
 }
@@ -96,6 +103,7 @@ bool menu_take_quit(void) {
 }
 
 bool menu_is_open(void) { return g_open; }
+bool menu_live(void) { return g_open && g_colors_page; }
 
 unsigned menu_take_changes(void) {
     unsigned c = g_changes;
@@ -154,6 +162,55 @@ static void controls_action(int a) {
     g_dirty = true;
 }
 
+static void colors_leave(void) {
+    g_colors_page = false;
+    g_kedit = false;
+    uicolors_save();
+}
+
+static void colors_action(int a) {
+    int n = uicolors_slot_count(), rows = n + 2;   /* + reset, back */
+    if (g_kedit) {                     /* red / green / blue of row g_krow */
+        u32 c = uicolors_slot_get(g_krow);
+        int sh = 16 - 8 * g_kch, v = (int)((c >> sh) & 255);
+        switch (a) {
+        case MENU_UP: g_kch = (g_kch + 2) % 3; break;
+        case MENU_DOWN: g_kch = (g_kch + 1) % 3; break;
+        case MENU_LEFT: case MENU_RIGHT:
+            v += a == MENU_LEFT ? -5 : 5;
+            v = v < 0 ? 0 : v > 255 ? 255 : v;
+            uicolors_slot_set(g_krow, (c & ~(0xFFu << sh)) | (u32)v << sh);
+            break;
+        case MENU_OK: case MENU_BACK: g_kedit = false; break;
+        }
+        g_dirty = true;
+        return;
+    }
+    switch (a) {
+    case MENU_UP: g_krow = (g_krow + rows - 1) % rows; break;
+    case MENU_DOWN: g_krow = (g_krow + 1) % rows; break;
+    case MENU_LEFT: case MENU_RIGHT:
+        if (g_krow < n) {              /* the next / previous ready-made colour */
+            int np = uicolors_preset_count(), p = uicolors_slot_preset(g_krow);
+            if (p < 0) p = a == MENU_LEFT ? 1 : np - 1;   /* from a custom colour */
+            u32 cur = uicolors_slot_get(g_krow);
+            for (int k = 0; k < np; k++) {   /* skip ones that look the same (red on a red shape) */
+                p = (p + (a == MENU_LEFT ? np - 1 : 1)) % np;
+                if (uicolors_preset_color(g_krow, p) != cur) break;
+            }
+            uicolors_slot_set(g_krow, uicolors_preset_color(g_krow, p));
+        }
+        break;
+    case MENU_OK:
+        if (g_krow < n) { g_kedit = true; g_kch = 0; }
+        else if (g_krow == n) uicolors_reset_all();
+        else colors_leave();
+        break;
+    case MENU_BACK: colors_leave(); break;
+    }
+    g_dirty = true;
+}
+
 void menu_action(int a) {
     if (!g_open) return;
     if (g_quit_page) {
@@ -172,6 +229,10 @@ void menu_action(int a) {
         controls_action(a);
         return;
     }
+    if (g_colors_page) {
+        colors_action(a);
+        return;
+    }
     switch (a) {
     case MENU_UP:
     case MENU_DOWN: {
@@ -184,12 +245,13 @@ void menu_action(int a) {
     }
     case MENU_LEFT:
     case MENU_RIGHT:
-        if (g_sel == MI_CONTROLS) { if (a == MENU_RIGHT) menu_action(MENU_OK); return; }
+        if (g_sel == MI_CONTROLS || g_sel == MI_COLORS) { if (a == MENU_RIGHT) menu_action(MENU_OK); return; }
         if (item_enabled(g_sel)) change(g_sel, a == MENU_LEFT ? -1 : 1);
         break;
     case MENU_OK:
         if (g_sel == MI_CLOSE) g_open = false;
         else if (g_sel == MI_CONTROLS) { g_controls = true; g_crow = 0; g_ccol = 0; g_capture = 0; }
+        else if (g_sel == MI_COLORS) { g_colors_page = true; g_krow = 0; g_kedit = false; }
         else if (item_enabled(g_sel)) change(g_sel, 1);
         break;
     case MENU_BACK:
@@ -333,8 +395,8 @@ static int text_wrapped(const char* s, float x, int y, float maxw, int size, int
 
 static const char* item_label(int i) {
     static const char* const k[MI_COUNT] = {"SCREEN SHAPE", "DISPLAY", "WINDOW SIZE", "RENDERER",
-                                            "INTERNAL RESOLUTION", "CUSTOM TEXTURES", "CONTROLS",
-                                            "BACK TO THE GAME"};
+                                            "INTERNAL RESOLUTION", "CUSTOM TEXTURES", "MENU COLOURS",
+                                            "CONTROLS", "BACK TO THE GAME"};
     return k[i];
 }
 
@@ -352,6 +414,13 @@ static void item_value(int i, char* out, size_t cap) {
     case MI_TEXTURES:
         snprintf(out, cap, "%s", !g_info.textures_found ? "NONE FOUND" : s->custom_textures ? "ON" : "OFF");
         break;
+    case MI_COLORS: {
+        int changed = 0;
+        for (int k = 0; k < uicolors_slot_count(); k++) changed += uicolors_slot_get(k) != uicolors_slot_original(k);
+        if (changed) snprintf(out, cap, "%d CHANGED", changed);
+        else snprintf(out, cap, "THE GAME'S OWN");
+        break;
+    }
     case MI_CONTROLS: snprintf(out, cap, "KEYBOARD AND CONTROLLER"); break;
     default: out[0] = 0; break;
     }
@@ -373,6 +442,8 @@ static const char* item_help(int i) {
                                    ".png or .dds). Turn off and on again (or press F5 twice) to load files added or changed since."
                                  : "No custom texture folder was found. Put Dolphin-format texture packs in "
                                    "C:\\nfls2\\textures to use them.";
+    case MI_COLORS: return "Change the colours of the game's menu bars and music ticker (shapes custom textures can't "
+                           "reach). The game carries on behind the page so you can see each change.";
     case MI_CONTROLS: return "Choose which keys and controller buttons work each GameCube button and stick.";
     default: return "Close this menu and carry on playing.";
     }
@@ -386,6 +457,7 @@ static bool needs_restart(int i) {
 }
 
 static void draw_controls(int w, int h, float u);
+static void draw_colors(int w, int h, float u);
 
 #define COL_ORANGE 0xFF7A00u
 #define COL_YELLOW 0xFFD21Fu
@@ -415,6 +487,10 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
     float u = (float)h / 1080.0f;              /* layout unit: 1 pixel at 1080 lines */
     if ((float)w / 1920.0f < u * 0.75f) u = (float)w / 1920.0f / 0.75f;
 #define U(v) ((int)((v) * u + 0.5f))
+    if (g_colors_page) {                               /* the game left bright, to see the colours */
+        draw_colors(w, h, u);
+        return g_px;
+    }
     fill_rect(0, 0, w, h, 0, 150);                     /* the game, dimmed */
     if (g_quit_page) {
         int pw = U(760), ph = U(330);
@@ -446,7 +522,7 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
         return g_px;
     }
 
-    int pw = U(980), ph = U(890);
+    int pw = U(980), ph = U(950);
     int px0 = (w - pw) / 2, py0 = (h - ph) / 2;
     fill_rect(px0, py0, px0 + pw, py0 + ph, COL_PANEL, 232);
     fill_rect(px0, py0 + ph - U(6), px0 + pw, py0 + ph, COL_ORANGE, 255);   /* bottom edge */
@@ -458,7 +534,7 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
     text("VIDEO SETTINGS", (float)(px0 + U(28)), by1 - U(24), U(78), 0x111111u, 255, 0);
 
     /* Rows */
-    int row_h = U(74), ry = py0 + U(130), lx = px0 + U(60), vx = px0 + pw - U(70);
+    int row_h = U(70), ry = py0 + U(130), lx = px0 + U(60), vx = px0 + pw - U(70);
     for (int i = 0; i < MI_COUNT; i++) {
         int y0 = ry + i * row_h + (i == MI_CLOSE ? U(18) : 0);
         bool sel = i == g_sel, en = item_enabled(i);
@@ -562,5 +638,87 @@ static void draw_controls(int w, int h, float u) {
     const char* help = g_capture ? "ESC: CANCEL     DELETE: NO BINDING"
                                  : "UP / DOWN: CHOOSE     LEFT / RIGHT: KEYBOARD OR CONTROLLER     ENTER OR A: CHANGE     ESC OR B: BACK";
     text(help, (float)(w / 2), py0 + ph - U(24), U(22), COL_GREY, 230, 2);
+#undef U
+}
+
+/* ------------------------------------------------- menu colours page --- */
+static void draw_colors(int w, int h, float u) {
+#define U(v) ((int)((v) * u + 0.5f))
+    int n = uicolors_slot_count(), rows = n + 2;
+    int pw = U(820), row_h = U(60), top = U(120);
+    int ph = top + rows * row_h + U(30) + U(250);
+    int px0 = w - pw - U(40), py0 = (h - ph) / 2;     /* to the right: the game shows beside it */
+    if (px0 < U(16)) px0 = U(16);
+    fill_rect(px0, py0, px0 + pw, py0 + ph, COL_PANEL, 225);
+    fill_rect(px0, py0 + ph - U(6), px0 + pw, py0 + ph, COL_ORANGE, 255);
+    int by0 = py0 - U(30), by1 = py0 + U(70);
+    fill_slant(px0 - U(24), by0, px0 + U(470), by1, U(24), COL_ORANGE, 255);
+    fill_slant(px0 + U(480), by0 + U(16), px0 + U(506), by1, U(22), COL_YELLOW, 255);
+    text("MENU COLOURS", (float)(px0 + U(28)), by1 - U(20), U(68), 0x111111u, 255, 0);
+
+    int lx = px0 + U(50), sx = px0 + pw - U(90), vx = sx - U(40), fs = U(28);
+    for (int r = 0; r < rows; r++) {
+        int y0 = py0 + top + r * row_h + (r >= n ? U(14) : 0), base = y0 + U(40);
+        bool sel = r == g_krow;
+        if (sel) {
+            fill_rect(px0 + U(20), y0, px0 + pw - U(20), y0 + row_h - U(6), COL_ORANGE, g_kedit ? 70 : 40);
+            fill_rect(px0 + U(20), y0, px0 + U(28), y0 + row_h - U(6), COL_ORANGE, 255);
+        }
+        if (r >= n) {
+            text(r == n ? "RESET ALL TO THE GAME'S OWN" : "BACK", (float)lx, base, fs, sel ? COL_YELLOW : COL_GREY,
+                 255, 0);
+            continue;
+        }
+        text(uicolors_slot_name(r), (float)lx, base, fs, sel ? COL_YELLOW : COL_GREY, 255, 0);
+        u32 c = uicolors_slot_get(r);
+        int p = uicolors_slot_preset(r);
+        char v[48];
+        if (p >= 0) snprintf(v, sizeof(v), "%s", uicolors_preset_name(p));
+        else snprintf(v, sizeof(v), "CUSTOM  %06X", c);
+        int vw = (int)text_width(v, fs);
+        text(v, (float)vx, base, fs, sel ? COL_WHITE : 0xD2D2D2u, 255, 1);
+        if (sel && !g_kedit) {
+            arrow(vx - vw - U(22), base - U(11), U(8), -1, COL_YELLOW, 255);
+            arrow(vx + U(16), base - U(11), U(8), 1, COL_YELLOW, 255);
+        }
+        /* The colour itself, beside the game's own (small, behind). */
+        int sy0 = y0 + U(10), sy1 = y0 + row_h - U(16);
+        fill_rect(sx + U(34), sy0 + U(10), sx + U(56), sy1, uicolors_slot_original(r), 255);
+        fill_rect(sx, sy0, sx + U(40), sy1, 0xFFFFFFu, 255);
+        fill_rect(sx + U(2), sy0 + U(2), sx + U(38), sy1 - U(2), c, 255);
+    }
+
+    /* Below: red / green / blue of the selected colour, or what it is. */
+    int iy = py0 + top + rows * row_h + U(40);
+    fill_rect(px0 + U(50), iy - U(10), px0 + pw - U(50), iy - U(8), COL_DIM, 255);
+    if (g_krow < n) {
+        u32 c = uicolors_slot_get(g_krow);
+        static const char* const k_ch[3] = {"RED", "GREEN", "BLUE"};
+        static const u32 k_chc[3] = {0xE04040u, 0x40C040u, 0x4080F0u};
+        for (int k = 0; k < 3; k++) {
+            int y = iy + U(20) + k * U(46), v = (int)((c >> (16 - 8 * k)) & 255);
+            bool on = g_kedit && g_kch == k;
+            text(k_ch[k], (float)lx, y + U(26), U(26), on ? COL_YELLOW : g_kedit ? COL_GREY : COL_DIM, 255, 0);
+            int bx0 = lx + U(130), bx1 = px0 + pw - U(150);
+            fill_rect(bx0, y + U(10), bx1, y + U(22), 0x303038u, 255);
+            fill_rect(bx0, y + U(10), bx0 + (bx1 - bx0) * v / 255, y + U(22), k_chc[k], g_kedit ? 255 : 120);
+            char num[8];
+            snprintf(num, sizeof(num), "%d", v);
+            text(num, (float)(px0 + pw - U(60)), y + U(26), U(26), on ? COL_WHITE : COL_GREY, 255, 1);
+            if (on) {
+                arrow(bx0 - U(20), y + U(16), U(7), -1, COL_YELLOW, 255);
+                arrow(bx1 + U(20), y + U(16), U(7), 1, COL_YELLOW, 255);
+            }
+        }
+        text_wrapped(uicolors_slot_help(g_krow), (float)lx, iy + U(190), (float)(pw - U(100)), U(24), U(30),
+                     COL_GREY, 255);
+    } else {
+        text_wrapped(g_krow == n ? "Put every colour on this page back to the game's own."
+                                 : "Back to the video settings. Colours are saved to ui-colors.txt.",
+                     (float)lx, iy + U(40), (float)(pw - U(100)), U(24), U(30), COL_GREY, 255);
+    }
+    const char* help = g_kedit ? "UP / DOWN: RED, GREEN OR BLUE     LEFT / RIGHT: CHANGE     A OR B: DONE"
+                               : "LEFT / RIGHT: COLOUR     A / ENTER: FINE-TUNE     B / ESC: BACK";
+    text(help, (float)(px0 + pw / 2), py0 + ph + U(40), U(22), COL_WHITE, 255, 2);
 #undef U
 }

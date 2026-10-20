@@ -13,6 +13,7 @@
 #   .\play.ps1 -UisLog        (log each kind of call the menu scripts make, "uis: call" lines)
 #   .\play.ps1 -DumpTextures   (save every texture the game uses to C:\nfls2\dump\textures, with Dolphin's names)
 #   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
+#   .\play.ps1 -NoUiColors    (the game's own menu shape colours; ignores ui-colors.txt)
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
 #   .\play.ps1 -ShowTHX        (keep the THX intro; it is skipped by default)
 #   .\play.ps1 -Aspect 16:9    (screen shape: auto (follows the game's widescreen option), 4:3, 16:9)
@@ -36,6 +37,7 @@ param(
     [string]$MemCard = "C:\nfls2\saves\MemoryCardA.raw",
     [switch]$NoMemCard,
     [switch]$NoText,
+    [switch]$NoUiColors,
     [string]$Textures = "C:\nfls2\textures",
     [string]$Replace = "C:\nfls2\replace",
     [switch]$NoTextures,
@@ -99,6 +101,7 @@ foreach ($p in $Press) { $gameArgs += @("--press", $p) }
 if ($NoIdleSkip) { $gameArgs += "--no-idle-skip" }
 if (-not $ShowTHX) { $gameArgs += "--skip-thx" }
 if ($NoText) { $gameArgs += @("--no-text") }
+if ($NoUiColors) { $gameArgs += @("--no-ui-colors") }
 if ($Software) { $gameArgs += @("--software") }
 elseif ($PSBoundParameters.ContainsKey("Res")) { $gameArgs += @("--gpu", "--res", $Res) }
 elseif ($GPU) { $gameArgs += @("--gpu") }
@@ -129,7 +132,7 @@ if ($start) { $report = $log[($start - 1)..($log.Count - 1)] } else { $report = 
 # Slow stretches (the window logs a perf line each second the game runs below full speed).
 $perf = @($log | Select-String -Pattern "^perf:|^audio:|^hitch:" | ForEach-Object { $_.Line })
 $gpuLines = @($log | Select-String -Pattern "^gpu:|^custom textures:" | ForEach-Object { $_.Line })
-$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:|^window: player|^window: controller|^window: wrote memdump|^uis:|^window: game.s screen option" | ForEach-Object { $_.Line })
+$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:|^window: player|^window: controller|^window: wrote memdump|^uis:|^ui colors:|^window: game.s screen option" | ForEach-Object { $_.Line })
 $cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
 $txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })
 $ct = @($log | Select-String -Pattern "^cardtrace:" | ForEach-Object { $_.Line })

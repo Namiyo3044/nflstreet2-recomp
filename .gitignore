@@ -6,3 +6,8 @@ drawlog*.txt
 play.txt
 *.mpg
 build/
+
+run*.txt
+summary.txt
+shot_*.bmp
+tex_*.bmp
