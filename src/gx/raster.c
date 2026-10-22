@@ -363,7 +363,8 @@ static DrawSetup g_setup;
 /* The screen shape the port shows when it is fixed (1 = 4:3, 2 = 16:9; 0 =
    follow the game). Full-screen 3D the game still draws for the other shape
    (for a moment after the setting changes, until the game sets up its next
-   screen) is narrowed or widened to fit, so it never looks stretched. */
+   screen) is narrowed or widened to fit, so it never looks stretched; only
+   while the game is seen drawing for the other shape. */
 static volatile int g_target_shape;
 
 void gx_raster_set_target_shape(int shape) {
@@ -373,6 +374,11 @@ void gx_raster_set_target_shape(int shape) {
 static float projection_correction(void) {
     int target = g_target_shape;
     if (!target || XFR[0x26] != 0)
+        return 1.0f;
+    /* Once the game draws its screens for the shape shown, a projection
+       made for the other shape is meant (a created player's portrait is
+       drawn 4:3 and read back from the frame buffer): leave it alone. */
+    if ((target == 2 && g_widescreen == 1) || (target == 1 && g_widescreen == 0))
         return 1.0f;
     float p0 = fabsf(gx_f32(XFR[0x20])), p2 = fabsf(gx_f32(XFR[0x22]));
     float vw = fabsf(gx_f32(XFR[0x1A])) * 2.0f, vh = fabsf(gx_f32(XFR[0x1B])) * 2.0f;
