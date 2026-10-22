@@ -967,8 +967,12 @@ static void poll_events(void) {
                 if (g_gpu) g_shot_pending = true;
                 else save_screenshot();
             } else if (e.key.key == SDLK_F12 && !e.key.repeat) {
-                gx_raster_draw_log(interrupts_game_seconds(), 2);
-                printf("window: logging the next two frames to drawlog.txt and drawlog-short.txt\n");
+                if (g_gpu) {
+                    printf("window: the draw log (F12) only works with the software renderer\n");
+                } else {
+                    gx_raster_draw_log(interrupts_game_seconds(), 2);
+                    printf("window: logging the next two frames to drawlog.txt and drawlog-short.txt\n");
+                }
             } else if (e.key.key == SDLK_F9 && !e.key.repeat) {
                 static const int k_next[] = {1, 2, 0};   /* auto -> 4:3 -> 16:9 -> auto */
                 if (!in_front_end()) {

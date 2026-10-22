@@ -827,6 +827,17 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         g_vmem_reads++;
         return v;
     }
+    if ((ea & 0xFF000000u) == 0xC8000000u) {   /* the frame buffer, read directly (GXPeekARGB / GXPeekZ) */
+        u32 v = gx_raster_peek(ea & ~3u);
+        if (!(ea & 0x00400000u)) {         /* colour: the alpha read mode (PE 0x1008, GXPokeAlphaRead) */
+            u32 mode = reg16(0x1008u) & 3u;
+            if (mode == 0) v &= 0x00FFFFFFu;
+            else if (mode == 1) v |= 0xFF000000u;
+        }
+        if (size == 4) return v;
+        u32 sh = (4u - size - (ea & 3u)) * 8u;
+        return (v >> sh) & (size == 2 ? 0xFFFFu : 0xFFu);
+    }
     if ((ea & 0xFFFF0000u) != MMIO_BASE) {
         warn_unmapped("read", ea, size, cpu->pc);
         return 0;
@@ -1027,6 +1038,7 @@ void mmio_report(void) {
            g_pacing ? "on" : "off", g_finish_held_count);
     printf("gather pipe: %llu bytes to the GPU, %llu bytes recorded to RAM, %llu link changes\n",
            g_pipe_to_gpu, g_pipe_recorded, g_link_changes);
+    gx_raster_peek_report();
     printf("memory: virtual window 0x7E000000 r%llu/w%llu, unmapped accesses %llu\n",
            g_vmem_reads, g_vmem_writes, g_unmapped);
     printf("locked cache (0xE0000000): r%llu/w%llu, DMA %llu KB in, %llu KB out\n", g_l1_reads, g_l1_writes,

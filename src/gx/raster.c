@@ -1217,7 +1217,11 @@ static u32 list_verts(CmdList* l, u32 count) {
 static CmdList g_lists[2];
 static u32 g_rec;                      /* list being recorded */
 
+static bool g_peek_stale = true;       /* commands recorded since the last frame-buffer peek snapshot */
+static unsigned long long g_peeks, g_peek_snapshots;
+
 static Cmd* list_push(CmdList* l) {
+    g_peek_stale = true;
     if (l->n == l->cap) {
         u32 cap = l->cap ? l->cap * 2 : 4096;
         Cmd* c = (Cmd*)realloc(l->cmds, sizeof(Cmd) * cap);
@@ -2640,4 +2644,40 @@ void gx_raster_report(void) {
     printf("screen shape: %s (last 3D projection made for %.2f:1)\n",
            g_widescreen == 1 ? "16:9 widescreen" : g_widescreen == 0 ? "4:3" : "not known (no 3D drawn)",
            g_last_aspect);
+}
+
+/* ------------------------------------------------- frame-buffer peeks --- */
+/* The CPU reading the frame buffer directly (GXPeekARGB / GXPeekZ, at
+   0xC8000000: x in bits 2-11, y in bits 12-21, bit 22 = depth). The game does
+   this to make a created player's portrait: it draws the head, then reads the
+   pixels back one by one. The first read after new drawing draws everything
+   recorded so far and takes a snapshot of the frame buffer (read back from
+   the graphics card when that draws); later reads come from the snapshot. */
+u32 gx_raster_peek(u32 ea) {
+    g_peeks++;
+    if (!gx_raster_active())
+        return 0;
+    if (g_peek_stale) {
+        submit();
+        wait_idle();
+        efb_to_memory(true);
+        g_peek_stale = false;
+        if (g_peek_snapshots++ == 0)
+            printf("gx: the game is reading the frame buffer directly (peeks; first at 0x%08X)\n", ea);
+    }
+    u32 x = (ea >> 2) & 0x3FFu, y = (ea >> 12) & 0x3FFu;
+    if (x >= EFB_W || y >= EFB_H)
+        return 0;
+    u32 i = y * EFB_W + x;
+    if (ea & 0x00400000u)
+        return g_depth[i] & 0x00FFFFFFu;
+    u32 c = g_color[i];
+    if ((gx_bp[0x43] & 7u) != 1u)      /* no alpha in the frame buffer's format: reads as opaque */
+        c |= 0xFF000000u;
+    return c;
+}
+
+void gx_raster_peek_report(void) {
+    if (g_peeks)
+        printf("gx: %llu frame-buffer peeks (%llu snapshots)\n", g_peeks, g_peek_snapshots);
 }

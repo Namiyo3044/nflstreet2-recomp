@@ -67,6 +67,11 @@ void gx_raster_widescreen_reset(void);
    redirected gather pipe, as movie players use). */
 void gx_raster_note_ram_write(u32 addr);
 
+/* The CPU reading the frame buffer directly (0xC8000000-0xC8FFFFFF:
+   GXPeekARGB, GXPeekZ): colour as 0xAARRGGBB or 24-bit depth. */
+u32 gx_raster_peek(u32 ea);
+void gx_raster_peek_report(void);
+
 /* Renderer timing since the last call: seconds the game waited for the
    drawing threads, average and worst time to draw a frame, triangles per frame. */
 void gx_raster_take_perf(double* wait_s, double* draw_avg_s, double* draw_max_s, u32* tris_per_frame);
