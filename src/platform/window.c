@@ -868,6 +868,7 @@ static u8 stick_value(float v) {
 }
 
 /* ------------------------------------------------------ settings menu --- */
+#define SIDE_FILL 0x2A2B30u            /* ultrawide menus' sides */
 static bool g_resize_pending;          /* left full screen: size the window for the shape once it has */
 
 static void set_window_size(void) {
@@ -1646,6 +1647,9 @@ void window_field(CPUState* cpu) {
         g_resize_pending = false;
         set_window_size();
     }
+    /* Ultrawide menus: a dark grey at the sides the 16:9 backgrounds don't
+       reach (matches fill the whole picture themselves). */
+    gx_raster_set_side_fill(g_settings.screen_shape >= 3 && in_front_end() ? SIDE_FILL : 0u);
     uicolors_frame(cpu);
     menu_set_shape_locked(!in_front_end());
     {

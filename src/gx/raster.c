@@ -377,6 +377,10 @@ void gx_raster_set_target_shape(int shape) {
     g_target_shape = shape;
 }
 
+static volatile u32 g_side_fill;       /* 0xRRGGBB to clear frames to (0: as the game asks) */
+
+void gx_raster_set_side_fill(u32 rgb) { g_side_fill = rgb; }
+
 /* Test shapes wider than 16:9: 3 = 21:9, 4 = 32:9. */
 static float ultrawide_aspect(int target) { return target == 4 ? 32.0f / 9.0f : 21.0f / 9.0f; }
 
@@ -2555,6 +2559,11 @@ void gx_raster_copy(u32 cmd) {
             u32 a = (gx_bp[0x4F] >> 8) & 255u, r = gx_bp[0x4F] & 255u;
             u32 g = (gx_bp[0x50] >> 8) & 255u, b = gx_bp[0x50] & 255u;
             cp->clear_color = (a << 24) | (r << 16) | (g << 8) | b;
+            /* Ultrawide menus: the frame cleared to a grey instead of black,
+               so the sides the 16:9 backgrounds don't reach aren't black. */
+            u32 fill = g_side_fill;
+            if (fill && clear && to_xfb && r < 16 && g < 16 && b < 16)
+                cp->clear_color = (a << 24) | (fill & 0x00FFFFFFu);
             cp->clear_z = gx_bp[0x51] & 0xFFFFFFu;
         }
     }

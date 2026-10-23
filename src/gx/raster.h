@@ -85,6 +85,9 @@ void gx_raster_take_perf(double* wait_s, double* draw_avg_s, double* draw_max_s,
 bool gx_raster_use_gpu(void* (*getproc)(const char*), int scale, void (*make_current)(void));
 /* The graphics card's name for menus ("" with the software renderer). */
 const char* gx_raster_gpu_name(void);
+/* Frames the game clears to black are cleared to this colour instead
+   (0xRRGGBB; 0 = off): the sides of ultrawide menus. */
+void gx_raster_set_side_fill(u32 rgb);
 /* The graphics card's internal resolution, changed while running. */
 void gx_raster_set_gpu_scale(int scale);
 
