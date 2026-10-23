@@ -652,13 +652,90 @@ static bool state_capture(const RenderState* rs) {
 #define HUD_LOW 0.20f                  /* the top HUD: objects placed above this (-1 bottom .. 1 top) */
 #define HUD_SIDE 0.30f                 /* and this far to one side (-1..1 across 16:9) */
 #define HUD_PANELS 0.55f               /* the team panels' row: placed above this */
+static u32 g_tick_seq_now, g_tick_seq = ~0u;   /* draws seen; the last music-ticker piece */
+static float g_tick_mn, g_tick_mx;     /* where that piece lay (across 16:9) */
+#define TICK_PEND 512
+static u32 g_tick_pend[TICK_PEND][2];  /* the run's pieces so far (first vertex, count), before its disc */
+static int g_tick_np;
+static bool g_tick_ok;                 /* this run is the ticker */
+static CmdList* g_tick_list;
+static CmdList* g_wl;                  /* the list (and first vertex) of the draw being widened */
+static u32 g_wb;
+static int g_ovl_cur, g_ovl_prev;      /* pieces placed low and to the side, this / last frame */
+static u32 g_ovl_frame;
+#define HUD_OVERLAY 4                  /* that many: the play-calling screen is up */
 static int g_banner_cur, g_banner_prev;   /* a stadium-name banner seen this / last frame (its side) */
 static u32 g_banner_frame;
 #define HUD_SIDE_LOW 0.50f             /* below it, this far to one side (style point popups) */
 static volatile int g_hud_match;       /* a match is on (set from the game thread) */
 void gx_raster_set_match(bool on) { g_hud_match = on; }
 
+static void lerp_vtx(const SVtx* a, const SVtx* b, float t, SVtx* out);
+
+/* Pieces crossing a side, remembered by what they look like (side, height
+   of their object's origin, size): one whose origin moved since the last
+   frame is sliding. */
+#define SLIDE_MAX 64
+typedef struct { float oy, w, h, ox; u32 frame; int side; } Slide;
+static Slide g_slide[SLIDE_MAX];
+
+static bool slide_moving(const SVtx* v, u32 n, float mn, float mx, float frame) {
+    float ylo = 1e9f, yhi = -1e9f;
+    for (u32 i = 0; i < n; i++) {
+        float ny = v[i].clip[1] / v[i].clip[3];
+        ylo = fminf(ylo, ny); yhi = fmaxf(yhi, ny);
+    }
+    int side = mn < -1.0f ? -1 : 1;
+    float oy = v[0].org[1], ox = v[0].org[0] / frame, w = mx - mn, h = yhi - ylo;
+    Slide* e = NULL;
+    Slide* old = &g_slide[0];
+    for (int k = 0; k < SLIDE_MAX; k++) {
+        Slide* q = &g_slide[k];
+        if (q->side == side && fabsf(q->oy - oy) < 0.002f && fabsf(q->w - w) < 0.01f && fabsf(q->h - h) < 0.01f &&
+            g_frames - q->frame <= 2u) { e = q; break; }
+        if (q->frame < old->frame) old = q;
+    }
+    bool moving = false;
+    if (e) {
+        if (e->frame != g_frames) moving = fabsf(e->ox - ox) > 0.002f;
+        else moving = false;
+    } else {
+        e = old;
+    }
+    e->oy = oy; e->w = w; e->h = h; e->side = side;
+    if (e->frame != g_frames || !moving) e->ox = ox;
+    e->frame = g_frames;
+    return moving;
+}
+
+/* Cut a piece made of quads at the 16:9 picture's sides: each corner past a
+   side moves along its quad's edge (the corner level with it) to the side,
+   colours and texture following. */
+static void crop_at_sides(SVtx* v, u32 n, float frame) {
+    if (n % 4u) return;
+    for (u32 q = 0; q < n; q += 4) {
+        SVtx c[4];
+        memcpy(c, &v[q], sizeof c);
+        for (int i = 0; i < 4; i++) {
+            float ui = c[i].clip[0] / (c[i].clip[3] * frame);
+            if (ui >= -1.0f && ui <= 1.0f) continue;
+            float edge = ui < 0.0f ? -1.0f : 1.0f;
+            float yi = c[i].clip[1] / c[i].clip[3];
+            int best = -1;
+            for (int j = 0; j < 4; j++) {
+                if (j == i) continue;
+                float yj = c[j].clip[1] / c[j].clip[3], uj = c[j].clip[0] / (c[j].clip[3] * frame);
+                if (fabsf(yj - yi) < 1e-3f && (edge < 0.0f ? uj > -1.0f : uj < 1.0f)) { best = j; break; }
+            }
+            if (best < 0) continue;
+            float uj = c[best].clip[0] / (c[best].clip[3] * frame);
+            lerp_vtx(&c[i], &c[best], (edge - ui) / (uj - ui), &v[q + (u32)i]);
+        }
+    }
+}
+
 static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool capture) {
+    u32 seq = ++g_tick_seq_now;        /* every draw counts (the ticker's run is unbroken) */
     int target = g_target_shape;
     if (target < 3 || n < 2) return;   /* lines (2) too: the Gamebreaker bar's glowing outline */
     /* Positions across the 16:9 picture (-1 its left edge, 1 its right),
@@ -696,6 +773,68 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
        edge, so that end is taken to the edge of the wider picture. Scenery
        (depth-tested) is left alone. */
     if (g_setup.persp && ztest) return;
+    /* The music ticker (the song popup at the bottom left, in menus and
+       matches) moves left like the HUD's left side. It is drawn in one
+       run: its box (placed left of the middle, low down), then each piece
+       drawn straight after that lies low (end caps, tab, disc, the song's
+       lines). Plenty else sits low on the left (button bars, menu text), so
+       a run only counts once its disc turns up (placed from the top of the
+       screen though drawn at the bottom); the pieces before it are moved
+       then, still waiting in this list. */
+    if (g_setup.persp && !ztest && g_wl) {
+        float tu = v[0].org[0] / frame, ty = v[0].org[1], ylo = 1e9f, yhi = -1e9f;
+        for (u32 i = 0; i < n; i++) {
+            float ny = v[i].clip[1] / v[i].clip[3];
+            ylo = fminf(ylo, ny); yhi = fmaxf(yhi, ny);
+        }
+        bool low = yhi < -0.40f;
+        /* its box is tall (a button bar placed the same way is thin) */
+        bool start = low && v[0].org[0] != 0.0f && tu < -0.30f && ty < -0.60f && ty > ylo - 0.3f && ty < yhi + 0.3f &&
+                     yhi - ylo > 0.20f;
+        bool next = low && g_tick_seq == seq - 1u && g_tick_list == g_wl &&
+                    (mn < 0.25f || (mx - mn < 0.25f && mn >= g_tick_mn - 0.05f && mn <= g_tick_mx + 0.15f));
+        if (g_tick_ok && mx - mn >= 0.5f) next = false;   /* after the disc only small pieces (a bar drawn next isn't it) */
+        /* the disc: big (a button icon at the bottom is placed the same way
+           but is much smaller) */
+        bool disc = low && ty > 0.9f && tu < -0.30f && yhi - ylo > 0.22f;
+        if (!next && start) { g_tick_np = 0; g_tick_ok = false; }   /* a new run */
+        if (next || start) {
+            g_tick_seq = seq; g_tick_mn = mn; g_tick_mx = mx; g_tick_list = g_wl;
+            float r = fminf(ultrawide_aspect(target), 21.0f / 9.0f) / (16.0f / 9.0f);
+            float shift = -(r - 1.0f) * frame;
+            if (disc && !g_tick_ok) {          /* it is the ticker: move what came before */
+                g_tick_ok = true;
+                for (int k = 0; k < g_tick_np; k++)
+                    for (u32 i = 0; i < g_tick_pend[k][1]; i++) {
+                        SVtx* w = &g_wl->verts[g_tick_pend[k][0] + i];
+                        w->clip[0] += shift * w->clip[3];
+                        project(w);
+                    }
+                g_tick_np = 0;
+            }
+            if (g_tick_ok) {
+                for (u32 i = 0; i < n; i++) {
+                    v[i].clip[0] += shift * v[i].clip[3];
+                    project(&v[i]);
+                }
+                return;
+            }
+            if (g_tick_np < TICK_PEND) { g_tick_pend[g_tick_np][0] = g_wb; g_tick_pend[g_tick_np][1] = n; g_tick_np++; }
+            /* not known yet: treated as usual for now */
+        }
+    }
+    /* Menus: a menu piece lying wholly beyond the 16:9 picture's sides was
+       off the screen as the game made it (a list parked outside, waiting to
+       slide in), and nothing covers that space at the wider shapes, so it
+       showed (and left trails). It stays out of sight. */
+    if (g_setup.persp && !ztest && !g_hud_match && (mx < -1.0f || mn > 1.0f)) {
+        (void)slide_moving(v, n, mn, mx, frame);   /* remembered: it may slide in next */
+        for (u32 i = 0; i < n; i++) {
+            v[i].clip[0] = (mx < -1.0f ? -4.0f : 4.0f) * v[i].clip[3];
+            project(&v[i]);
+        }
+        return;
+    }
     /* The match HUD along the top (team 1 on the left, team 2 on the right):
        its panels move out towards the sides, to the edges of a 21:9 area
        (the screen's edges at 21:9; at 32:9 they'd be too far out to read
@@ -728,6 +867,13 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
            time, "Conversion Failed") and the game's logo are placed nearer
            the middle, and the pre-match panels further down. */
         float side = oy >= HUD_PANELS ? HUD_SIDE : HUD_SIDE_LOW;
+        /* The play-calling screen fills the lower half with play cards and
+           button bars on both sides; its cards reach up into the popups'
+           space, so while it is up only the panel row moves. Counted over
+           this frame and the last. */
+        if (g_frames != g_ovl_frame) { g_ovl_prev = g_ovl_cur; g_ovl_cur = 0; g_ovl_frame = g_frames; }
+        if (oy < -0.1f && fabsf(ou) > 0.4f && g_ovl_cur < 1000) g_ovl_cur++;
+        if (oy < HUD_PANELS && (g_ovl_cur >= HUD_OVERLAY || g_ovl_prev >= HUD_OVERLAY)) side = 1e9f;
         /* A long bar in that row placed nearer the middle but lying mostly
            to one side (a stadium's name banner before the match): with
            its side, so the name stays inside it. */
@@ -754,6 +900,14 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
         }
     }
     if ((mn >= -1.0f && mx <= 1.0f) || mx < -1.0f || mn > 1.0f) return;
+    /* Menus: a piece crossing the side of the 16:9 picture as it slides in
+       or out (its place changes from frame to frame) isn't a bar meant to
+       reach the edge: it is cut at the side, as the game's screen did,
+       rather than stretched to the screen's edge. */
+    if (!g_hud_match && g_setup.persp && slide_moving(v, n, mn, mx, frame)) {
+        crop_at_sides(v, n, frame);
+        return;
+    }
     if (textured) {
         /* Textured: only long thin bars (the main menu's logo bar is a tinted
            plain texture), not text or pictures sliding in from the side. */
@@ -2264,6 +2418,7 @@ static const CmdList* expand_list(const CmdList* l) {
             const Vtx* raw = l->raw + c->u.draw.first;
             for (u32 k = 0; k < count; k++)
                 transform(&raw[k], &e->verts[base + k]);
+            g_wl = e; g_wb = base;
             widen_fullscreen_2d(&e->verts[base], count, state_textured(&l->states[c->state]), l->states[c->state].ztest,
                                 state_capture(&l->states[c->state]));
             emit_prim(e, c->state, (u8)c->u.draw.prim, base, count);
@@ -2324,6 +2479,7 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
         p += decode_vertex(cpu, &fmt, p, &v);
         transform(&v, &sv[i]);
     }
+    g_wl = l; g_wb = base;
     widen_fullscreen_2d(sv, count, state_textured(&l->states[state]), l->states[state].ztest,
                         state_capture(&l->states[state]));
     if (g_dlog_at >= 0.0 && g_dlog_frames > 0 && interrupts_game_seconds() >= g_dlog_at)
