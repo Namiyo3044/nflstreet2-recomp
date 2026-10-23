@@ -18,9 +18,9 @@
  *   F6 = memory search for a setting (see window.c)
  */
 
-/* Opens the window (scale = initial size as a multiple of 640x480).
-   Returns false if SDL or the window can't be started. */
-bool window_open(int scale);
+/* Opens the window (height: its starting height in lines; the width follows
+   the screen shape). Returns false if SDL or the window can't be started. */
+bool window_open(int height);
 
 /* Draw with the graphics card and show its frames directly (call before
    window_open). scale: internal resolution as a multiple of the GameCube's.
@@ -65,6 +65,9 @@ void window_preview_request(int index);
 
 /* The main menu's Quit Game was picked: asks "quit?" at the next field. */
 void window_quit_request(void);
+
+/* Quit now (the game's own Quit Game dialog said yes). */
+void window_quit_now(void);
 
 /* The game's Options list picked Video Settings: opens the port's menu. */
 void window_video_request(void);

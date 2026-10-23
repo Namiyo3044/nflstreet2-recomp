@@ -11,3 +11,4 @@ run*.txt
 summary.txt
 shot_*.bmp
 tex_*.bmp
+memdump-crash.bin

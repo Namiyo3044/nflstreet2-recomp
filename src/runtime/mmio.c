@@ -691,6 +691,25 @@ static bool in_vmem(u32 ea, u8 size) {
 #define UNMAPPED_REGIONS 16
 static struct { u32 region, first_ea, first_pc; unsigned long long reads, writes; } g_unmapped_by[UNMAPPED_REGIONS];
 
+/* Debug: the first bad access from the menu-script interpreter writes the
+   game's memory to memdump-crash.bin and prints its registers (the script
+   it ran can then be studied). */
+static void uis_vm_crash_dump(CPUState* cpu) {
+    static bool done;
+    if (done || cpu->pc < 0x8021A000u || cpu->pc >= 0x8021C600u) return;
+    done = true;
+    printf("uis: script crash at pc 0x%08X, registers:", cpu->pc);
+    for (int i = 0; i < 32; i++) printf(" r%d=%08X", i, cpu->gpr[i]);
+    printf("\n");
+    FILE* f = fopen("memdump-crash.bin", "wb");
+    if (f) {
+        fwrite(cpu->ram, 1, cpu->ram_size, f);
+        fclose(f);
+        printf("uis: script crash: wrote memdump-crash.bin\n");
+    }
+    fflush(stdout);
+}
+
 static void warn_unmapped(const char* what, u32 ea, u8 size, u32 pc) {
     if (g_unmapped++ < 16)
         fprintf(stderr, "warn: %s%u %s unmapped 0x%08X (pc 0x%08X)\n", what, size * 8,
@@ -839,6 +858,7 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         return (v >> sh) & (size == 2 ? 0xFFFFu : 0xFFu);
     }
     if ((ea & 0xFFFF0000u) != MMIO_BASE) {
+        uis_vm_crash_dump(cpu);
         warn_unmapped("read", ea, size, cpu->pc);
         return 0;
     }
@@ -893,6 +913,7 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
         return;
     }
     if ((ea & 0xFFFF0000u) != MMIO_BASE) {
+        uis_vm_crash_dump(cpu);
         warn_unmapped("write", ea, size, cpu->pc);
         return;
     }

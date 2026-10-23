@@ -12,6 +12,7 @@
 #include "platform/movie.h"
 #include "runtime/disc.h"
 #include "runtime/uicolors.h"
+#include "runtime/uismenu.h"
 
 #include <SDL3/SDL.h>
 
@@ -303,6 +304,7 @@ static void update_aspect(bool announce) {
         return;
     bool changed = aspect != g_aspect;
     g_aspect = aspect;
+    menu_set_aspect(aspect);
     static const char* const k_mode[] = {"auto", "fixed", "fixed"};
     snprintf(g_title_shape, sizeof(g_title_shape), "%s (%s)", wide ? "16:9" : "4:3", k_mode[g_aspect_mode]);
     set_title();
@@ -381,16 +383,16 @@ static bool gpu_setup(void) {
 
 static void bindings_resolve(void);
 
-bool window_open(int scale) {
+bool window_open(int height) {
     bindings_resolve();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) {
         fprintf(stderr, "error: SDL_Init failed: %s\n", SDL_GetError());
         return false;
     }
-    if (scale < 1) scale = 1;
+    if (height < 240) height = 240;
     load_saved_shape();
     bool start_wide = g_aspect_mode == 2 || (g_aspect_mode == 0 && g_saved_wide == 1);
-    int win_w = start_wide ? 853 * scale : 640 * scale, win_h = 480 * scale;
+    int win_h = height, win_w = (int)((float)height * (start_wide ? 16.0f / 9.0f : 4.0f / 3.0f) + 0.5f);
     if (g_gpu_scale > 0) {
         g_window = SDL_CreateWindow("NFL Street 2", win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
         if (g_window && gpu_setup()) {
@@ -822,8 +824,8 @@ static u8 stick_value(float v) {
 static void set_window_size(void) {
     if (g_fullscreen) return;
     if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MAXIMIZED) SDL_RestoreWindow(g_window);
-    int s = g_settings.window_size;
-    SDL_SetWindowSize(g_window, (int)(480.0f * (float)s * g_aspect + 0.5f), 480 * s);
+    int h = settings_window_height(g_settings.window_size);
+    SDL_SetWindowSize(g_window, (int)((float)h * g_aspect + 0.5f), h);
     SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 }
 
@@ -837,6 +839,10 @@ static void apply_settings(unsigned ch) {
     }
     if (ch & (1u << MI_WINSIZE))
         set_window_size();
+    if ((ch & (1u << MI_RES)) && g_gpu) {
+        gx_raster_set_gpu_scale(g_settings.resolution);
+        g_gpu_scale = g_settings.resolution;
+    }
     if (ch & (1u << MI_CONTROLS)) {
         bindings_resolve();            /* "reset" leaves them at 0 */
         update_players_text();
@@ -1434,6 +1440,11 @@ void window_quit_request(void) {
     g_quit_req = true;
 }
 
+void window_quit_now(void) {
+    printf("window: quitting from the game's main menu\n");
+    g_quit = true;
+}
+
 void window_video_request(void) {
     g_video_req = true;
 }
@@ -1576,6 +1587,21 @@ void window_field(CPUState* cpu) {
     sync_game_screen_option(cpu);
     uicolors_frame(cpu);
     menu_set_shape_locked(!in_front_end());
+    {
+        /* The game's Video Settings screen: its rows read and set the
+           settings, applied here as the menu's are. */
+        static const UisVideoRows k_rows = {menu_game_row_count, menu_game_row_get, menu_game_row_set,
+                                            menu_game_row_name, menu_game_row_help};
+        uismenu_set_video_rows(&k_rows);
+        uismenu_video_frame(cpu);
+        if (!menu_is_open()) {
+            unsigned ch = menu_take_changes();
+            if (ch) {
+                apply_settings(ch);
+                settings_save();
+            }
+        }
+    }
     static bool live;                  /* the colours page was open last field */
     if (menu_is_open() && menu_live()) {
         /* The game carries on (its controllers idle) so the colours picked

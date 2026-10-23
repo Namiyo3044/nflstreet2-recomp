@@ -83,6 +83,8 @@ void gx_raster_take_perf(double* wait_s, double* draw_avg_s, double* draw_max_s,
    GameCube's. Returns false (the software renderer stays) if the GPU setup
    fails. */
 bool gx_raster_use_gpu(void* (*getproc)(const char*), int scale, void (*make_current)(void));
+/* The graphics card's internal resolution, changed while running. */
+void gx_raster_set_gpu_scale(int scale);
 
 /* GPU mode: the window shows frames from the GPU (call once the presenting
    context is set up), so copies to the TV buffer aren't written to RAM. */

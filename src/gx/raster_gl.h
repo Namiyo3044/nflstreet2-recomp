@@ -28,6 +28,10 @@ typedef void* (*GlrGetProc)(const char* name);
    current. Returns false (with a message printed) if anything is missing. */
 bool glr_init(GlrGetProc getproc, int scale, void (*make_current)(void));
 
+/* A new internal resolution (1-8), used from the next list on (on the GPU
+   thread). */
+void glr_set_scale(int scale);
+
 /* Draws a recorded list. TV-buffer copies in it are read back and written
    to RAM; clears are done on the GPU. */
 void glr_run_list(const CmdList* l);

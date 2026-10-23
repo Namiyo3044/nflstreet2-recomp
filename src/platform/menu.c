@@ -32,6 +32,13 @@ static int g_crow, g_ccol, g_capture;
 #define CROWS (GCI_COUNT + 4)
 static char g_players[256];
 static bool g_shape_locked;
+static float g_aspect = 4.0f / 3.0f;   /* the window's shape now (for window sizes) */
+
+void menu_set_aspect(float aspect) {
+    if (aspect == g_aspect) return;
+    g_aspect = aspect;
+    g_dirty = true;
+}
 
 void menu_set_shape_locked(bool locked) {
     if (g_shape_locked == locked) return;
@@ -125,13 +132,80 @@ static void change(int item, int dir) {
     switch (item) {
     case MI_SHAPE: s->screen_shape = (s->screen_shape + 3 + dir) % 3; break;
     case MI_DISPLAY: s->fullscreen = !s->fullscreen; break;
-    case MI_WINSIZE: s->window_size = (s->window_size - 1 + 4 + dir) % 4 + 1; break;
+    case MI_WINSIZE: s->window_size = (s->window_size - 1 + SETTINGS_WINDOW_SIZES + dir) % SETTINGS_WINDOW_SIZES + 1; break;
     case MI_RENDERER: s->renderer = !s->renderer; break;
     case MI_RES: s->resolution = (s->resolution - 1 + 8 + dir) % 8 + 1; break;
     case MI_TEXTURES: s->custom_textures = !s->custom_textures; break;
     default: return;
     }
     g_changes |= 1u << item;
+}
+
+static bool needs_restart(int i);
+
+/* The game's own Video Settings screen (uismenu.c): its five rows are the
+   first five items, with values as numbers from 0. */
+static const int k_game_item[MENU_GAME_ROWS] = {MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RENDERER, MI_RES};
+
+int menu_game_row_count(int row) {
+    switch (k_game_item[row]) {
+    case MI_SHAPE: return 3;
+    case MI_DISPLAY: case MI_RENDERER: return 2;
+    case MI_WINSIZE: return SETTINGS_WINDOW_SIZES;
+    default: return 8;
+    }
+}
+
+int menu_game_row_get(int row) {
+    const Settings* s = &g_settings;
+    switch (k_game_item[row]) {
+    case MI_SHAPE: return s->screen_shape;
+    case MI_DISPLAY: return s->fullscreen ? 1 : 0;
+    case MI_WINSIZE: return s->window_size - 1;
+    case MI_RENDERER: return s->renderer ? 1 : 0;
+    default: return s->resolution - 1;
+    }
+}
+
+void menu_game_row_set(int row, int v) {
+    Settings* s = &g_settings;
+    int item = k_game_item[row];
+    switch (item) {
+    case MI_SHAPE: if (g_shape_locked) return; s->screen_shape = v; break;
+    case MI_DISPLAY: s->fullscreen = v != 0; break;
+    case MI_WINSIZE: s->window_size = v + 1; break;
+    case MI_RENDERER: s->renderer = v != 0; break;
+    default: s->resolution = v + 1; break;
+    }
+    g_changes |= 1u << item;
+    g_dirty = true;
+}
+
+const char* menu_game_row_name(int row, int v) {
+    static char buf[48];
+    switch (k_game_item[row]) {
+    case MI_SHAPE: return v == 1 ? "4:3" : v == 2 ? "16:9" : "Game's Setting";
+    case MI_DISPLAY: return v ? "Full Screen" : "Window";
+    case MI_WINSIZE: {
+        int h = settings_window_height(v + 1);
+        snprintf(buf, sizeof buf, "%d x %d", (int)((float)h * g_aspect + 0.5f), h);
+        return buf;
+    }
+    case MI_RENDERER: return v ? "Software" : "Graphics Card";
+    default: snprintf(buf, sizeof buf, "%dx", v + 1); return buf;
+    }
+}
+
+const char* menu_game_row_help(int row) {
+    /* Short: the help line has room for about 45 letters. */
+    static const char k_restart[] = "Takes effect the next time the game starts.";
+    switch (k_game_item[row]) {
+    case MI_SHAPE: return "Change the screen aspect ratio.";
+    case MI_DISPLAY: return "Play in a window or in full screen.";
+    case MI_WINSIZE: return "Change the size of the window.";
+    case MI_RENDERER: return needs_restart(MI_RENDERER) ? k_restart : "Change how the game is drawn.";
+    default: return "Change how sharply the game is drawn.";
+    }
 }
 
 static void controls_action(int a) {
@@ -403,7 +477,7 @@ static int text_wrapped(const char* s, float x, int y, float maxw, int size, int
 }
 
 static const char* item_label(int i) {
-    static const char* const k[MI_COUNT] = {"SCREEN SHAPE", "DISPLAY", "WINDOW SIZE", "RENDERER",
+    static const char* const k[MI_COUNT] = {"ASPECT RATIO", "DISPLAY", "WINDOW SIZE", "RENDERER",
                                             "INTERNAL RESOLUTION", "CUSTOM TEXTURES", "MENU COLOURS",
                                             "CONTROLS", "BACK TO THE GAME"};
     return k[i];
@@ -414,11 +488,14 @@ static void item_value(int i, char* out, size_t cap) {
     switch (i) {
     case MI_SHAPE: snprintf(out, cap, "%s", s->screen_shape == 1 ? "4:3" : s->screen_shape == 2 ? "16:9" : "GAME'S SETTING"); break;
     case MI_DISPLAY: snprintf(out, cap, "%s", s->fullscreen ? "FULL SCREEN" : "WINDOW"); break;
-    case MI_WINSIZE: snprintf(out, cap, "%dX  (%d LINES)", s->window_size, 480 * s->window_size); break;
+    case MI_WINSIZE: {
+        int h = settings_window_height(s->window_size);
+        snprintf(out, cap, "%d X %d", (int)((float)h * g_aspect + 0.5f), h);
+        break;
+    }
     case MI_RENDERER: snprintf(out, cap, "%s", s->renderer ? "SOFTWARE" : "GRAPHICS CARD"); break;
     case MI_RES:
-        if (s->resolution == 1) snprintf(out, cap, "1X  (ORIGINAL)");
-        else snprintf(out, cap, "%dX  (%dP)", s->resolution, 480 * s->resolution);
+        snprintf(out, cap, "%dX", s->resolution);
         break;
     case MI_TEXTURES:
         snprintf(out, cap, "%s", !g_info.textures_found ? "NONE FOUND" : s->custom_textures ? "ON" : "OFF");
@@ -445,7 +522,7 @@ static const char* item_help(int i) {
     case MI_RENDERER: return "The graphics card draws faster and sharper than the software renderer. Takes effect "
                              "the next time the game starts.";
     case MI_RES: return "How sharply the graphics card draws the game, as a multiple of the GameCube's own picture. "
-                        "Higher needs a faster card. Takes effect the next time the game starts.";
+                        "Higher needs a faster card.";
     case MI_TEXTURES: return g_info.textures_found
                                  ? "Replacement textures from the custom texture folder (Dolphin's format, "
                                    ".png or .dds). Turn off and on again (or press F5 twice) to load files added or changed since."
@@ -461,7 +538,7 @@ static const char* item_help(int i) {
 static bool needs_restart(int i) {
     const Settings* s = &g_settings;
     if (i == MI_RENDERER) return (s->renderer == 0) != g_info.gpu_running;
-    if (i == MI_RES) return g_info.gpu_running && s->renderer == 0 && s->resolution != g_info.res_running;
+    if (i == MI_RES) return false;     /* changed straight away (the graphics card's) */
     return false;
 }
 

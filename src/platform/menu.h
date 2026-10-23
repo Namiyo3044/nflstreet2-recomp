@@ -44,9 +44,22 @@ int menu_capturing(void);
    controls page; the window updates it. */
 void menu_set_players_text(const char* text);
 
+/* The picture's shape now (width / height), for the window sizes shown. */
+void menu_set_aspect(float aspect);
+
 /* The screen shape can't be changed now (during a match). */
 void menu_set_shape_locked(bool locked);
 void menu_bind(int code);
+
+/* The game's own Video Settings screen: its rows are Screen Shape, Display,
+   Window Size, Renderer and Internal Resolution, values numbered from 0.
+   Setting one counts as a change (menu_take_changes). */
+#define MENU_GAME_ROWS 5
+int menu_game_row_count(int row);
+int menu_game_row_get(int row);
+void menu_game_row_set(int row, int value);
+const char* menu_game_row_name(int row, int value);
+const char* menu_game_row_help(int row);
 
 /* Items changed since the last call (1 << MI_...; MI_CONTROLS for bindings,
    which are left 0 where they should be the default). */

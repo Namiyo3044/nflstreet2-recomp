@@ -12,6 +12,8 @@ GLR_FUNCS(GLR_DEFINE)
 #define G(name) glr_##name
 
 static int g_scale = 1;
+static volatile int g_want_scale;      /* a new internal resolution asked for (0: none) */
+static GLint g_maxtex;
 /* Horizontal scale: a third more than the vertical one, so a widescreen
    picture (which the game squeezes into the 640-pixel frame for the TV to
    stretch) keeps its full horizontal detail when stretched back to 16:9.
@@ -432,6 +434,7 @@ bool glr_init(GlrGetProc getproc, int scale, void (*make_current)(void)) {
            (const char*)G(glGetString)(GL_RENDERER), (const char*)G(glGetString)(GL_VERSION));
     GLint maxtex = 0;
     G(glGetIntegerv)(GL_MAX_TEXTURE_SIZE, &maxtex);
+    g_maxtex = maxtex;
     while (g_scale > 1 && ((float)EFB_W * g_scale * 4.0f / 3.0f > (float)maxtex || EFB_H * g_scale > maxtex)) g_scale--;
     g_sx = (float)g_scale * 4.0f / 3.0f;
     g_efb_w = PX(EFB_W);
@@ -812,10 +815,53 @@ bool glr_xfb_on_gpu(u32 dest) {
     return g_ready && xfb_find(dest) != NULL;
 }
 
+void glr_set_scale(int scale) {
+    g_want_scale = scale < 1 ? 1 : scale > 8 ? 8 : scale;
+}
+
+/* On the GPU thread, between lists: a new internal resolution. The frame
+   buffer is made again at the new size (starting black) and the TV-buffer
+   textures dropped (made again at the new size by the next copies); the
+   texture-copy slots remake themselves when their size changes. */
+static void apply_scale(void) {
+    int s = g_want_scale;
+    if (!s) return;
+    g_want_scale = 0;
+    while (s > 1 && ((float)EFB_W * s * 4.0f / 3.0f > (float)g_maxtex || EFB_H * s > g_maxtex)) s--;
+    if (s == g_scale) return;
+    G(glDeleteFramebuffers)(1, &g_fbo);
+    G(glDeleteTextures)(1, &g_color_tex);
+    G(glDeleteTextures)(1, &g_depth_tex);
+    for (int i = 0; i < XFB_SLOTS; i++) {
+        if (g_xfb[i].tex) {
+            G(glDeleteTextures)(1, &g_xfb[i].tex);
+            G(glDeleteFramebuffers)(1, &g_xfb[i].fbo);
+        }
+        g_xfb[i].tex = g_xfb[i].fbo = 0;
+        g_xfb[i].valid = false;
+    }
+    g_scale = s;
+    g_sx = (float)g_scale * 4.0f / 3.0f;
+    g_efb_w = PX(EFB_W);
+    g_efb_h = EFB_H * g_scale;
+    if (!make_fbo(&g_fbo, &g_color_tex, &g_depth_tex, g_efb_w, g_efb_h)) {
+        printf("gpu: couldn't make the frame buffer at %dx; graphics card drawing stopped\n", g_scale);
+        g_ready = false;
+        return;
+    }
+    G(glClearColor)(0, 0, 0, 0);
+    G(glClearDepth)(0.0);
+    G(glClear)(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    printf("gpu: now drawing at %dx%d (%dx the GameCube's resolution)\n", g_efb_w, g_efb_h, g_scale);
+}
+
 void glr_run_list(const CmdList* l) {
     if (!g_ready)
         return;
     if (g_make_current) g_make_current();
+    apply_scale();
+    if (!g_ready)
+        return;
     delete_dead_textures();
     g_hires_budget_used = 0;
     if (!l->n)

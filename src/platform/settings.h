@@ -23,7 +23,7 @@ typedef struct {
     int resolution;                    /* graphics card's internal resolution, 1-8 x the GameCube's */
     int screen_shape;                  /* 0 = the game's setting, 1 = 4:3, 2 = 16:9 */
     int fullscreen;                    /* 0 / 1 */
-    int window_size;                   /* 1-4 x 640x480 */
+    int window_size;                   /* 1-6: 480, 720, 900, 1080, 1440, 2160 lines */
     int custom_textures;               /* 0 / 1 */
     /* Bindings: 0 = the default, -1 = nothing. Keys are SDL scancodes;
        controller codes are SDL gamepad button + 1, or 64 + axis * 2
@@ -42,5 +42,9 @@ bool settings_load(const char* path);
 
 /* Writes the file given to settings_load (if any). */
 void settings_save(void);
+
+/* The window's height (lines) for a window_size. */
+#define SETTINGS_WINDOW_SIZES 6
+int settings_window_height(int window_size);
 
 #endif

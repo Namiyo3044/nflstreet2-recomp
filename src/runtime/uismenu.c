@@ -94,6 +94,7 @@ enum { NOBJ = 0x75, NVAR = 0x1BB, NFUNC = 0x12, OPT = 14, GRP = 9, NEWIDX = NOBJ
 #define P_CODE_END (P_BASE + 0x4000u)
 #define P_TEXT (P_BASE + 0x4000u)        /* Options list texts with Video Settings */
 #define P_TEXT_END (P_BASE + 0x4400u)
+#define P_DIALOG (P_BASE + 0x4300u)      /* the quit dialog's texts (inside P_TEXT's room, past what it uses) */
 
 typedef struct { u32 lo, hi, nlo; } Region;
 static Region g_rg[4];
@@ -321,7 +322,7 @@ static bool list_with_video(u32 var, const char* before, u32* text) {
     char* at = strstr(buf, before);
     if (!at) return false;
     int n = snprintf(out, sizeof(out), "%.*s|Video Settings%s", (int)(at - buf), buf, at);
-    if (n <= 0 || *text + (u32)n + 4 > P_TEXT_END) return false;
+    if (n <= 0 || *text + (u32)n + 4 > P_DIALOG) return false;
     memcpy(R + (*text - G), out, (size_t)n);
     wr(var + 4, (u32)n);
     wr(var + 8, *text);
@@ -373,11 +374,17 @@ static bool add_video(u32 h, u32 code_hi) {
     put_jump(hat, emit_chain(ht, 5, hd, VIDEO_AT, hc));
     /* Action: the port's video settings; then input back on (as the
        entries' "not available" paths) and on as the default does. */
+    /* Action: both open the Audio Settings screen (its case, old index 2),
+       telling the port first which of the two it is to be: Video Settings
+       is the same screen in "video mode" (uismenu_video_screen). */
     u32 ac = g_code;
     emit8(0x41); emit_push(UIS_FN_VIDEO); emit_push(0); emit8(0x0B); emit8(0x42);
-    emit8(0x41); emit_push(0xFFFFFFF5u); emit8(0x1A); emit8(0x43); emit32(0x0001F87Eu); emit8(0x42); emit8(0x42);
-    emit_jump(ad);
-    put_jump(aat, emit_chain(at, 5, ad, VIDEO_AT, ac));
+    emit_jump(at[2]);
+    u32 au = g_code;
+    emit8(0x41); emit_push(UIS_FN_AUDIO); emit_push(0); emit8(0x0B); emit8(0x42);
+    emit_jump(at[2]);
+    u32 at2[5] = {at[0], at[1], au, at[3], at[4]};
+    put_jump(aat, emit_chain(at2, 5, ad, VIDEO_AT, ac));
     return true;
 }
 
@@ -566,12 +573,27 @@ void uismenu_add_quit(CPUState* cpu) {
         if (!c) return;
         wr(two[k]->dflt_imm, c - (two[k]->dflt_imm + 5));
     }
-    /* Action: index 6 asks "quit?". */
+    /* Action: index 6 asks "quit?" in the game's own dialog (opcode 70 with
+       3 arguments after the dialog kind 0x30001: title, message, choices; the
+       script waits there and gets back the choice picked, 0 = the first), as
+       the entries' "not available" message does. Yes quits; either way the
+       input goes back on (the press turned it off: call 1f86e at the
+       handler's start). */
     {
+        u32 v_title = P_DIALOG, v_msg = P_DIALOG + 12, v_choice = P_DIALOG + 24;
+        put_var(v_title, P_DIALOG + 0x40, 1, " ", 4);
+        static const char k_msg[] = "Quit NFL STREET 2? Anything not saved will be lost.";
+        put_var(v_msg, P_DIALOG + 0x50, (u32)strlen(k_msg), k_msg, 64);
+        put_var(v_choice, P_DIALOG + 0x90, 8, "|Yes|^No", 16);
         u32 c = g_code;
+        emit8(0x41); emit_push(0x00030001u); emit_push(v_title); emit_push(v_msg); emit_push(v_choice);
+        emit8(0x70); emit8(0x03);
+        emit8(0x41); emit_push(1); emit8(0x36);   /* picked Yes? (choices count from 1, as Retry is 1 in the game's Retry/Cancel dialog) */
+        u32 skip = g_code;
+        emit_push(0); emit8(0x3F);
         emit8(0x41); emit_push(UIS_FN_QUIT); emit_push(0); emit8(0x0B); emit8(0x42);
-        /* Not quitting: input back on, as the entries' "not available" path
-           does (the press turned it off: call 1f86e at the handler's start). */
+        wr(skip + 1, g_code - (skip + 6));
+        emit8(0x42);                       /* the choice */
         emit8(0x41); emit_push(0xFFFFFFF5u); emit8(0x1A); emit8(0x43); emit32(0x0001F87Eu); emit8(0x42); emit8(0x42);
         emit_jump(s_action->dflt);
         wr(s_action->dflt_imm, c - (s_action->dflt_imm + 5));
@@ -622,7 +644,26 @@ void uismenu_add_quit(CPUState* cpu) {
                 emit8(0x41); emit_push(old_pos); emit8(0x36);
                 u32 next = g_code;
                 emit_push(0); emit8(0x3F);
-                emit8(0x42); emit_push(old_pos + 1);
+                emit8(0x42);
+                if (old_pos == 2) {
+                    /* Old 2 is also Video Settings (it opens Audio
+                       Settings' screen): the port says which it was. */
+                    /* A native call: a slot for the answer, the function, its arguments
+                       and their count; 0b takes the function and count, writing the
+                       answer into the slot (the arguments are left to pop). */
+                    emit_push(0); emit_push(UIS_FN_VIDEO_BACK); emit_push(0); emit8(0x0B);   /* -> the answer */
+                    emit_push(1); emit8(0x36);
+                    u32 aud = g_code;
+                    emit_push(0); emit8(0x3F);
+                    emit_push(2);
+                    u32 j = g_code;
+                    emit_push(0); emit8(0x40);
+                    wr(aud + 1, g_code - (aud + 6));
+                    emit_push(3);
+                    wr(j + 1, g_code - (j + 6));
+                } else {
+                    emit_push(old_pos + 1);
+                }
                 fix[k] = g_code;
                 emit_push(0); emit8(0x40);
                 wr(next + 1, g_code - (next + 6));
@@ -673,4 +714,494 @@ void uismenu_add_quit(CPUState* cpu) {
     wr(h + 4, P_OBJTAB);
     printf("uis: main menu: Quit Game button added%s%s (%d page looks, %u bytes of script)\n",
            bar ? " with its bar" : "", video ? ", Options: Video Settings" : "", looks, g_code - P_CODE);
+}
+
+/* ------------------------------------------ title screen: no licence --- */
+/* The GameCube title screen shows "Licensed by Nintendo" under "Press
+   START"; the PS2 and Xbox ones don't. It is a text record in the title
+   script pointing at a variable holding the words, with its own length:
+   that length is set to 0, so the line isn't drawn. */
+void uismenu_hide_licence(CPUState* cpu) {
+    R = cpu->ram;
+    RS = cpu->ram_size;
+    if (!R) return;
+    static const char k_text[] = "Licensed by Nintendo";
+    const u32 n = sizeof(k_text) - 1;
+    static u32 g_done_rec;             /* the record hidden last time (still loaded: nothing to do) */
+    if (g_done_rec && in_ram(g_done_rec, 8) && rd(g_done_rec + 4) == 0) {
+        u32 var = rd(g_done_rec);
+        if (in_ram(var, 12) && rd(var + 4) == n && in_ram(rd(var + 8), n) && memcmp(R + (rd(var + 8) - G), k_text, n) == 0)
+            return;
+    }
+    for (u32 o = 0x00800000u; o + n + 4 < RS && o < 0x01800000u; o++) {
+        if (R[o] != 'L' || memcmp(R + o, k_text, n) != 0) continue;
+        u32 str = G + o;
+        /* Its variable (type 1, length 20, pointer) just before the texts. */
+        for (u32 v = str - 4; v + 0x2000 > str && v >= G + 12; v -= 4) {
+            if (rd(v) != str || rd(v - 4) != n || rd(v - 8) != 1) continue;
+            u32 var = v - 8;
+            /* The text records (pointer to the variable, then its length). */
+            int hidden = 0;
+            for (u32 r = var - 4; r + 0x4000 > var && r >= G; r -= 4)
+                if (rd(r) == var && rd(r + 4) == n) { wr(r + 4, 0); hidden++; g_done_rec = r; }
+            static bool told;
+            if (hidden && !told) {
+                told = true;
+                printf("uis: title screen: \"Licensed by Nintendo\" hidden\n");
+            }
+            return;
+        }
+    }
+}
+
+/* ------------------------------------------- Video Settings screen --- */
+/* Video Settings opens the Audio Settings screen (OPTIONS group 5, screen
+   5) in "video mode": its title becomes "Video Settings" and its three
+   volume rows are left out, so the choice row (the GameCube's Video row)
+   is what remains. Called while that screen's script sets itself up. */
+#define PV_BASE (PORT_RAM_BASE + 0x20000u)
+#define PV_TEXT (PV_BASE + 0x0000u)
+#define PV_KIDS (PV_BASE + 0x0100u)
+#define PV_LIST (PV_BASE + 0x0200u)
+#define PV_KIDS2 (PV_BASE + 0x0300u)   /* the root's children with the row copies */
+#define PV_OBJTAB (PV_BASE + 0x0400u)   /* the object table with the row copies */
+#define PV_ROWLIST (PV_BASE + 0x0900u)  /* the root's list of rows */
+#define PV_CODE (PV_BASE + 0x0A00u)     /* script added to the screen */
+#define PV_VARS (PV_BASE + 0x0C00u)     /* the copies' text variables */
+#define PV_HEAP (PV_BASE + 0x1000u)     /* the copies themselves */
+#define PV_END (PV_BASE + 0x8000u)
+#define VROWS 5                          /* rows on the screen: the original + 4 copies */
+#define VROW_DY 50.0f                    /* the rows' spacing (the volume rows' own) */
+#define AUD_NOBJ 0x22u
+#define AUD_NVAR 0x27u
+#define AUD_NFUNC 7u
+
+/* The choice row (object 1) and its parts (objects 2-6), copied for more
+   rows. A copy takes: the parts' instances (one block), their object records'
+   lists, descriptors and descriptor lists, and their drawing records; pointers
+   and script-relative offsets into any of those are moved to the copy, object
+   numbers to the copy's. Each copy gets its own label and value text
+   variables (the two text records point at buffer variables the row writes
+   its texts into). */
+#define VR_FIRST 1u
+#define VR_LAST 6u
+#define VR_MAXREG 64
+static Region g_vr[VR_MAXREG];
+static int g_nvr;
+static u32 g_vheap;
+
+static u32 vr_alloc(u32 n) {
+    u32 a = (g_vheap + 31u) & ~31u;
+    if (a + n > PV_END) return 0;
+    g_vheap = a + n;
+    return a;
+}
+
+static bool vr_add(u32 lo, u32 hi) {   /* a block to copy (once) */
+    for (int i = 0; i < g_nvr; i++)
+        if (lo >= g_vr[i].lo && hi <= g_vr[i].hi) return true;
+    if (g_nvr == VR_MAXREG || hi <= lo || !in_ram(lo, hi - lo)) return false;
+    g_vr[g_nvr++] = (Region){lo, hi, 0};
+    return true;
+}
+
+static u32 vr_reloc(u32 w, u32 h, bool offsets) {
+    for (int i = 0; i < g_nvr; i++)
+        if (w >= g_vr[i].lo && w < g_vr[i].hi) return w - g_vr[i].lo + g_vr[i].nlo;
+    if (offsets && w >= 0x800u && w < 0x40000u) {
+        u32 a = h + w;
+        for (int i = 0; i < g_nvr; i++)
+            if (a >= g_vr[i].lo && a < g_vr[i].hi) return a - g_vr[i].lo + g_vr[i].nlo - h;
+    }
+    return w;
+}
+
+static u32 g_vrow[VROWS];              /* the rows' instances (0: the original) */
+static u32 g_vh;                       /* the video screen's script header (0: not open) */
+static u32 g_vhelp;                    /* its help line's text record */
+static u32 g_vhelp_var, g_vhelp_buf;
+static u32 g_vval_var[5], g_vval_buf[5];
+static bool g_vstarted;                /* its rows have been given their values */
+static int g_vlast[VROWS];
+static const UisVideoRows* g_vcb;
+static u32 g_vrow_text[VROWS];         /* their value text records */
+
+static int video_rows(u32 h) {
+    u32 tab = h + 0x30, nobj = rd(h);
+    if (nobj != AUD_NOBJ) return 1;
+    u32 ctrl = rd(tab);
+    u32 row = rd(tab + VR_FIRST * 20);
+    g_vrow[0] = row;
+    /* The parts' instances: from the row's to the next object's. */
+    u32 inst_lo = row, inst_hi = 0xFFFFFFFFu;
+    for (u32 o = 0; o < nobj; o++) {
+        u32 a = rd(tab + o * 20);
+        if (o >= VR_FIRST && o <= VR_LAST) continue;
+        if (a > inst_lo && a < inst_hi) inst_hi = a;
+    }
+    for (u32 o = VR_FIRST; o <= VR_LAST; o++)
+        if (rd(tab + o * 20) >= inst_hi) return 1;
+    /* The last word before the next object is the root's (a draw list entry):
+       copy up to the row's text slots only. */
+    if (inst_hi - inst_lo > 0x800u) return 1;
+    g_nvr = 0;
+    vr_add(inst_lo, inst_hi - 4);
+    u32 draw_lo = 0xFFFFFFFFu, draw_hi = 0;
+    for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
+        u32 r = tab + o * 20, n1 = rd(r + 4), p1 = rd(r + 8), n2 = rd(r + 12), p2 = rd(r + 16);
+        if (n1) vr_add(p1, p1 + n1 * 4);
+        if (n2) vr_add(p2, p2 + n2 * 8);
+        for (u32 i = 0; i < n1; i++) {
+            u32 q = rd(p1 + i * 4), c = rd(q + 4), l = rd(q + 8);
+            vr_add(q, q + 12);
+            if (c > 16) return 1;
+            vr_add(l, l + c * 8);
+            for (u32 j = 0; j < c; j++) {
+                u32 k = rd(l + j * 8), v = rd(l + j * 8 + 4);
+                if (k == 0xFFFFFFFFu || !in_ram(v, 4)) continue;
+                u32 off = rd(v);
+                if (off < 0x800u || off >= 0x40000u) continue;
+                u32 size = (rd(h + off) >> 28) == 4 ? 0x60u : 0x40u;
+                if (h + off < draw_lo) draw_lo = h + off;
+                if (h + off + size > draw_hi) draw_hi = h + off + size;
+            }
+        }
+    }
+    /* Each part's focus links (+0x64 / +0x68 / +0x6c: script-relative
+       offsets of a small block naming the part and its neighbours). */
+    for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
+        u32 inst = rd(tab + o * 20), lo = 0xFFFFFFFFu, hi = 0;
+        for (u32 x = 0x64; x <= 0x6C; x += 4) {
+            u32 off = rd(inst + x);
+            if (off < 0x40u || off >= 0x40000u) { lo = 0xFFFFFFFFu; break; }
+            if (h + off < lo) lo = h + off;
+            if (h + off + 12 > hi) hi = h + off + 12;
+        }
+        if (lo != 0xFFFFFFFFu && hi - lo <= 0x40u) vr_add(lo, hi);
+    }
+    /* The row's own text slots (+0x368 value, +0x370 label) point at its two
+       text records, which follow the parts' quads. */
+    u32 vslot = row + 0x368, lslot = row + 0x370;
+    u32 voff = rd(vslot), loff = rd(lslot);
+    if (voff < 0x800u || loff < 0x800u || voff >= 0x40000u || loff >= 0x40000u) return 1;
+    if (h + voff + 0x40 > draw_hi) draw_hi = h + voff + 0x40;
+    if (h + loff + 0x40 > draw_hi) draw_hi = h + loff + 0x40;
+    if (draw_lo > h + voff) draw_lo = h + voff;
+    if (draw_hi <= draw_lo || draw_hi - draw_lo > 0x1000u) return 1;
+    vr_add(draw_lo, draw_hi);
+    int nreg = g_nvr;
+
+    /* The new object table: the screen's objects, then the copies. */
+    u32 per = VR_LAST - VR_FIRST + 1, nnew = nobj + (VROWS - 1) * per;
+    if (PV_OBJTAB + nnew * 20 > PV_ROWLIST) return 1;
+    memcpy(R + (PV_OBJTAB - G), R + (tab - G), nobj * 20);
+    g_vheap = PV_HEAP;
+    u32 vars = PV_VARS;
+    for (int c = 1; c < VROWS; c++) {
+        u32 base = nobj + (u32)(c - 1) * per;   /* the copy's first object number */
+        for (int i = 0; i < nreg; i++) {
+            u32 n = g_vr[i].hi - g_vr[i].lo, a = vr_alloc(n);
+            if (!a) return c;
+            g_vr[i].nlo = a;
+            memcpy(R + (a - G), R + (g_vr[i].lo - G), n);
+        }
+        for (int i = 0; i < nreg; i++) {
+            u32 n = g_vr[i].hi - g_vr[i].lo;
+            bool is_draw = g_vr[i].lo == draw_lo;
+            for (u32 a = g_vr[i].nlo; a + 4 <= g_vr[i].nlo + n; a += 4) {
+                u32 w = rd(a);
+                if (w == 0xC000FFFFu || w == 0xFFFFFFFFu) {   /* object numbers in lists */
+                    if (a + 8 <= g_vr[i].nlo + n && !is_draw) {
+                        u32 idx = rd(a + 4);
+                        if (idx >= VR_FIRST && idx <= VR_LAST) { wr(a + 4, base + idx - VR_FIRST); a += 4; continue; }
+                    }
+                    continue;
+                }
+                wr(a, vr_reloc(w, h, !is_draw));
+            }
+        }
+        /* The focus-link offsets are small (below what vr_reloc takes as an
+           offset): moved here, field by field. */
+        for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
+            u32 inst = rd(tab + o * 20), cinst = vr_reloc(inst, h, false);
+            for (u32 x = 0x64; x <= 0x6C; x += 4) {
+                u32 off = rd(inst + x), a = h + off;
+                for (int i = 0; i < nreg; i++)
+                    if (a >= g_vr[i].lo && a < g_vr[i].hi) { wr(cinst + x, a - g_vr[i].lo + g_vr[i].nlo - h); break; }
+            }
+        }
+        for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
+            u32 src = tab + o * 20, dst = PV_OBJTAB + (base + o - VR_FIRST) * 20;
+            wr(dst, vr_reloc(rd(src), h, false));
+            wr(dst + 4, rd(src + 4));
+            wr(dst + 8, vr_reloc(rd(src + 8), h, false));
+            wr(dst + 12, rd(src + 12));
+            wr(dst + 16, vr_reloc(rd(src + 16), h, false));
+        }
+        u32 crow = vr_reloc(row, h, false);
+        g_vrow[c] = crow;
+        /* One row lower. */
+        union { u32 u; float f; } y;
+        y.u = rd(row + 0x0C); y.f += VROW_DY * (float)c; wr(crow + 0x0C, y.u);
+        /* Its own text buffers: the text records point at variables. */
+        u32 vrec = h + rd(crow + 0x368), lrec = h + rd(crow + 0x370);
+        if (!in_ram(vrec, 0x40) || !in_ram(lrec, 0x40)) return c;
+        u32 vvar = vars, lvar = vars + 12;
+        u32 vbuf = vr_alloc(100), lbuf = vr_alloc(40);
+        if (!vbuf || !lbuf) return c;
+        put_var(vvar, vbuf, rd(rd(vrec + 0x20) + 4), (const char*)(R + (rd(rd(vrec + 0x20) + 8) - G)), 100);
+        put_var(lvar, lbuf, rd(rd(lrec + 0x20) + 4), (const char*)(R + (rd(rd(lrec + 0x20) + 8) - G)), 40);
+        wr(vrec + 0x20, vvar);
+        wr(lrec + 0x20, lvar);
+        g_vrow_text[c] = vrec;
+        vars += 24;
+    }
+    g_vrow_text[0] = h + voff;
+    /* Up / down: each row's focus links (+0x6c next, +0x68 previous: has
+       one, the row itself, the other row; script-relative instances) chain
+       the five rows; the copies still pointed at the volume rows. */
+    /* The link blocks are packed against the next data in the script (a
+       block with no link has no third word: what follows is something
+       else, the row's box among it), so each link gets a block of its own.
+       The first row keeps its "no previous" block. */
+    for (int r = 0; r < VROWS; r++) {
+        u32 self = g_vrow[r] - h;
+        u32 nb = vr_alloc(12);
+        wr(nb, r < VROWS - 1 ? 1u : 0u); wr(nb + 4, self); wr(nb + 8, r < VROWS - 1 ? g_vrow[r + 1] - h : self);
+        wr(g_vrow[r] + 0x6C, nb - h);
+        if (r > 0) {
+            u32 pb = vr_alloc(12);
+            wr(pb, 1); wr(pb + 4, self); wr(pb + 8, g_vrow[r - 1] - h);
+            wr(g_vrow[r] + 0x68, pb - h);
+        }
+    }
+    /* Labels: written into each row's label text (its buffer variable and
+       the record's length) and its label variable (+0x94, which the row's
+       start-up uses). */
+    static const char* const k_label[VROWS] = {"Aspect Ratio", "Display", "Window Size", "Renderer",
+                                               "Internal Resolution"};
+    for (int r = 0; r < VROWS; r++) {
+        u32 lrec = h + rd(g_vrow[r] + 0x370), lv = rd(lrec + 0x20);
+        u32 n = (u32)strlen(k_label[r]);
+        if (!in_ram(lv, 12) || rd(lv + 4) == 0 || !in_ram(rd(lv + 8), 40)) continue;
+        memset(R + (rd(lv + 8) - G), 0, 40);
+        memcpy(R + (rd(lv + 8) - G), k_label[r], n);
+        wr(lv + 4, n);
+        wr(lrec + 0x24, n);
+        u32 lab = vars;                    /* a variable for +0x94 */
+        put_var(lab, vr_alloc(32), n, k_label[r], 32);
+        wr(g_vrow[r] + 0x94, lab);
+        vars += 12;
+    }
+    wr(h, nnew);
+    wr(h + 4, PV_OBJTAB);
+    /* On screen and in the up / down order: after the original row, in the
+       root's children and its list of rows. */
+    {
+        u32 r0 = PV_OBJTAB, n2 = rd(r0 + 12), kids = rd(r0 + 16), out = PV_KIDS2;
+        for (u32 k = 0; k < n2 && k < 24; k++) {
+            wr(out, rd(kids + k * 8)); wr(out + 4, rd(kids + k * 8 + 4)); out += 8;
+            if (rd(kids + k * 8) == 0xC000FFFFu && rd(kids + k * 8 + 4) == VR_FIRST)
+                for (int c = 1; c < VROWS; c++) { wr(out, 0xC000FFFFu); wr(out + 4, nobj + (u32)(c - 1) * per); out += 8; }
+        }
+        wr(r0 + 12, (out - (PV_KIDS2)) / 8);
+        wr(r0 + 16, PV_KIDS2);
+        u32 n1 = rd(r0 + 4), p1 = rd(r0 + 8);
+        for (u32 i = 0; i < n1 && i < 8; i++) {
+            u32 desc = rd(p1 + i * 4), n = rd(desc + 4), list = rd(desc + 8);
+            if (n != 1 || rd(list) != 0xFFFFFFFFu || rd(list + 4) != VR_FIRST) continue;
+            u32 lo = PV_ROWLIST;
+            wr(lo, 0xFFFFFFFFu); wr(lo + 4, VR_FIRST);
+            for (int c = 1; c < VROWS; c++) { wr(lo + (u32)c * 8, 0xFFFFFFFFu); wr(lo + (u32)c * 8 + 4, nobj + (u32)(c - 1) * per); }
+            wr(desc + 4, VROWS);
+            wr(desc + 8, lo);
+        }
+    }
+    /* The copies' start-up handler (the game ran the original's when the
+       screen loaded): called at the end of the controller's own start-up,
+       in place of its last call. */
+    u32 init = 0, cinit = 0;
+    {
+        u32 r = tab + VR_FIRST * 20, n2 = rd(r + 12), p2 = rd(r + 16);
+        for (u32 k = 0; k < n2; k++) if (rd(p2 + k * 8) == 0x8000FFFEu) init = rd(p2 + k * 8 + 4);
+        r = tab; n2 = rd(r + 12); p2 = rd(r + 16);
+        for (u32 k = 0; k < n2 && k < 32; k++) if (rd(p2 + k * 8) == 0x8000FFFEu) cinit = rd(p2 + k * 8 + 4);
+    }
+    u32 call = 0;
+    for (u32 a = cinit; cinit && a < cinit + 0x200; a++)
+        if (rb(a) == 0x43 && rb(a + 5) == 0x42 && rb(a + 6) == 0x42 && rb(a + 7) == 0x42 && rb(a + 8) == 0x44) { call = a; break; }
+    if (init && call) {
+        u32 orig = rd(call + 1);
+        g_code = PV_CODE;
+        for (int c = 1; c < VROWS; c++) {
+            emit8(0x57); emit32(g_vrow[c] - ctrl); emit8(0xFF); emit8(0xFE);
+            emit8(0x43); emit32(init - h);
+            emit8(0x42);
+        }
+        /* The screen's start-up paused the music (as Audio Settings does
+           until its Music Volume row is picked); its function 3 with 10 (the
+           music row's) starts it again. */
+        emit_push(0); emit_push(0x80000003u); emit_push(10); emit_push(1); emit8(0x0B);
+        emit8(0x42); emit8(0x42);   /* the argument, then the answer's slot */
+        emit8(0x41); emit_push(0xFFFFFFFDu); emit8(0x1A); emit8(0x43); emit32(orig); emit8(0x42); emit8(0x42);
+        emit8(0x44);
+        wr(call + 1, PV_CODE - h);
+    }
+    return VROWS;
+}
+
+void uismenu_set_video_rows(const UisVideoRows* cb) { g_vcb = cb; }
+
+static bool video_open(void) {
+    u32 h = g_vh;
+    if (!h || !in_ram(h, 0x40) || rd(h) != AUD_NOBJ + (VROWS - 1) * (VR_LAST - VR_FIRST + 1) || rd(h + 4) != PV_OBJTAB)
+        return false;
+    /* Still the screen's memory (not freed and reused): its title and the
+       first row's link to the second, both set by the port. */
+    u32 vars = rd(h + 0xC);
+    if (!in_ram(vars, 12) || rd(vars + 8) != PV_TEXT || !in_ram(g_vrow[0], 0x400) ||
+        h + rd(g_vrow[0] + 0x6C) < PV_HEAP || h + rd(g_vrow[0] + 0x6C) >= PV_END)
+        return false;
+    if (g_vhelp && (!in_ram(g_vhelp_var, 12) || rd(g_vhelp_var + 8) != g_vhelp_buf)) return false;
+    for (int r = 0; r < VROWS; r++)
+        if (!in_ram(g_vrow_text[r], 0x40) || !in_ram(g_vval_var[r], 12) || rd(g_vval_var[r] + 8) != g_vval_buf[r])
+            return false;
+    return true;
+}
+
+void uismenu_video_closed(void) { g_vh = 0; }
+
+bool uismenu_video_active(CPUState* cpu) {
+    R = cpu->ram;
+    RS = cpu->ram_size;
+    if (!R) return false;
+    if (!video_open()) { g_vh = 0; return false; }
+    return true;
+}
+
+/* A text record showing one of the port's buffer variables: its text. The
+   game's own scripts point the record at other variables (the value names
+   "Normal" etc.), so it's pointed back first. */
+static void set_text(u32 rec, u32 var, const char* t, u32 cap) {
+    if (!in_ram(rec, 0x40) || !in_ram(var, 12) || !in_ram(rd(var + 8), cap)) return;
+    u32 n = (u32)strlen(t);
+    if (n >= cap) n = cap - 1;
+    u32 buf = rd(var + 8);
+    if (rd(rec + 0x20) == var && rd(rec + 0x24) == n && rd(var + 4) == n && memcmp(R + (buf - G), t, n) == 0) return;
+    memset(R + (buf - G), 0, cap);
+    memcpy(R + (buf - G), t, n);
+    wr(var + 4, n);
+    wr(rec + 0x20, var);
+    wr(rec + 0x24, n);
+}
+
+/* Every video field while Video Settings is open: the rows show the port's
+   settings, a value changed with left / right is applied, and the help line
+   follows the row with the cursor. */
+void uismenu_video_frame(CPUState* cpu) {
+    if (!g_vh || !g_vcb) return;
+    if (!uismenu_video_active(cpu)) return;
+    u32 h = g_vh;
+    /* The copies' start-up (run at the end of the screen's) sets their
+       range; after it, the values go in. */
+    if (!g_vstarted) {
+        for (int r = 0; r < VROWS; r++)
+            if (rd(g_vrow[r] + 0x80) != 1) return;   /* step not set yet: start-up still to run */
+        for (int r = 0; r < VROWS; r++) {
+            int n = g_vcb->count(r), v = g_vcb->get(r);
+            wr(g_vrow[r] + 0x78, 0);
+            wr(g_vrow[r] + 0x7C, (u32)(n - 1));
+            wr(g_vrow[r] + 0x8C, 1);                  /* wraps round */
+            wr(g_vrow[r] + 0x74, (u32)v);
+            g_vlast[r] = v;
+        }
+        g_vstarted = true;
+        printf("uis: Video Settings: rows show the port's settings\n");
+    }
+    int focus = -1;
+    for (int r = 0; r < VROWS; r++) {
+        u32 row = g_vrow[r];
+        int v = (int)rd(row + 0x74), n = g_vcb->count(r);
+        /* Only the row with the cursor changes (left / right); anything else
+           moving a value isn't the player, so it's put back. */
+        if (v < 0 || v >= n || (v != g_vlast[r] && rd(row + 0x84) != 1)) { v = g_vlast[r]; wr(row + 0x74, (u32)v); }
+        int cur = g_vcb->get(r);
+        if (v == g_vlast[r] && cur != v) {   /* changed elsewhere (F11, the port's menu) */
+            v = g_vlast[r] = cur;
+            wr(row + 0x74, (u32)v);
+        }
+        if (v != g_vlast[r]) {
+            printf("uis: Video Settings: row %d set to %s\n", r + 1, g_vcb->name(r, v));
+            g_vcb->set(r, v);
+            g_vlast[r] = v;
+        }
+        set_text(g_vrow_text[r], g_vval_var[r], g_vcb->name(r, v), 100);
+        if (rd(row + 0x84) == 1) focus = r;
+    }
+    if (focus >= 0 && g_vhelp) set_text(g_vhelp, g_vhelp_var, g_vcb->help(focus), 200);
+}
+
+bool uismenu_video_screen(CPUState* cpu) {
+    R = cpu->ram;
+    RS = cpu->ram_size;
+    if (!R || RS < (PV_BASE - G) + 0x1000u) return false;
+    u32 h = 0;
+    for (u32 o = 0x00800000u; o + 0x20 < RS && o < 0x01800000u; o += 4) {
+        u32 a = G + o;
+        if (rd(a) == AUD_NOBJ && rd(a + 4) == a + 0x30 && rd(a + 8) == AUD_NVAR && rd(a + 0x10) == AUD_NFUNC &&
+            str_is(rd(a + 0xC), "Audio Settings")) { h = a; break; }
+    }
+    if (!h) { printf("uis: Video Settings: the Audio Settings screen isn't as expected\n"); return false; }
+    u32 vars = rd(h + 0xC), tab = h + 0x30;
+    /* Titles: var 0 ("Audio Settings", Xbox / PS2 layout) and var 2
+       ("Audio/Visual", GameCube). */
+    memset(R + (PV_TEXT - G), 0, 0x100);
+    memcpy(R + (PV_TEXT - G), "Video Settings", 14);
+    wr(vars + 0 * 12 + 4, 14); wr(vars + 0 * 12 + 8, PV_TEXT);
+    wr(vars + 2 * 12 + 4, 14); wr(vars + 2 * 12 + 8, PV_TEXT);
+    /* The volume rows (objects 7, 14, 21) out of the root's children and its
+       list of rows. */
+    static const u32 k_vol[3] = {0x07, 0x0E, 0x15};
+    #define IS_VOL(n) ((n) == k_vol[0] || (n) == k_vol[1] || (n) == k_vol[2])
+    u32 n2 = rd(tab + 12), kids = rd(tab + 16), out = PV_KIDS;
+    for (u32 k = 0; k < n2 && k < 24; k++) {
+        u32 key = rd(kids + k * 8), val = rd(kids + k * 8 + 4);
+        if (key == 0xC000FFFFu && IS_VOL(val)) continue;
+        wr(out, key); wr(out + 4, val); out += 8;
+    }
+    wr(tab + 12, (out - PV_KIDS) / 8);
+    wr(tab + 16, PV_KIDS);
+    u32 n1 = rd(tab + 4), p1 = rd(tab + 8), lout = PV_LIST;
+    for (u32 i = 0; i < n1 && i < 8; i++) {
+        u32 desc = rd(p1 + i * 4), n = rd(desc + 4), list = rd(desc + 8);
+        if (!n || n > 16 || !in_ram(list, n * 8)) continue;
+        bool any = false;
+        for (u32 k = 0; k < n; k++) if (rd(list + k * 8) == 0xFFFFFFFFu && IS_VOL(rd(list + k * 8 + 4))) any = true;
+        if (!any) continue;
+        u32 start = lout, m = 0;
+        for (u32 k = 0; k < n; k++) {
+            if (rd(list + k * 8) == 0xFFFFFFFFu && IS_VOL(rd(list + k * 8 + 4))) continue;
+            wr(lout, rd(list + k * 8)); wr(lout + 4, rd(list + k * 8 + 4)); lout += 8; m++;
+        }
+        wr(desc + 4, m);
+        wr(desc + 8, start);
+    }
+    #undef IS_VOL
+    /* The help line: the text record showing var 34 (the focused row's
+       help, copied there by the rows' focus handlers). */
+    g_vhelp = 0;
+    for (u32 a = h + 0x3000u; a < h + 0x5000u; a += 0x20)
+        if (rd(a + 0x20) == vars + 34 * 12 && (rd(a) & 0xFFFFu) == 0x0402u) { g_vhelp = a; break; }
+    g_vhelp_var = vars + 34 * 12;
+    int rows = video_rows(h);
+    for (int r = 0; r < VROWS && rows == VROWS; r++) {
+        g_vrow_text[r] = h + rd(g_vrow[r] + 0x368);
+        g_vval_var[r] = rd(g_vrow_text[r] + 0x20);
+        g_vval_buf[r] = rd(g_vval_var[r] + 8);
+    }
+    g_vhelp_buf = rd(g_vhelp_var + 8);
+    g_vh = rows == VROWS ? h : 0;
+    g_vstarted = false;
+    printf("uis: Video Settings: Audio Settings screen opened in video mode (%d rows)\n", rows);
+    return true;
 }

@@ -509,6 +509,7 @@ int main(int argc, char** argv) {
         if (!egl_init()) { fprintf(stderr, "no EGL context\n"); return 1; }
         if (!gx_raster_use_gpu(getproc, scale, make_current)) return 1;
         egl_make(g_dpy, NULL, NULL, NULL);   /* release: the renderer's GPU thread uses it */
+        if (getenv("RESCALE")) gx_raster_set_gpu_scale(atoi(getenv("RESCALE")));   /* tests: changed while running */
     }
     GLuint shot_fbo = 0;
     if (present) {

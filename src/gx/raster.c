@@ -110,6 +110,10 @@ static void texture_freed(const u32* texels) {
     glr_texture_freed(texels);
 }
 
+void gx_raster_set_gpu_scale(int scale) {
+    if (g_gpu) glr_set_scale(scale);
+}
+
 bool gx_raster_use_gpu(void* (*getproc)(const char*), int scale, void (*make_current)(void)) {
     if (!glr_init(getproc, scale, make_current))
         return false;

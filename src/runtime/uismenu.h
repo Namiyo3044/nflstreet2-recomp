@@ -9,14 +9,44 @@
 #define PORT_RAM_BASE 0x81800000u
 #define PORT_RAM_SIZE 0x00100000u
 
-/* Function number the added menu code calls to ask "quit?". */
+/* Function number the added menu code calls once "quit?" is answered yes. */
 #define UIS_FN_QUIT 0x7A51u
 /* ... and to open the port's video settings (Options list). */
 #define UIS_FN_VIDEO 0x7A52u
+/* ... and to say the Options list opens Audio Settings itself (not in video mode). */
+#define UIS_FN_AUDIO 0x7A53u
+#define UIS_FN_VIDEO_BACK 0x7A54u   /* 1 once when back from Video Settings */
 
 /* Adds a seventh button, Quit Game, to the main menu (once per load of the
    main menu's script; does nothing if the script isn't the expected one).
    Call while the main menu script is setting itself up. */
 void uismenu_add_quit(CPUState* cpu);
+
+/* Hides the GameCube title screen's "Licensed by Nintendo" line, as on PS2 and
+   Xbox (call while the title screen script is loaded). */
+void uismenu_hide_licence(CPUState* cpu);
+
+/* Video Settings: turns the Audio Settings screen being set up into the
+   video settings screen (false if it isn't as expected). */
+bool uismenu_video_screen(CPUState* cpu);
+
+/* The Video Settings rows' values, from the window side (settings). */
+typedef struct {
+    int (*count)(int row);
+    int (*get)(int row);
+    void (*set)(int row, int value);
+    const char* (*name)(int row, int value);
+    const char* (*help)(int row);
+} UisVideoRows;
+void uismenu_set_video_rows(const UisVideoRows* rows);
+
+/* Video Settings is open (the Audio Settings screen in video mode). */
+bool uismenu_video_active(CPUState* cpu);
+
+/* Another screen's script ran: Video Settings is closed. */
+void uismenu_video_closed(void);
+
+/* Once per video field: Video Settings' rows follow and set the settings. */
+void uismenu_video_frame(CPUState* cpu);
 
 #endif

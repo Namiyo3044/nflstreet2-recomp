@@ -400,6 +400,9 @@ static void uis_main_menu_edits(CPUState* ctx) {
     }
 }
 
+static bool g_video_screen;            /* the Options list asked for Video Settings */
+static bool g_video_back;              /* ... and the cursor goes back to it */
+
 static int uis_native_hook(CPUState* ctx) {
     if (g_uis_ok < 0)
         g_uis_ok = mem_read32(ctx, UIS_NATIVE_DISPATCH) == 0x9421FFE8u &&    /* stwu r1, -0x18(r1) */
@@ -427,21 +430,51 @@ static int uis_native_hook(CPUState* ctx) {
         }
     }
     if (ctx->gpr[3] == UIS_FN_QUIT && group == 0) {
-        printf("uis: Quit Game picked\n");
+        /* Yes in the game's own "quit?" dialog (uismenu.c). */
+        printf("uis: Quit Game confirmed\n");
 #ifdef NFLS2_HAVE_WINDOW
-        window_quit_request();
+        window_quit_now();
 #endif
         mem_write32(ctx, ctx->gpr[8], 0);
         ctx->gpr[3] = 1;
         ctx->pc = ctx->lr;
         return 1;
     }
-    if (ctx->gpr[3] == UIS_FN_VIDEO && group == 0) {
-        printf("uis: Video Settings picked\n");
-#ifdef NFLS2_HAVE_WINDOW
-        window_video_request();
-#endif
+    if ((ctx->gpr[3] == UIS_FN_VIDEO || ctx->gpr[3] == UIS_FN_AUDIO) && group == 0) {
+        /* The Options list opens Audio Settings for both entries; this says
+           which (Video Settings: the same screen in video mode). */
+        g_video_screen = g_video_back = ctx->gpr[3] == UIS_FN_VIDEO;
         mem_write32(ctx, ctx->gpr[8], 0);
+        ctx->gpr[3] = 1;
+        ctx->pc = ctx->lr;
+        return 1;
+    }
+    if (group == 5 && screen == 5 && ctx->gpr[3] == 0x80000002u) {
+        /* The screen's leaving (its function 2, run as it closes): from here
+           its memory is on its way out, so the port stops touching it. */
+        uismenu_video_closed();
+        return 0;
+    }
+    if (group == 5 && screen == 5 && ctx->gpr[3] == 0x80000003u && ctx->gpr[6] == 1 && uismenu_video_active(ctx)) {
+        /* Video Settings: the screen's function 3 is the rows' sound
+           preview (8-10: speech, effects, music; anything else pauses the
+           music, as the screen's start-up did). Each is made the music row's,
+           which keeps the music playing. */
+        mem_write32(ctx, ctx->gpr[7], 10);
+        return 0;
+    }
+    if (group == 5 && screen == 5 && ctx->gpr[3] == 0x80000005u && ctx->gpr[6] >= 1 && uismenu_video_active(ctx)) {
+        /* ... and nothing written to the game's audio / screen settings (its
+           rows set the port's): the setting number is made one the game
+           doesn't have, so the call goes through and does nothing. */
+        mem_write32(ctx, ctx->gpr[7], 0x7Fu);
+        uismenu_video_closed();        /* sent as the screen is left (Back): it's closing */
+        return 0;
+    }
+    if (ctx->gpr[3] == UIS_FN_VIDEO_BACK && group == 0) {
+        /* Back on Options from Audio Settings' screen: was it Video Settings? */
+        mem_write32(ctx, ctx->gpr[8], g_video_back ? 1u : 0u);
+        g_video_back = false;
         ctx->gpr[3] = 1;
         ctx->pc = ctx->lr;
         return 1;
@@ -483,11 +516,20 @@ static int uis_native_hook(CPUState* ctx) {
     }
     if (ctx->gpr[3] != UIS_FN_PLATFORM)
         return 0;
+    if (!(group == 5 && screen == 5)) uismenu_video_closed();   /* another screen loading */
     if (group == 0) { uis_main_menu_edits(ctx); uismenu_add_quit(ctx); }
+    if (group == 0 && (screen == 2 || screen == 3)) uismenu_hide_licence(ctx);   /* the title screen */
     static u32 seen[16];
     if (group < 16 && screen < 32 && !(seen[group] & (1u << screen))) {
         seen[group] |= 1u << screen;
         printf("uis: menu group %u screen %u checks the console\n", group, screen);
+    }
+    if (group == 5 && screen == 5 && g_video_screen) {
+        /* Video Settings: the screen in video mode, with its GameCube
+           layout (the Video row) kept. */
+        g_video_screen = false;
+        uismenu_video_screen(ctx);
+        return 0;
     }
     if (!(group == 5 && screen == 5 && g_settings.screen_shape != 0))
         return 0;
@@ -851,7 +893,7 @@ int main(int argc, char** argv) {
     unsigned long long max_steps = 50000000ull;
     bool max_steps_given = false;
     bool want_window = false;
-    int window_scale = 2;
+    int window_height = 960;
     int gpu_scale = 0;                 /* 0 = software renderer */
     const char* dump_audio = NULL;
     const char* textures_dir = NULL;
@@ -873,7 +915,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i + 1 < argc; i++)
         if (strcmp(argv[i], "--settings") == 0) {
             settings_load(argv[i + 1]);
-            window_scale = g_settings.window_size;
+            window_height = settings_window_height(g_settings.window_size);
             gpu_scale = g_settings.renderer == 0 ? g_settings.resolution : 0;
             aspect_mode = g_settings.screen_shape;
             have_settings = true;
@@ -915,7 +957,7 @@ int main(int argc, char** argv) {
             gpu_scale = atoi(argv[++i]);
             if (gpu_scale < 1) gpu_scale = 1;
         } else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
-            window_scale = atoi(argv[++i]);
+            window_height = 480 * atoi(argv[++i]);
         } else if (strcmp(argv[i], "--debug") == 0) {
             g_debug = true;
         } else if (strcmp(argv[i], "--quiet") == 0) {
@@ -1002,7 +1044,7 @@ int main(int argc, char** argv) {
         window_set_aspect_mode(aspect_mode);
         if (dump_audio) window_set_audio_dump(dump_audio);
         window_set_gpu(gpu_scale);
-        if (!window_open(window_scale))
+        if (!window_open(window_height))
             return 1;
         gx_raster_render_all();
         interrupts_set_field_callback(window_field);

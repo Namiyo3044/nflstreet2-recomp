@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-Settings g_settings = {0, 4, 0, 0, 2, 1, {0}, {0}, 0, 1};
+Settings g_settings = {0, 4, 0, 0, 3, 1, {0}, {0}, 0, 1};
 
 const char* const k_gc_input_names[GCI_COUNT] = {
     "a", "b", "x", "y", "z", "start", "l", "r",
@@ -15,6 +15,11 @@ const char* const k_gc_input_names[GCI_COUNT] = {
 static char g_path[1024];
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+int settings_window_height(int window_size) {
+    static const int k_h[SETTINGS_WINDOW_SIZES] = {480, 720, 900, 1080, 1440, 2160};
+    return k_h[clampi(window_size, 1, SETTINGS_WINDOW_SIZES) - 1];
+}
 
 bool settings_load(const char* path) {
     if (!path || !*path) return false;
@@ -35,7 +40,7 @@ bool settings_load(const char* path) {
         else if (strcmp(key, "screen_shape") == 0)
             s->screen_shape = strcmp(val, "4:3") == 0 ? 1 : strcmp(val, "16:9") == 0 ? 2 : 0;
         else if (strcmp(key, "fullscreen") == 0) s->fullscreen = atoi(val) != 0;
-        else if (strcmp(key, "window_size") == 0) s->window_size = clampi(atoi(val), 1, 4);
+        else if (strcmp(key, "window_size") == 0) s->window_size = clampi(atoi(val), 1, SETTINGS_WINDOW_SIZES);
         else if (strcmp(key, "custom_textures") == 0) s->custom_textures = atoi(val) != 0;
         else if (strcmp(key, "keyboard_player") == 0) s->keyboard_player = clampi(atoi(val), 1, 4) - 1;
         else if (strcmp(key, "nintendo_labels") == 0) s->nintendo_labels = atoi(val) != 0;
