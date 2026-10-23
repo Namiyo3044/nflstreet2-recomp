@@ -471,6 +471,13 @@ static int uis_native_hook(CPUState* ctx) {
         uismenu_video_closed();        /* sent as the screen is left (Back): it's closing */
         return 0;
     }
+    if (ctx->gpr[3] == UIS_FN_FLICKER_DONE && group == 0) {
+        uismenu_flicker_done(ctx);
+        mem_write32(ctx, ctx->gpr[8], 0);
+        ctx->gpr[3] = 1;
+        ctx->pc = ctx->lr;
+        return 1;
+    }
     if (ctx->gpr[3] == UIS_FN_VIDEO_BACK && group == 0) {
         /* Back on Options from Audio Settings' screen: was it Video Settings? */
         mem_write32(ctx, ctx->gpr[8], g_video_back ? 1u : 0u);

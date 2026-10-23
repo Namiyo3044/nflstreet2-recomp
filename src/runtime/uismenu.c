@@ -594,6 +594,7 @@ void uismenu_add_quit(CPUState* cpu) {
         emit8(0x41); emit_push(UIS_FN_QUIT); emit_push(0); emit8(0x0B); emit8(0x42);
         wr(skip + 1, g_code - (skip + 6));
         emit8(0x42);                       /* the choice */
+        emit8(0x41); emit_push(UIS_FN_FLICKER_DONE); emit_push(0); emit8(0x0B); emit8(0x42);
         emit8(0x41); emit_push(0xFFFFFFF5u); emit8(0x1A); emit8(0x43); emit32(0x0001F87Eu); emit8(0x42); emit8(0x42);
         emit_jump(s_action->dflt);
         wr(s_action->dflt_imm, c - (s_action->dflt_imm + 5));
@@ -721,6 +722,39 @@ void uismenu_add_quit(CPUState* cpu) {
    START"; the PS2 and Xbox ones don't. It is a text record in the title
    script pointing at a variable holding the words, with its own length:
    that length is set to 0, so the line isn't drawn. */
+/* The main menu's flicker objects (the glitch effect that brings a list's
+   text in piece by piece): a rate function counts +0x70 up and switches
+   pieces on and off; each piece is a pair (its drawing record's offset, on)
+   from +0x90, with +0x8C the first. The quit dialog opening part way through
+   left the count stopped and pieces off (the lists' entries invisible):
+   all pieces on, the count back at 0, as a finished flicker leaves them. */
+#define FLICKER_START 0x1B47Bu         /* their start-up handler (script offset) */
+void uismenu_flicker_done(CPUState* cpu) {
+    R = cpu->ram;
+    RS = cpu->ram_size;
+    u32 h = find_header();
+    if (!h) return;
+    u32 n = rd(h), tab = rd(h + 4), fixed = 0;
+    if (!in_ram(tab, n * 20) || n > 0x200) return;
+    for (u32 k = 0; k < n; k++) {
+        u32 inst = rd(tab + k * 20), n2 = rd(tab + k * 20 + 12), p2 = rd(tab + k * 20 + 16);
+        if (!in_ram(inst, 0x100) || n2 > 64 || !in_ram(p2, n2 * 8)) continue;
+        bool flicker = false;
+        for (u32 j = 0; j < n2; j++)
+            if (rd(p2 + j * 8) == 0x8000FFFEu && rd(p2 + j * 8 + 4) == h + FLICKER_START) flicker = true;
+        if (!flicker) continue;
+        bool any = false;
+        if (rd(inst + 0x8C) == 0) { wr(inst + 0x8C, 1); any = true; }
+        for (u32 off = 0x90; off < 0x100; off += 8) {
+            u32 rec = rd(inst + off);
+            if (rec < 0x100u || rec > 0x40000u) break;     /* past the pieces */
+            if (rd(inst + off + 4) == 0) { wr(inst + off + 4, 1); any = true; }
+        }
+        if (any) { wr(inst + 0x70, 0); fixed++; }
+    }
+    if (fixed) printf("uis: main menu: %u text flicker(s) cut short by the quit dialog finished\n", fixed);
+}
+
 void uismenu_hide_licence(CPUState* cpu) {
     R = cpu->ram;
     RS = cpu->ram_size;

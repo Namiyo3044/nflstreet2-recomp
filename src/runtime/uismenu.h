@@ -16,6 +16,11 @@
 /* ... and to say the Options list opens Audio Settings itself (not in video mode). */
 #define UIS_FN_AUDIO 0x7A53u
 #define UIS_FN_VIDEO_BACK 0x7A54u   /* 1 once when back from Video Settings */
+#define UIS_FN_FLICKER_DONE 0x7A55u /* after the quit dialog: the text flicker finished */
+
+/* The main menu's text-flicker pieces shown again in full (a dialog opened
+   while one was flickering stopped it part way, leaving text hidden). */
+void uismenu_flicker_done(CPUState* cpu);
 
 /* Adds a seventh button, Quit Game, to the main menu (once per load of the
    main menu's script; does nothing if the script isn't the expected one).
