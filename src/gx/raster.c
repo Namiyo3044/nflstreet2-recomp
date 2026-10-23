@@ -636,12 +636,35 @@ static bool state_textured(const RenderState* rs) {
     return false;
 }
 
-static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest) {
+/* A copy of the whole screen drawn back as a texture (a crossfade: the last
+   picture drawn over the new one as it fades; the loading screen's curtain:
+   strips of it sliding off the sides): the copy holds the whole wider
+   picture, so anything drawn from it in 2D is laid across the full width
+   (not kept to 16:9 in the middle, which squeezed it, and stopped the
+   curtain's strips at the 16:9 edges). Small copies (a created player's
+   portrait) are left alone. */
+static bool state_capture(const RenderState* rs) {
+    for (u32 i = 0; i < rs->stages && i < 16; i++)
+        if (rs->st[i].tex_on && rs->st[i].efb_copy && rs->st[i].tw >= 300u && rs->st[i].th >= 200u) return true;
+    return false;
+}
+
+static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool capture) {
     int target = g_target_shape;
     if (target < 3 || n < 3) return;
     /* Positions across the 16:9 picture (-1 its left edge, 1 its right),
        which sits in the middle of the wider one. */
     float frame = (16.0f / 9.0f) / ultrawide_aspect(target);
+    if (capture && !g_setup.persp && g_setup.xs < 1.0f) {
+        for (u32 i = 0; i < n; i++) {
+            if (!(v[i].clip[3] > 1e-6f)) return;
+        }
+        for (u32 i = 0; i < n; i++) {
+            v[i].clip[0] /= g_setup.xs;
+            project(&v[i]);
+        }
+        return;
+    }
     float mn = 1e9f, mx = -1e9f, alpha = 0.0f;
     for (u32 i = 0; i < n; i++) {
         if (!(v[i].clip[3] > 1e-6f)) return;
@@ -651,7 +674,7 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest) {
         alpha += v[i].col[0][3];
     }
     if (!g_setup.persp && g_setup.xs < 1.0f && mn <= -0.97f && mx >= 0.97f) {   /* screen-wide 2D */
-        if (textured && alpha / (float)n > 0.95f) return;   /* an opaque picture */
+        if (textured && !capture && alpha / (float)n > 0.95f) return;   /* an opaque picture */
         for (u32 i = 0; i < n; i++) {
             v[i].clip[0] /= g_setup.xs;
             project(&v[i]);
@@ -2163,7 +2186,8 @@ static const CmdList* expand_list(const CmdList* l) {
             const Vtx* raw = l->raw + c->u.draw.first;
             for (u32 k = 0; k < count; k++)
                 transform(&raw[k], &e->verts[base + k]);
-            widen_fullscreen_2d(&e->verts[base], count, state_textured(&l->states[c->state]), l->states[c->state].ztest);
+            widen_fullscreen_2d(&e->verts[base], count, state_textured(&l->states[c->state]), l->states[c->state].ztest,
+                                state_capture(&l->states[c->state]));
             emit_prim(e, c->state, (u8)c->u.draw.prim, base, count);
         } else {
             Cmd* d = list_push(e);
@@ -2222,7 +2246,8 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
         p += decode_vertex(cpu, &fmt, p, &v);
         transform(&v, &sv[i]);
     }
-    widen_fullscreen_2d(sv, count, state_textured(&l->states[state]), l->states[state].ztest);
+    widen_fullscreen_2d(sv, count, state_textured(&l->states[state]), l->states[state].ztest,
+                        state_capture(&l->states[state]));
     if (g_dlog_at >= 0.0 && g_dlog_frames > 0 && interrupts_game_seconds() >= g_dlog_at)
         dlog_draw(prim, count, &sv[0]);
 
