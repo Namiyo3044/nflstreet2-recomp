@@ -19,7 +19,7 @@ typedef struct {
 enum { MENU_UP, MENU_DOWN, MENU_LEFT, MENU_RIGHT, MENU_OK, MENU_BACK };
 
 /* Settings items, as bits in menu_take_changes(). */
-enum { MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RENDERER, MI_RES, MI_TEXTURES, MI_COLORS, MI_CONTROLS, MI_CLOSE, MI_COUNT };
+enum { MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RES, MI_RENDERER, MI_TEXTURES, MI_COLORS, MI_CONTROLS, MI_CLOSE, MI_COUNT };
 
 void menu_open(const MenuInfo* info);
 /* Opens on its own page asking whether to quit (the main menu's Quit Game);
@@ -44,6 +44,9 @@ int menu_capturing(void);
    controls page; the window updates it. */
 void menu_set_players_text(const char* text);
 
+/* The graphics card's name, shown for the graphics card renderer. */
+void menu_set_gpu_name(const char* name);
+
 /* The picture's shape now (width / height), for the window sizes shown. */
 void menu_set_aspect(float aspect);
 
@@ -60,6 +63,7 @@ int menu_game_row_get(int row);
 void menu_game_row_set(int row, int value);
 const char* menu_game_row_name(int row, int value);
 const char* menu_game_row_help(int row);
+bool menu_game_row_enabled(int row);
 
 /* Items changed since the last call (1 << MI_...; MI_CONTROLS for bindings,
    which are left 0 where they should be the default). */

@@ -37,6 +37,7 @@ typedef struct {
     void (*set)(int row, int value);
     const char* (*name)(int row, int value);
     const char* (*help)(int row);
+    bool (*enabled)(int row);          /* can be used now (else greyed out and skipped) */
 } UisVideoRows;
 void uismenu_set_video_rows(const UisVideoRows* rows);
 

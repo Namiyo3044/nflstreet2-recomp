@@ -396,6 +396,7 @@ bool window_open(int height) {
     if (g_gpu_scale > 0) {
         g_window = SDL_CreateWindow("NFL Street 2", win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
         if (g_window && gpu_setup()) {
+            menu_set_gpu_name(gx_raster_gpu_name());
             g_gpu = true;
         } else {
             printf("gpu: falling back to the software renderer\n");
@@ -1591,7 +1592,7 @@ void window_field(CPUState* cpu) {
         /* The game's Video Settings screen: its rows read and set the
            settings, applied here as the menu's are. */
         static const UisVideoRows k_rows = {menu_game_row_count, menu_game_row_get, menu_game_row_set,
-                                            menu_game_row_name, menu_game_row_help};
+                                            menu_game_row_name, menu_game_row_help, menu_game_row_enabled};
         uismenu_set_video_rows(&k_rows);
         uismenu_video_frame(cpu);
         if (!menu_is_open()) {

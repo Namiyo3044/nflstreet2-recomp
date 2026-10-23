@@ -110,6 +110,8 @@ static void texture_freed(const u32* texels) {
     glr_texture_freed(texels);
 }
 
+const char* gx_raster_gpu_name(void) { return g_gpu ? glr_gpu_name() : ""; }
+
 void gx_raster_set_gpu_scale(int scale) {
     if (g_gpu) glr_set_scale(scale);
 }

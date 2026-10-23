@@ -33,6 +33,12 @@ static int g_crow, g_ccol, g_capture;
 static char g_players[256];
 static bool g_shape_locked;
 static float g_aspect = 4.0f / 3.0f;   /* the window's shape now (for window sizes) */
+static char g_gpu_name[48];            /* the graphics card's name ("": not known) */
+
+void menu_set_gpu_name(const char* name) {
+    snprintf(g_gpu_name, sizeof g_gpu_name, "%s", name ? name : "");
+    g_dirty = true;
+}
 
 void menu_set_aspect(float aspect) {
     if (aspect == g_aspect) return;
@@ -145,7 +151,7 @@ static bool needs_restart(int i);
 
 /* The game's own Video Settings screen (uismenu.c): its five rows are the
    first five items, with values as numbers from 0. */
-static const int k_game_item[MENU_GAME_ROWS] = {MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RENDERER, MI_RES};
+static const int k_game_item[MENU_GAME_ROWS] = {MI_SHAPE, MI_DISPLAY, MI_WINSIZE, MI_RES, MI_RENDERER};
 
 int menu_game_row_count(int row) {
     switch (k_game_item[row]) {
@@ -173,12 +179,21 @@ void menu_game_row_set(int row, int v) {
     switch (item) {
     case MI_SHAPE: if (g_shape_locked) return; s->screen_shape = v; break;
     case MI_DISPLAY: s->fullscreen = v != 0; break;
-    case MI_WINSIZE: s->window_size = v + 1; break;
+    case MI_WINSIZE: if (s->fullscreen) return; s->window_size = v + 1; break;
     case MI_RENDERER: s->renderer = v != 0; break;
-    default: s->resolution = v + 1; break;
+    default: if (s->renderer) return; s->resolution = v + 1; break;
     }
     g_changes |= 1u << item;
     g_dirty = true;
+}
+
+bool menu_game_row_enabled(int row) {
+    switch (k_game_item[row]) {
+    case MI_SHAPE: return !g_shape_locked;
+    case MI_WINSIZE: return !g_settings.fullscreen;
+    case MI_RES: return g_settings.renderer == 0;   /* the graphics card's */
+    default: return true;
+    }
 }
 
 const char* menu_game_row_name(int row, int v) {
@@ -191,7 +206,7 @@ const char* menu_game_row_name(int row, int v) {
         snprintf(buf, sizeof buf, "%d x %d", (int)((float)h * g_aspect + 0.5f), h);
         return buf;
     }
-    case MI_RENDERER: return v ? "Software" : "Graphics Card";
+    case MI_RENDERER: return v ? "Software" : g_gpu_name[0] ? g_gpu_name : "Graphics Card";
     default: snprintf(buf, sizeof buf, "%dx", v + 1); return buf;
     }
 }
@@ -477,8 +492,8 @@ static int text_wrapped(const char* s, float x, int y, float maxw, int size, int
 }
 
 static const char* item_label(int i) {
-    static const char* const k[MI_COUNT] = {"ASPECT RATIO", "DISPLAY", "WINDOW SIZE", "RENDERER",
-                                            "INTERNAL RESOLUTION", "CUSTOM TEXTURES", "MENU COLOURS",
+    static const char* const k[MI_COUNT] = {"ASPECT RATIO", "DISPLAY", "WINDOW RESOLUTION", "INTERNAL RESOLUTION",
+                                            "RENDERER", "CUSTOM TEXTURES", "MENU COLOURS",
                                             "CONTROLS", "BACK TO THE GAME"};
     return k[i];
 }
@@ -493,7 +508,13 @@ static void item_value(int i, char* out, size_t cap) {
         snprintf(out, cap, "%d X %d", (int)((float)h * g_aspect + 0.5f), h);
         break;
     }
-    case MI_RENDERER: snprintf(out, cap, "%s", s->renderer ? "SOFTWARE" : "GRAPHICS CARD"); break;
+    case MI_RENDERER:
+        if (s->renderer || !g_gpu_name[0]) snprintf(out, cap, "%s", s->renderer ? "SOFTWARE" : "GRAPHICS CARD");
+        else {
+            snprintf(out, cap, "%s", g_gpu_name);
+            for (char* c = out; *c; c++) if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
+        }
+        break;
     case MI_RES:
         snprintf(out, cap, "%dX", s->resolution);
         break;

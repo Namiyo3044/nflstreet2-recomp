@@ -978,8 +978,8 @@ static int video_rows(u32 h) {
     /* Labels: written into each row's label text (its buffer variable and
        the record's length) and its label variable (+0x94, which the row's
        start-up uses). */
-    static const char* const k_label[VROWS] = {"Aspect Ratio", "Display", "Window Size", "Renderer",
-                                               "Internal Resolution"};
+    static const char* const k_label[VROWS] = {"Aspect Ratio", "Display", "Window Resolution",
+                                               "Internal Resolution", "Renderer"};
     for (int r = 0; r < VROWS; r++) {
         u32 lrec = h + rd(g_vrow[r] + 0x370), lv = rd(lrec + 0x20);
         u32 n = (u32)strlen(k_label[r]);
@@ -1052,6 +1052,47 @@ static int video_rows(u32 h) {
 
 void uismenu_set_video_rows(const UisVideoRows* cb) { g_vcb = cb; }
 
+static int g_ven[VROWS];               /* each row usable (1), greyed out (0), not set yet (-1) */
+
+/* Rows that can't be used now (Window Resolution in full screen): their
+   texts greyed (the game's own "disabled" grey) and the up / down links
+   stepping over them. Only redone when one changes. */
+#define TEXT_NORMAL 0xDCDCDCFFu
+#define TEXT_GREY 0x646464FFu
+static void video_enable_rows(u32 h) {
+    bool changed = false;
+    for (int r = 0; r < VROWS; r++) {
+        int en = !g_vcb->enabled || g_vcb->enabled(r) ? 1 : 0;
+        if (en != g_ven[r]) { g_ven[r] = en; changed = true; }
+    }
+    /* Texts: kept grey every field (the game recolours a row as the
+       cursor leaves it), put back once when usable again. */
+    for (int r = 0; r < VROWS; r++) {
+        if (g_ven[r] && !changed) continue;
+        u32 vrec = g_vrow_text[r], lrec = h + rd(g_vrow[r] + 0x370);
+        if (in_ram(lrec, 0x20)) wr(lrec + 0x18, g_ven[r] ? TEXT_NORMAL : TEXT_GREY);
+        if (in_ram(vrec, 0x20) && rd(g_vrow[r] + 0x84) != 1) wr(vrec + 0x18, g_ven[r] ? TEXT_NORMAL : TEXT_GREY);
+    }
+    if (!changed) return;
+    /* Links: each usable row to the usable rows either side. The first
+       row's "no previous" block is the game's own (left alone). */
+    for (int r = 0; r < VROWS; r++) {
+        if (!g_ven[r]) continue;
+        u32 self = g_vrow[r] - h;
+        int nx = r + 1, pv = r - 1;
+        while (nx < VROWS && !g_ven[nx]) nx++;
+        while (pv >= 0 && !g_ven[pv]) pv--;
+        u32 nb = h + rd(g_vrow[r] + 0x6C);
+        if (nb >= PV_HEAP && nb + 12 <= PV_END) {
+            wr(nb, nx < VROWS ? 1u : 0u); wr(nb + 4, self); wr(nb + 8, nx < VROWS ? g_vrow[nx] - h : self);
+        }
+        u32 pb = h + rd(g_vrow[r] + 0x68);
+        if (r > 0 && pb >= PV_HEAP && pb + 12 <= PV_END) {
+            wr(pb, pv >= 0 ? 1u : 0u); wr(pb + 4, self); wr(pb + 8, pv >= 0 ? g_vrow[pv] - h : self);
+        }
+    }
+}
+
 static bool video_open(void) {
     u32 h = g_vh;
     if (!h || !in_ram(h, 0x40) || rd(h) != AUD_NOBJ + (VROWS - 1) * (VR_LAST - VR_FIRST + 1) || rd(h + 4) != PV_OBJTAB)
@@ -1116,15 +1157,20 @@ void uismenu_video_frame(CPUState* cpu) {
             g_vlast[r] = v;
         }
         g_vstarted = true;
+        for (int r = 0; r < VROWS; r++) g_ven[r] = -1;
         printf("uis: Video Settings: rows show the port's settings\n");
     }
+    video_enable_rows(h);
     int focus = -1;
     for (int r = 0; r < VROWS; r++) {
         u32 row = g_vrow[r];
         int v = (int)rd(row + 0x74), n = g_vcb->count(r);
         /* Only the row with the cursor changes (left / right); anything else
            moving a value isn't the player, so it's put back. */
-        if (v < 0 || v >= n || (v != g_vlast[r] && rd(row + 0x84) != 1)) { v = g_vlast[r]; wr(row + 0x74, (u32)v); }
+        if (v < 0 || v >= n || (v != g_vlast[r] && (rd(row + 0x84) != 1 || g_ven[r] == 0))) {
+            v = g_vlast[r];
+            wr(row + 0x74, (u32)v);
+        }
         int cur = g_vcb->get(r);
         if (v == g_vlast[r] && cur != v) {   /* changed elsewhere (F11, the port's menu) */
             v = g_vlast[r] = cur;

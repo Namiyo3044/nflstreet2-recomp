@@ -419,6 +419,46 @@ static void set_sampler(int unit, const Stage* s, bool hires) {
 static bool build_copy_program(void);
 
 /* --------------------------------------------------------------- init --- */
+/* The card's name as OpenGL gives it, tidied for showing in a menu: what
+   comes after "/" (bus, instruction set) or in brackets dropped, (R) / (TM)
+   marks and the maker's name in front taken out ("NVIDIA GeForce RTX
+   4070/PCIe/SSE2" -> "GeForce RTX 4070"). */
+static char g_gpu_name[48];
+
+static void tidy_gpu_name(const char* raw) {
+    char b[256];
+    size_t n = 0;
+    int depth = 0;
+    for (const char* p = raw ? raw : ""; *p && *p != '/' && n + 1 < sizeof b; p++) {
+        if (*p == '(') { depth++; continue; }
+        if (*p == ')') { if (depth) depth--; continue; }
+        if (!depth) b[n++] = *p;
+    }
+    b[n] = 0;
+    static const char* const k_drop[] = {"NVIDIA Corporation ", "NVIDIA ", "AMD ", "ATI Technologies Inc. ", "ATI ",
+                                         "Intel ", " Series"};
+    for (size_t i = 0; i < sizeof k_drop / sizeof k_drop[0]; i++) {
+        char* at = strstr(b, k_drop[i]);
+        if (at) memmove(at, at + strlen(k_drop[i]), strlen(at + strlen(k_drop[i])) + 1);
+    }
+    /* "Graphics" at the end only when a model number is left ("Arc A770
+       Graphics" -> "Arc A770", but "Radeon Graphics" stays). */
+    n = strlen(b);
+    while (n && b[n - 1] == ' ') b[--n] = 0;
+    if (n > 9 && strcmp(b + n - 9, " Graphics") == 0 && strpbrk(b, "0123456789") &&
+        strpbrk(b, "0123456789") < b + n - 9)
+        b[n - 9] = 0;
+    /* Spaces tidied (doubles from what was taken out, and at the ends). */
+    char* w = b;
+    for (char* r = b; *r; r++)
+        if (*r != ' ' || (w > b && w[-1] != ' ')) *w++ = *r;
+    while (w > b && w[-1] == ' ') w--;
+    *w = 0;
+    snprintf(g_gpu_name, sizeof g_gpu_name, "%s", b);
+}
+
+const char* glr_gpu_name(void) { return g_gpu_name; }
+
 bool glr_init(GlrGetProc getproc, int scale, void (*make_current)(void)) {
     g_make_current = make_current;
     g_scale = scale < 1 ? 1 : scale > 8 ? 8 : scale;
@@ -430,6 +470,7 @@ bool glr_init(GlrGetProc getproc, int scale, void (*make_current)(void)) {
 #undef GLR_LOAD
     if (missing)
         return false;
+    tidy_gpu_name((const char*)G(glGetString)(GL_RENDERER));
     printf("gpu: %s / %s / OpenGL %s\n", (const char*)G(glGetString)(GL_VENDOR),
            (const char*)G(glGetString)(GL_RENDERER), (const char*)G(glGetString)(GL_VERSION));
     GLint maxtex = 0;
