@@ -38,7 +38,7 @@ bool settings_load(const char* path) {
         if (strcmp(key, "renderer") == 0) s->renderer = strcmp(val, "software") == 0;
         else if (strcmp(key, "resolution") == 0) s->resolution = clampi(atoi(val), 1, 8);
         else if (strcmp(key, "screen_shape") == 0)
-            s->screen_shape = strcmp(val, "4:3") == 0 ? 1 : strcmp(val, "16:9") == 0 ? 2 : 0;
+            s->screen_shape = strcmp(val, "4:3") == 0 ? 1 : strcmp(val, "16:9") == 0 ? 2 : strcmp(val, "21:9") == 0 ? 3 : strcmp(val, "32:9") == 0 ? 4 : 0;
         else if (strcmp(key, "fullscreen") == 0) s->fullscreen = atoi(val) != 0;
         else if (strcmp(key, "window_size") == 0) s->window_size = clampi(atoi(val), 1, SETTINGS_WINDOW_SIZES);
         else if (strcmp(key, "custom_textures") == 0) s->custom_textures = atoi(val) != 0;
@@ -63,12 +63,12 @@ void settings_save(void) {
         printf("settings: couldn't write %s\n", g_path);
         return;
     }
-    static const char* const k_shape[] = {"auto", "4:3", "16:9"};
+    static const char* const k_shape[] = {"auto", "4:3", "16:9", "21:9", "32:9"};
     const Settings* s = &g_settings;
     fprintf(f, "# NFL Street 2 port settings. Changed from the video menu in the game window (F1).\n");
     fprintf(f, "renderer=%s\n", s->renderer ? "software" : "gpu");
     fprintf(f, "resolution=%d\n", s->resolution);
-    fprintf(f, "screen_shape=%s\n", k_shape[clampi(s->screen_shape, 0, 2)]);
+    fprintf(f, "screen_shape=%s\n", k_shape[clampi(s->screen_shape, 0, 4)]);
     fprintf(f, "fullscreen=%d\n", s->fullscreen);
     fprintf(f, "window_size=%d\n", s->window_size);
     fprintf(f, "custom_textures=%d\n", s->custom_textures);

@@ -44,6 +44,9 @@ void glr_run_list(const CmdList* l);
    c->id then use it. */
 void glr_tex_copy(const TexCopy* c);
 
+/* Reads one native pixel (colour 0xAARRGGBB, or depth) of the frame buffer. */
+void glr_read_point(u32 x, u32 y, bool depth, u32* out);
+
 /* Reads the frame buffer back into g_color (and g_depth if depth). */
 void glr_readback(bool depth);
 

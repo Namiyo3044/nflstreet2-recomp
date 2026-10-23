@@ -358,9 +358,9 @@ static bool g_uis_log;                /* --uis-log */
    Each edit: the script bytes around the compared number (byte 11). */
 typedef struct { const u8 sig[26]; u8 len; u8 off, on; bool screen_shape; const char* what; } UisEdit;
 static const UisEdit k_uis_edits[] = {
-    {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x1C,0x3F,0x41,0x10,0,0,0x01,0x65,0x6F}, 26, 1, 2, true,
+    {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x1C,0x3F,0x41,0x10,0,0,0x01,0x65,0x6F}, 26, 1, 2, false,
      "Options list: Audio Settings"},
-    {{0x55,0,0,0,0xA0,0xFF,0xFA,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x26,0x3F,0x41,0x10,0,0,0x01,0x81,0x6F}, 26, 1, 2, true,
+    {{0x55,0,0,0,0xA0,0xFF,0xFA,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x26,0x3F,0x41,0x10,0,0,0x01,0x81,0x6F}, 26, 1, 2, false,
      "Options help: Adjust audio settings."},
     {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x02,0x36,0x41,0x10,0,0,0x01,0x36,0x10,0,0,0,0,0x0B}, 25, 2, 0x7F, false,
      "main menu: Online"},
@@ -531,7 +531,9 @@ static int uis_native_hook(CPUState* ctx) {
         uismenu_video_screen(ctx);
         return 0;
     }
-    if (!(group == 5 && screen == 5 && g_settings.screen_shape != 0))
+    /* Audio Settings: always its Xbox / PS2 layout (sound only; the screen
+       shape is on Video Settings now, not an Audio/Visual screen). */
+    if (!(group == 5 && screen == 5))
         return 0;
     mem_write32(ctx, ctx->gpr[8], 1);  /* "Xbox" */
     ctx->gpr[3] = 1;                   /* handled */
@@ -950,7 +952,7 @@ int main(int argc, char** argv) {
             idle_skip = false;
         } else if (strcmp(argv[i], "--aspect") == 0 && i + 1 < argc) {
             const char* a = argv[++i];
-            aspect_mode = strcmp(a, "4:3") == 0 ? 1 : strcmp(a, "16:9") == 0 ? 2 : 0;
+            aspect_mode = strcmp(a, "4:3") == 0 ? 1 : strcmp(a, "16:9") == 0 ? 2 : strcmp(a, "21:9") == 0 ? 3 : strcmp(a, "32:9") == 0 ? 4 : 0;
         } else if (strcmp(argv[i], "--gpu") == 0) {
             if (!gpu_scale) gpu_scale = have_settings ? g_settings.resolution : 1;
         } else if (strcmp(argv[i], "--res") == 0 && i + 1 < argc) {

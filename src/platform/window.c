@@ -239,7 +239,7 @@ static void set_title(void) {
 }
 
 void window_set_aspect_mode(int mode) {
-    g_aspect_mode = mode < 0 || mode > 2 ? 0 : mode;
+    g_aspect_mode = mode < 0 || mode > 4 ? 0 : mode;
 }
 
 /* The game's widescreen setting is only visible once it draws 3D (the title
@@ -298,17 +298,18 @@ static void update_aspect(bool announce) {
     if (g_aspect_mode == 0 && detected >= 0 && g_shape_trusted)
         save_shape(detected);
     int game_wide = detected >= 0 ? detected : g_saved_wide == 1;
-    int wide = g_aspect_mode == 2 || (g_aspect_mode == 0 && game_wide == 1);
-    float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+    int wide = g_aspect_mode >= 2 || (g_aspect_mode == 0 && game_wide == 1);
+    float aspect = g_aspect_mode == 4 ? 32.0f / 9.0f : g_aspect_mode == 3 ? 21.0f / 9.0f : wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+    const char* shape = g_aspect_mode == 4 ? "32:9" : g_aspect_mode == 3 ? "21:9" : wide ? "16:9" : "4:3";
     if (aspect == g_aspect && !announce)
         return;
     bool changed = aspect != g_aspect;
     g_aspect = aspect;
     menu_set_aspect(aspect);
-    static const char* const k_mode[] = {"auto", "fixed", "fixed"};
-    snprintf(g_title_shape, sizeof(g_title_shape), "%s (%s)", wide ? "16:9" : "4:3", k_mode[g_aspect_mode]);
+    static const char* const k_mode[] = {"auto", "fixed", "fixed", "test", "test"};
+    snprintf(g_title_shape, sizeof(g_title_shape), "%s (%s)", shape, k_mode[g_aspect_mode]);
     set_title();
-    printf("window: screen shape %s (%s)\n", wide ? "16:9" : "4:3", k_mode[g_aspect_mode]);
+    printf("window: screen shape %s (%s)\n", shape, k_mode[g_aspect_mode]);
     /* A plain window follows the new shape: same height, new width. */
     if (changed && !g_fullscreen && !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_MAXIMIZED)) {
         int w, h;
@@ -391,8 +392,18 @@ bool window_open(int height) {
     }
     if (height < 240) height = 240;
     load_saved_shape();
-    bool start_wide = g_aspect_mode == 2 || (g_aspect_mode == 0 && g_saved_wide == 1);
-    int win_h = height, win_w = (int)((float)height * (start_wide ? 16.0f / 9.0f : 4.0f / 3.0f) + 0.5f);
+    if (g_aspect_mode == 0) {
+        /* "The game's setting" is gone from the menus (its own option isn't
+           on any screen now): settings saved with it, or --aspect auto, take
+           the shape the game was last seen using (16:9 if not known). */
+        g_aspect_mode = g_saved_wide == 0 ? 1 : 2;
+        g_settings.screen_shape = g_aspect_mode;
+        settings_save();
+        printf("window: screen shape set to %s (was the game's setting)\n", g_aspect_mode == 2 ? "16:9" : "4:3");
+    }
+    bool start_wide = g_aspect_mode >= 2 || (g_aspect_mode == 0 && g_saved_wide == 1);
+    float start_aspect = g_aspect_mode == 4 ? 32.0f / 9.0f : g_aspect_mode == 3 ? 21.0f / 9.0f : start_wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+    int win_h = height, win_w = (int)((float)height * start_aspect + 0.5f);
     if (g_gpu_scale > 0) {
         g_window = SDL_CreateWindow("NFL Street 2", win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
         if (g_window && gpu_setup()) {
@@ -664,13 +675,43 @@ static void set_shape_mode(int mode) {
 
 static u32 be32(const u8* p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
 
+/* Ultrawide (test): the game's own 16:9 camera shapes made wider, so it
+   draws (and decides what is on screen) for the wider picture itself. The
+   16:9 values sit next to the 4:3 ones in two tables: the match camera's
+   (0x802A0128: 4:3, 16:9, then a second pair) and the menus' (0x802A83EC).
+   Put back to 16:9 for the other shapes. */
+static const u32 k_wide_consts[] = {0x002A012Cu, 0x002A0134u, 0x002A83F0u};
+#define F32_16_9 0x3FE38E39u
+
+static void set_game_wide_shape(CPUState* cpu) {
+    /* A quarter wider than shown: the game skips what it thinks is outside
+       its camera, and close players at the sides went missing a little early
+       at very wide shapes. The extra width falls outside the picture (the
+       renderer fits the camera to the shape shown). */
+    float t = g_settings.screen_shape == 4 ? 32.0f / 9.0f : g_settings.screen_shape == 3 ? 21.0f / 9.0f : 0.0f;
+    t *= 1.25f;
+    u32 want = F32_16_9;
+    if (t > 0.0f) memcpy(&want, &t, 4);
+    for (size_t i = 0; i < sizeof k_wide_consts / sizeof k_wide_consts[0]; i++) {
+        u32 a = k_wide_consts[i];
+        if (a + 4 > cpu->ram_size) return;
+        u8* p = cpu->ram + a;
+        u32 have = be32(p);
+        /* Only where the table is as expected (16:9, or a shape put there). */
+        if (have != F32_16_9 && !(have > 0x40000000u && have < 0x40A00000u)) continue;
+        if (have == want) continue;
+        p[0] = (u8)(want >> 24); p[1] = (u8)(want >> 16); p[2] = (u8)(want >> 8); p[3] = (u8)want;
+    }
+}
+
 static void sync_game_screen_option(CPUState* cpu) {
+    if (cpu && cpu->ram) set_game_wide_shape(cpu);
     if (!cpu || !cpu->ram || GAME_OPT_SCREEN + 12 > cpu->ram_size || g_settings.screen_shape == 0)
         return;
     u8* p = cpu->ram + GAME_OPT_SCREEN;
     if (be32(p + 4) != 0x5354504Fu || be32(p + 8) != 0x5349444Fu)
         return;                        /* the record isn't set up yet */
-    u32 want = g_settings.screen_shape == 2 ? 2u : 0u;
+    u32 want = g_settings.screen_shape >= 2 ? 2u : 0u;   /* 21:9: the game draws for 16:9 */
     u32 have = be32(p);
     if (have == want)
         return;
@@ -981,7 +1022,7 @@ static void poll_events(void) {
                     printf("window: logging the next two frames to drawlog.txt and drawlog-short.txt\n");
                 }
             } else if (e.key.key == SDLK_F9 && !e.key.repeat) {
-                static const int k_next[] = {1, 2, 0};   /* auto -> 4:3 -> 16:9 -> auto */
+                static const int k_next[] = {2, 2, 3, 4, 1};   /* 4:3 -> 16:9 -> 21:9 -> 32:9 -> 4:3 */
                 if (!in_front_end()) {
                     printf("window: the screen shape can only be changed in the game's menus, not during a match\n");
                 } else {

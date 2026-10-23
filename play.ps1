@@ -16,11 +16,11 @@
 #   .\play.ps1 -NoUiColors    (the game's own menu shape colours; ignores ui-colors.txt)
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
 #   .\play.ps1 -ShowTHX        (keep the THX intro; it is skipped by default)
-#   .\play.ps1 -Aspect 16:9    (screen shape: auto (follows the game's widescreen option), 4:3, 16:9)
+#   .\play.ps1 -Aspect 16:9    (screen shape for this run: 4:3 or 16:9)
 #
 # Keyboard (the defaults; change them in the F1 menu under Controls): arrows = stick, X = A, Z = B, C = X, S = Y, D = Z, Q / W = L / R,
 #           Enter = START, I J K L = C-stick, T F G H = D-pad
-#           Esc = quit, F1 (or the controller's Back / View button) = video menu, F5 = custom textures on / off, Tab (hold) = fast-forward, F9 = screen shape (auto / 4:3 / 16:9), F10 = screenshot (shot_NNN.bmp), F11 = fullscreen,
+#           Esc = quit, F1 (or the controller's Back / View button) = video menu, F5 = custom textures on / off, Tab (hold) = fast-forward, F9 = screen shape (4:3 / 16:9), F10 = screenshot (shot_NNN.bmp), F11 = fullscreen,
 #           F12 = draw log of two frames (drawlog.txt, drawlog-short.txt), Shift+F8 = memory dump (memdump.bin, for debugging).
 #           A USB/XInput controller also works.
 # The log (and the end-of-run report) goes to play.txt.

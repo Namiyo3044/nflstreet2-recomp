@@ -1000,6 +1000,24 @@ void glr_run_list(const CmdList* l) {
 }
 
 /* ---------------------------------------------------------- read-back --- */
+void glr_read_point(u32 x, u32 y, bool depth, u32* out) {
+    *out = 0;
+    if (!g_ready || x >= EFB_W || y >= EFB_H) return;
+    if (g_make_current) g_make_current();
+    /* The middle of the native pixel in the scaled frame buffer (row 0 is
+       the top, as in the EFB). */
+    GLint px = (GLint)(((float)x + 0.5f) * g_sx), py = (GLint)(y * (u32)g_scale + (u32)g_scale / 2u);
+    G(glBindFramebuffer)(GL_FRAMEBUFFER, g_fbo);
+    G(glPixelStorei)(GL_PACK_ALIGNMENT, 4);
+    if (depth) {
+        u32 d = 0;
+        G(glReadPixels)(px, py, 1, 1, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, &d);
+        *out = d >> 8;
+    } else {
+        G(glReadPixels)(px, py, 1, 1, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, out);
+    }
+}
+
 void glr_readback(bool depth) {
     if (!g_ready)
         return;

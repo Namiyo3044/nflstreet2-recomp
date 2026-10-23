@@ -377,13 +377,42 @@ void gx_raster_set_target_shape(int shape) {
     g_target_shape = shape;
 }
 
+/* Test shapes wider than 16:9: 3 = 21:9, 4 = 32:9. */
+static float ultrawide_aspect(int target) { return target == 4 ? 32.0f / 9.0f : 21.0f / 9.0f; }
+
 static float projection_correction(void) {
     int target = g_target_shape;
-    if (!target || XFR[0x26] != 0)
+    if (!target)
         return 1.0f;
+    if (XFR[0x26] != 0) {
+        /* 2D at 21:9 (test): full-screen 2D (menus, the scoreboard) kept at
+           16:9 in the middle of the wider picture, not stretched. */
+        if (target < 3) return 1.0f;
+        float vw = fabsf(gx_f32(XFR[0x1A])) * 2.0f, vh = fabsf(gx_f32(XFR[0x1B])) * 2.0f;
+        return vw >= 480.0f && vh >= 300.0f ? (16.0f / 9.0f) / ultrawide_aspect(target) : 1.0f;
+    }
     /* Once the game draws its screens for the shape shown, a projection
        made for the other shape is meant (a created player's portrait is
        drawn 4:3 and read back from the frame buffer): leave it alone. */
+    if (target >= 3) {
+        /* 21:9 (test): the game draws for 16:9; its full-screen 3D is
+           widened to fill the wider picture (more seen at the sides). */
+        float p0 = fabsf(gx_f32(XFR[0x20])), p2 = fabsf(gx_f32(XFR[0x22]));
+        float vw = fabsf(gx_f32(XFR[0x1A])) * 2.0f, vh = fabsf(gx_f32(XFR[0x1B])) * 2.0f;
+        if (!(p0 > 1e-6f) || !(p2 > 1e-6f) || vw < 480.0f || vh < 300.0f)
+            return 1.0f;
+        float aspect = p2 / p0 * (vh / vw) * (4.0f / 3.0f);
+        float t = ultrawide_aspect(target);
+        /* Any wide camera (the game's 16:9, or the wider one the port has it
+           make, with some extra width so things just off the sides aren't
+           skipped): fitted to the shape shown. */
+        static const float k_made[] = {16.0f / 9.0f, 0.0f, 0.0f};
+        float made[3] = {k_made[0], t * 1.25f, t};
+        for (int i = 0; i < 3; i++)
+            if (fabsf(aspect / made[i] - 1.0f) < 0.12f) return made[i] / t;   /* measured shapes run a little narrow */
+        if (fabsf(aspect - 4.0f / 3.0f) < 0.12f && g_widescreen != 1) return (4.0f / 3.0f) / t;
+        return 1.0f;
+    }
     if ((target == 2 && g_widescreen == 1) || (target == 1 && g_widescreen == 0))
         return 1.0f;
     float p0 = fabsf(gx_f32(XFR[0x20])), p2 = fabsf(gx_f32(XFR[0x22]));
@@ -614,7 +643,7 @@ static void transform(const Vtx* in, SVtx* out) {
         cz = gx_f32(pr[4]) * qz + gx_f32(pr[5]);
         cw = -qz;
     } else {
-        cx = gx_f32(pr[0]) * ex + gx_f32(pr[1]);
+        cx = (gx_f32(pr[0]) * ex + gx_f32(pr[1])) * g_setup.xs;
         cy = gx_f32(pr[2]) * ey + gx_f32(pr[3]);
         cz = gx_f32(pr[4]) * ez + gx_f32(pr[5]);
         cw = 1.0f;
@@ -1230,7 +1259,15 @@ static CmdList g_lists[2];
 static u32 g_rec;                      /* list being recorded */
 
 static bool g_peek_stale = true;       /* commands recorded since the last frame-buffer peek snapshot */
-static unsigned long long g_peeks, g_peek_snapshots;
+static unsigned long long g_peeks, g_peek_snapshots, g_peek_probes;
+/* A probe: the game reading the same single pixel once a frame (the GPU
+   renderer then reads that pixel back on its own thread at the end of each
+   frame, and the game gets the last frame's value, instead of stopping to
+   wait for the whole frame to be drawn and read back). */
+static u32 g_probe_ea, g_probe_streak, g_peeks_frame, g_peek_last_ea;
+static volatile u32 g_probe_value;
+static volatile bool g_probe_on;        /* the GPU thread reads the probe pixel after each list */
+#define PROBE_STREAK 3u
 
 static Cmd* list_push(CmdList* l) {
     g_peek_stale = true;
@@ -1469,8 +1506,14 @@ static void worker_main(void* arg) {
                 glr_readback(job_depth);
             else if (job == JOB_TEXCOPY)
                 glr_tex_copy(g_job_copy);
-            else
+            else {
                 glr_run_list(g_defer ? expand_list(l) : l);
+                if (g_probe_on) {
+                    u32 ea = g_probe_ea, v = 0;
+                    glr_read_point((ea >> 2) & 0x3FFu, (ea >> 12) & 0x3FFu, (ea & 0x00400000u) != 0, &v);
+                    g_probe_value = v;
+                }
+            }
         } else {
             int y0, y1;
             band(who, count, &y0, &y1);
@@ -1540,6 +1583,12 @@ static void wait_idle(void) {
    when there are none) and starts recording into the other list. */
 static void submit(void) {
     gx_state_serial++;                 /* the next draw starts a new list: take a fresh snapshot */
+    /* Peeks this frame: one at the same pixel as before makes a probe. */
+    if (g_peeks_frame == 1 && g_peek_last_ea == g_probe_ea) g_probe_streak++;
+    else if (g_peeks_frame == 1) { g_probe_ea = g_peek_last_ea; g_probe_streak = 1; }
+    else if (g_peeks_frame > 1) g_probe_streak = 0;
+    g_peeks_frame = 0;
+    g_probe_on = g_gpu && g_workers && g_probe_streak >= PROBE_STREAK;
     start_workers();
     wait_idle();                       /* the other list is free again */
     gx_tex_collect_garbage();          /* texture memory the finished frame used */
@@ -2669,6 +2718,14 @@ u32 gx_raster_peek(u32 ea) {
     g_peeks++;
     if (!gx_raster_active())
         return 0;
+    g_peek_last_ea = ea;
+    if (g_peeks_frame++ == 0 && g_probe_on && ea == g_probe_ea) {
+        g_peek_probes++;
+        u32 c = g_probe_value;
+        if (ea & 0x00400000u) return c & 0x00FFFFFFu;
+        if ((gx_bp[0x43] & 7u) != 1u) c |= 0xFF000000u;
+        return c;
+    }
     if (g_peek_stale) {
         submit();
         wait_idle();
@@ -2691,5 +2748,6 @@ u32 gx_raster_peek(u32 ea) {
 
 void gx_raster_peek_report(void) {
     if (g_peeks)
-        printf("gx: %llu frame-buffer peeks (%llu snapshots)\n", g_peeks, g_peek_snapshots);
+        printf("gx: %llu frame-buffer peeks (%llu snapshots, %llu answered from the last frame)\n", g_peeks,
+               g_peek_snapshots, g_peek_probes);
 }

@@ -136,7 +136,7 @@ unsigned menu_take_changes(void) {
 static void change(int item, int dir) {
     Settings* s = &g_settings;
     switch (item) {
-    case MI_SHAPE: s->screen_shape = (s->screen_shape + 3 + dir) % 3; break;
+    case MI_SHAPE: s->screen_shape = (s->screen_shape - 1 + 4 + dir) % 4 + 1; break;   /* 4:3, 16:9, 21:9, 32:9 */
     case MI_DISPLAY: s->fullscreen = !s->fullscreen; break;
     case MI_WINSIZE: s->window_size = (s->window_size - 1 + SETTINGS_WINDOW_SIZES + dir) % SETTINGS_WINDOW_SIZES + 1; break;
     case MI_RENDERER: s->renderer = !s->renderer; break;
@@ -155,7 +155,7 @@ static const int k_game_item[MENU_GAME_ROWS] = {MI_SHAPE, MI_DISPLAY, MI_WINSIZE
 
 int menu_game_row_count(int row) {
     switch (k_game_item[row]) {
-    case MI_SHAPE: return 3;
+    case MI_SHAPE: return 4;
     case MI_DISPLAY: case MI_RENDERER: return 2;
     case MI_WINSIZE: return SETTINGS_WINDOW_SIZES;
     default: return 8;
@@ -165,7 +165,7 @@ int menu_game_row_count(int row) {
 int menu_game_row_get(int row) {
     const Settings* s = &g_settings;
     switch (k_game_item[row]) {
-    case MI_SHAPE: return s->screen_shape;
+    case MI_SHAPE: return s->screen_shape >= 1 && s->screen_shape <= 4 ? s->screen_shape - 1 : 1;
     case MI_DISPLAY: return s->fullscreen ? 1 : 0;
     case MI_WINSIZE: return s->window_size - 1;
     case MI_RENDERER: return s->renderer ? 1 : 0;
@@ -177,7 +177,7 @@ void menu_game_row_set(int row, int v) {
     Settings* s = &g_settings;
     int item = k_game_item[row];
     switch (item) {
-    case MI_SHAPE: if (g_shape_locked) return; s->screen_shape = v; break;
+    case MI_SHAPE: if (g_shape_locked) return; s->screen_shape = v + 1; break;
     case MI_DISPLAY: s->fullscreen = v != 0; break;
     case MI_WINSIZE: if (s->fullscreen) return; s->window_size = v + 1; break;
     case MI_RENDERER: s->renderer = v != 0; break;
@@ -199,7 +199,7 @@ bool menu_game_row_enabled(int row) {
 const char* menu_game_row_name(int row, int v) {
     static char buf[48];
     switch (k_game_item[row]) {
-    case MI_SHAPE: return v == 1 ? "4:3" : v == 2 ? "16:9" : "Game's Setting";
+    case MI_SHAPE: return v == 3 ? "32:9" : v == 2 ? "21:9" : v ? "16:9" : "4:3";
     case MI_DISPLAY: return v ? "Full Screen" : "Window";
     case MI_WINSIZE: {
         int h = settings_window_height(v + 1);
@@ -501,7 +501,7 @@ static const char* item_label(int i) {
 static void item_value(int i, char* out, size_t cap) {
     const Settings* s = &g_settings;
     switch (i) {
-    case MI_SHAPE: snprintf(out, cap, "%s", s->screen_shape == 1 ? "4:3" : s->screen_shape == 2 ? "16:9" : "GAME'S SETTING"); break;
+    case MI_SHAPE: snprintf(out, cap, "%s", s->screen_shape == 1 ? "4:3" : s->screen_shape == 3 ? "21:9 (TEST)" : s->screen_shape == 4 ? "32:9 (TEST)" : "16:9"); break;
     case MI_DISPLAY: snprintf(out, cap, "%s", s->fullscreen ? "FULL SCREEN" : "WINDOW"); break;
     case MI_WINSIZE: {
         int h = settings_window_height(s->window_size);
@@ -535,9 +535,9 @@ static void item_value(int i, char* out, size_t cap) {
 
 static const char* item_help(int i) {
     switch (i) {
-    case MI_SHAPE: return "How the picture is shaped. Game's setting follows the screen option in the game's own menu. "
-                          "4:3 and 16:9 also set the game's option to match. Can't be changed during a match (the "
-                          "match lays out its scoreboard when it starts); change it in the game's menus.";
+    case MI_SHAPE: return "The picture's shape: 4:3 or 16:9 (F9 also switches; the game's own screen option is set "
+                          "to match). Can't be changed during a match (the match lays out its scoreboard when it "
+                          "starts); change it in the game's menus.";
     case MI_DISPLAY: return "Play in a window or on the whole screen (F11 also switches).";
     case MI_WINSIZE: return "How big the window is when not playing full screen.";
     case MI_RENDERER: return "The graphics card draws faster and sharper than the software renderer. Takes effect "
