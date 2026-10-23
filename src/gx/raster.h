@@ -88,6 +88,8 @@ const char* gx_raster_gpu_name(void);
 /* Frames the game clears to black are cleared to this colour instead
    (0xRRGGBB; 0 = off): the sides of ultrawide menus. */
 void gx_raster_set_side_fill(u32 rgb);
+/* A match is on (ultrawide: the match HUD's team panels move out). */
+void gx_raster_set_match(bool on);
 /* The graphics card's internal resolution, changed while running. */
 void gx_raster_set_gpu_scale(int scale);
 

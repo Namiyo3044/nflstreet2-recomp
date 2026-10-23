@@ -101,14 +101,14 @@ static void near_hide(CPUState* cpu, float scale) {
     g_near_have = true;
 }
 
-void lodfix_frame(CPUState* cpu) {
-    if (!cpu || !cpu->ram || cpu->ram_size < 0x01800000u) return;
+bool lodfix_frame(CPUState* cpu) {
+    if (!cpu || !cpu->ram || cpu->ram_size < 0x01800000u) return false;
     float aspect = asf(rd(cpu, CAMERA_ASPECT));
     float scale = aspect > 1.9f && aspect < 8.0f ? aspect / (16.0f / 9.0f) : 1.0f;
     caps(cpu, scale);
     near_hide(cpu, scale);
     u32 n = rd(cpu, REG_COUNT);
-    if (n > 512) return;
+    if (n > 512) return false;
     for (u32 i = 0; i < n; i++) {
         u32 obj = rd(cpu, REG_LIST + i * 4);
         if (!ok(cpu, obj, 0x20)) continue;
@@ -121,7 +121,7 @@ void lodfix_frame(CPUState* cpu) {
             float v = asf(cur);
             if (!(v >= 0.0f && v < 16.0f)) continue;   /* not a threshold */
             Thr* t = thr_find(a, cur);
-            if (!t) return;
+            if (!t) return n >= 6;
             u32 want = scale == 1.0f ? t->orig : u32f(asf(t->orig) / scale);
             if (want != cur) wr(cpu, a, want);
             t->set = want;
@@ -133,4 +133,5 @@ void lodfix_frame(CPUState* cpu) {
                scale == 1.0f ? "the game's own" : "matched to the wider camera", aspect, g_lim_set[0], g_lim_set[1],
                g_lim_set[2]);
     }
+    return n >= 6;                     /* a match: both teams' players */
 }

@@ -1660,7 +1660,7 @@ void window_field(CPUState* cpu) {
     /* Ultrawide menus: a dark grey at the sides the 16:9 backgrounds don't
        reach (matches fill the whole picture themselves). */
     gx_raster_set_side_fill(g_settings.screen_shape >= 3 && in_front_end() ? SIDE_FILL : 0u);
-    lodfix_frame(cpu);
+    gx_raster_set_match(lodfix_frame(cpu));
     uicolors_frame(cpu);
     menu_set_shape_locked(!in_front_end());
     {

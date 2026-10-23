@@ -4,6 +4,7 @@
 
 /* Ultrawide shapes: the engine's level-of-detail thresholds matched to the
    wider camera (see lodfix.c). Once per video field. */
-void lodfix_frame(CPUState* cpu);
+/* Returns whether a match looks to be on (players registered). */
+bool lodfix_frame(CPUState* cpu);
 
 #endif

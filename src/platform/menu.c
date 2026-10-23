@@ -206,7 +206,7 @@ const char* menu_game_row_name(int row, int v) {
         snprintf(buf, sizeof buf, "%d x %d", (int)((float)h * g_aspect + 0.5f), h);
         return buf;
     }
-    case MI_RENDERER: return v ? "Software" : g_gpu_name[0] ? g_gpu_name : "Graphics Card";
+    case MI_RENDERER: return v ? "Software (slow)" : g_gpu_name[0] ? g_gpu_name : "Graphics Card";
     default: snprintf(buf, sizeof buf, "%dx", v + 1); return buf;
     }
 }
@@ -509,7 +509,7 @@ static void item_value(int i, char* out, size_t cap) {
         break;
     }
     case MI_RENDERER:
-        if (s->renderer || !g_gpu_name[0]) snprintf(out, cap, "%s", s->renderer ? "SOFTWARE" : "GRAPHICS CARD");
+        if (s->renderer || !g_gpu_name[0]) snprintf(out, cap, "%s", s->renderer ? "SOFTWARE (SLOW)" : "GRAPHICS CARD");
         else {
             snprintf(out, cap, "%s", g_gpu_name);
             for (char* c = out; *c; c++) if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);

@@ -649,9 +649,18 @@ static bool state_capture(const RenderState* rs) {
     return false;
 }
 
+#define HUD_LOW 0.20f                  /* the top HUD: objects placed above this (-1 bottom .. 1 top) */
+#define HUD_SIDE 0.30f                 /* and this far to one side (-1..1 across 16:9) */
+#define HUD_PANELS 0.55f               /* the team panels' row: placed above this */
+static int g_banner_cur, g_banner_prev;   /* a stadium-name banner seen this / last frame (its side) */
+static u32 g_banner_frame;
+#define HUD_SIDE_LOW 0.50f             /* below it, this far to one side (style point popups) */
+static volatile int g_hud_match;       /* a match is on (set from the game thread) */
+void gx_raster_set_match(bool on) { g_hud_match = on; }
+
 static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool capture) {
     int target = g_target_shape;
-    if (target < 3 || n < 3) return;
+    if (target < 3 || n < 2) return;   /* lines (2) too: the Gamebreaker bar's glowing outline */
     /* Positions across the 16:9 picture (-1 its left edge, 1 its right),
        which sits in the middle of the wider one. */
     float frame = (16.0f / 9.0f) / ultrawide_aspect(target);
@@ -687,6 +696,63 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
        edge, so that end is taken to the edge of the wider picture. Scenery
        (depth-tested) is left alone. */
     if (g_setup.persp && ztest) return;
+    /* The match HUD along the top (team 1 on the left, team 2 on the right):
+       its panels move out towards the sides, to the edges of a 21:9 area
+       (the screen's edges at 21:9; at 32:9 they'd be too far out to read
+       at a glance); bars that ran off the side still reach the screen's
+       edge. Below the panels the style point popups go with their side.
+       What moves is decided by where the piece's object sits (its
+       matrix's origin), not by the piece itself: every letter of a word
+       shares it (words stay whole), it doesn't shift as a piece grows or
+       fades, and a message centred on the screen sits in the middle. Only
+       in a match (menus are left alone). */
+    if (g_setup.persp && !ztest && g_hud_match) {
+        float ou = v[0].org[0] / frame, oy = v[0].org[1];
+        for (u32 i = 1; i < n; i++)
+            if (v[i].mtx != v[0].mtx) { ou = (mn + mx) * 0.5f; break; }   /* mixed: by the piece itself */
+        float ylo = 1e9f, yhi = -1e9f;
+        for (u32 i = 0; i < n; i++) {
+            float ny = v[i].clip[1] / v[i].clip[3];
+            ylo = fminf(ylo, ny); yhi = fmaxf(yhi, ny);
+        }
+        /* Drawn with the camera's own matrix, or placed from somewhere far
+           off (the music popup's disc is placed from the top of the screen):
+           by the piece itself. */
+        if ((fabsf(ou) < 0.02f && fabsf(oy) < 0.02f) || oy > yhi + 0.3f || oy < ylo - 0.3f) {
+            ou = (mn + mx) * 0.5f;
+            oy = ylo;
+        }
+        /* Up among the panels: anything placed to one side. Below them only
+           what is placed well out to the side (the style point popups):
+           the big messages in the middle (some drawn a letter-object at a
+           time, "Conversion Failed") and the game's logo are placed nearer
+           the middle, and the pre-match panels further down. */
+        float side = oy >= HUD_PANELS ? HUD_SIDE : HUD_SIDE_LOW;
+        /* A long bar in that row placed nearer the middle but lying mostly
+           to one side (a stadium's name banner before the match): with
+           its side, so the name stays inside it. */
+        if (g_frames != g_banner_frame) {   /* a new frame */
+            g_banner_prev = g_banner_cur; g_banner_cur = 0; g_banner_frame = g_frames;
+        }
+        if (ylo >= HUD_PANELS && ou >= -side && ou <= side) {
+            if (mn < -0.6f && mx < 0.5f) ou = -1.0f, g_banner_cur = -1;
+            else if (mx > 0.6f && mn > -0.5f) ou = 1.0f, g_banner_cur = 1;
+            else if (g_banner_cur || g_banner_prev)
+                ou = (float)(g_banner_cur ? g_banner_cur : g_banner_prev);   /* the rest of the banner (its faint big name) */
+        }
+        if (oy >= HUD_LOW && (ou < -side || ou > side)) {
+            float r = fminf(ultrawide_aspect(target), 21.0f / 9.0f) / (16.0f / 9.0f);
+            float shift = (ou < 0.0f ? -1.0f : 1.0f) * (r - 1.0f), edge = 1.0f / frame;
+            bool across = mn < 1.0f && mx > -1.0f;   /* partly on the 16:9 picture */
+            for (u32 i = 0; i < n; i++) {
+                float u = v[i].clip[0] / (v[i].clip[3] * frame);
+                float nu = across && u < -1.0f ? -edge : across && u > 1.0f ? edge : u + shift;   /* off the side: to the edge */
+                v[i].clip[0] = nu * v[i].clip[3] * frame;
+                project(&v[i]);
+            }
+            return;
+        }
+    }
     if ((mn >= -1.0f && mx <= 1.0f) || mx < -1.0f || mn > 1.0f) return;
     if (textured) {
         /* Textured: only long thin bars (the main menu's logo bar is a tinted
@@ -766,6 +832,17 @@ static void transform(const Vtx* in, SVtx* out) {
         cw = 1.0f;
     }
     out->clip[0] = cx; out->clip[1] = cy; out->clip[2] = cz; out->clip[3] = cw;
+    out->mtx = (u8)in->pos_mtx;
+    out->org[0] = out->org[1] = 0.0f;
+    if (g_setup.persp && g_target_shape >= 3) {
+        /* the matrix's origin: menu-system pieces (HUD text, panels) are
+           placed by their object's matrix, each letter offset within it */
+        float oz = gx_f32(m[11]);
+        if (oz < -1e-6f) {
+            out->org[0] = (gx_f32(pr[0]) * gx_f32(m[3]) + gx_f32(pr[1]) * oz) * g_setup.xs / -oz;
+            out->org[1] = (gx_f32(pr[2]) * gx_f32(m[7]) + gx_f32(pr[3]) * oz) / -oz;
+        }
+    }
     /* Perspective: GX's near plane is z = -w. Orthographic draws are never
        near-clipped (2D and full-screen effects). */
     out->near_d = g_setup.persp ? cz + cw : 1.0f;
@@ -1899,6 +1976,7 @@ static void dlog_short(u8 prim, u32 count, const SVtx* sv) {
        shapes), the viewport's size, and the transform unit's texgen count */
     fprintf(f, " %s xs%.3f vp%.0fx%.0f ntex%u", XFR[0x26] ? "2D" : "3D", g_setup.xs, fabsf(gx_f32(XFR[0x1A])) * 2.0f,
             fabsf(gx_f32(XFR[0x1B])) * 2.0f, XFR[0x3F] & 15u);
+    if (count) fprintf(f, " mtx%u org%.3f,%.3f%s", sv[0].mtx, sv[0].org[0], sv[0].org[1], g_hud_match ? " match" : "");
     for (u32 i = 0; i < stages && i < 4; i++) {
         u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
         fprintf(f, " [c%06X a%06X", gx_bp[0xC0 + i * 2] & 0xFFFFFFu, gx_bp[0xC1 + i * 2] & 0xFFFFFFu);

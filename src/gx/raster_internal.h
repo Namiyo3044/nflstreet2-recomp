@@ -40,6 +40,8 @@ typedef struct {
     float clip[4];              /* clip-space x, y, z, w (before the divide) */
     float near_d;               /* distance inside the near plane (z + w); < 0 = in front of it */
     float far_d;                /* distance inside the far plane (-z); < 0 = beyond it */
+    float org[2];               /* 3D: where its matrix's origin lands (x/w, y/w; the object it belongs to) */
+    u8 mtx;                     /* position matrix row */
     bool valid;
 } SVtx;
 
