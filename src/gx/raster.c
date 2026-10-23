@@ -406,12 +406,41 @@ static float projection_correction(void) {
         /* Any wide camera (the game's 16:9, or the wider one the port has it
            make, with some extra width so things just off the sides aren't
            skipped): fitted to the shape shown. */
-        static const float k_made[] = {16.0f / 9.0f, 0.0f, 0.0f};
-        float made[3] = {k_made[0], t * 1.25f, t};
-        for (int i = 0; i < 3; i++)
-            if (fabsf(aspect / made[i] - 1.0f) < 0.12f) return made[i] / t;   /* measured shapes run a little narrow */
+        /* The shapes cameras are made with: 16:9, and the ultrawide ones the
+           port has the game make (with or without the extra width), for
+           this shape or the other (a screen's camera keeps its shape until
+           the next screen). The nearest one; measured shapes run a little
+           narrow. */
+        static const float k_made[5] = {16.0f / 9.0f, 21.0f / 9.0f, 32.0f / 9.0f, 21.0f / 9.0f * 1.25f,
+                                        32.0f / 9.0f * 1.25f};
+        int best = -1;
+        float best_d = 0.12f;
+        for (int i = 0; i < 5; i++) {
+            float d = fabsf(aspect / k_made[i] - 1.0f);
+            if (d < best_d) { best_d = d; best = i; }
+        }
+        if (best >= 0) return k_made[best] / t;
         if (fabsf(aspect - 4.0f / 3.0f) < 0.12f && g_widescreen != 1) return (4.0f / 3.0f) / t;
         return 1.0f;
+    }
+    {
+        /* A camera still made for an ultrawide shape (the port had the game
+           make it wider; a screen's camera keeps its shape until the next
+           screen) shown at 4:3 or 16:9: fitted to the shape shown. */
+        float p0 = fabsf(gx_f32(XFR[0x20])), p2 = fabsf(gx_f32(XFR[0x22]));
+        float vw = fabsf(gx_f32(XFR[0x1A])) * 2.0f, vh = fabsf(gx_f32(XFR[0x1B])) * 2.0f;
+        if (p0 > 1e-6f && p2 > 1e-6f && vw >= 480.0f && vh >= 300.0f) {
+            float aspect = p2 / p0 * (vh / vw) * (4.0f / 3.0f);
+            float shown = target == 1 ? 4.0f / 3.0f : 16.0f / 9.0f;
+            static const float k_wide[4] = {21.0f / 9.0f, 32.0f / 9.0f, 21.0f / 9.0f * 1.25f, 32.0f / 9.0f * 1.25f};
+            int best = -1;
+            float best_d = 0.12f;
+            for (int i = 0; i < 4; i++) {
+                float d = fabsf(aspect / k_wide[i] - 1.0f);
+                if (d < best_d) { best_d = d; best = i; }
+            }
+            if (best >= 0) return k_wide[best] / shown;
+        }
     }
     if ((target == 2 && g_widescreen == 1) || (target == 1 && g_widescreen == 0))
         return 1.0f;

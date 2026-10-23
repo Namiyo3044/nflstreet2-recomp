@@ -658,6 +658,11 @@ static void ram_search(bool restart, bool same) {
     g_rs_step++;
 }
 
+/* Movies (replacement videos, trailers): the picture's shape, but no wider
+   than 16:9 (black at the sides at ultrawide shapes rather than stretched). */
+static bool g_game_movie;               /* the game is playing one of its movies */
+static float movie_aspect(void) { return g_aspect > 16.0f / 9.0f ? 16.0f / 9.0f : g_aspect; }
+
 /* A new screen shape setting (0 auto, 1 4:3, 2 16:9), from the menu or F9. */
 static void set_shape_mode(int mode) {
     g_aspect_mode = mode;
@@ -863,6 +868,8 @@ static u8 stick_value(float v) {
 }
 
 /* ------------------------------------------------------ settings menu --- */
+static bool g_resize_pending;          /* left full screen: size the window for the shape once it has */
+
 static void set_window_size(void) {
     if (g_fullscreen) return;
     if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MAXIMIZED) SDL_RestoreWindow(g_window);
@@ -878,6 +885,7 @@ static void apply_settings(unsigned ch) {
     if (ch & (1u << MI_DISPLAY)) {
         g_fullscreen = g_settings.fullscreen != 0;
         SDL_SetWindowFullscreen(g_window, g_fullscreen);
+        if (!g_fullscreen) g_resize_pending = true;   /* back to a window: the shape's own size */
     }
     if (ch & (1u << MI_WINSIZE))
         set_window_size();
@@ -1033,6 +1041,7 @@ static void poll_events(void) {
             } else if (e.key.key == SDLK_F11 && !e.key.repeat) {
                 g_fullscreen = !g_fullscreen;
                 SDL_SetWindowFullscreen(g_window, g_fullscreen);
+                if (!g_fullscreen) g_resize_pending = true;   /* back to a window: the shape's own size */
                 g_settings.fullscreen = g_fullscreen;
                 settings_save();
             }
@@ -1175,7 +1184,8 @@ static void present_gpu(CPUState* cpu) {
         shot = path;
         g_shot_pending = false;
     }
-    gx_raster_present_gpu(cpu, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2), mmio_reg(0x2000, 2), ww, wh, g_aspect,
+    gx_raster_present_gpu(cpu, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2), mmio_reg(0x2000, 2), ww, wh,
+                          g_game_movie ? movie_aspect() : g_aspect,   /* its own movies: 16:9 at most */
                           menu_is_open() ? NULL : shot);
     if (menu_is_open()) {
         bool dirty;
@@ -1240,7 +1250,9 @@ static void movie_track(CPUState* cpu) {
     }
 }
 
+
 void window_movie_begin(int index) {
+    g_game_movie = true;
     const char* dir = disc_replace_dir();
     if (!dir || !*dir) return;
     char path[1200];
@@ -1255,6 +1267,7 @@ void window_movie_begin(int index) {
 }
 
 void window_movie_end(void) {
+    g_game_movie = false;
     if (movie_is_open())
         printf("movie: ended at frame %ld, %.2f s after its first visible frame\n", g_movie_at,
                g_movie_at >= 0 ? interrupts_game_seconds() - g_movie_t_first : 0.0);
@@ -1280,7 +1293,7 @@ static bool present_movie(CPUState* cpu) {
     SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
     if (ww <= 0 || wh <= 0) return true;
     update_aspect(false);
-    gx_raster_present_pixels(px, w, h, ww, wh, g_aspect);   /* the shape the game shows its own movie at */
+    gx_raster_present_pixels(px, w, h, ww, wh, movie_aspect());   /* the shape the game shows its own movie at */
     static long logged = -1000;
     if (at < logged || at >= logged + 300) {   /* now and then, to check it's shown */
         logged = at;
@@ -1358,7 +1371,7 @@ static void present(CPUState* cpu) {
     update_aspect(false);
     int ww, wh;
     SDL_GetRenderOutputSize(g_renderer, &ww, &wh);
-    float aspect = g_aspect;
+    float aspect = g_game_movie ? movie_aspect() : g_aspect;
     float dw = (float)ww, dh = (float)ww / aspect;
     if (dh > (float)wh) { dh = (float)wh; dw = dh * aspect; }
     SDL_FRect src = {0, 0, (float)g_shown_w, (float)g_shown_h};
@@ -1567,7 +1580,7 @@ static void preview_loop(CPUState* cpu) {
         SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
         if (ww > 0 && wh > 0) {
             update_aspect(false);
-            if (px) gx_raster_present_pixels(px, w, h, ww, wh, g_aspect);   /* the shape the game's own movies get */
+            if (px) gx_raster_present_pixels(px, w, h, ww, wh, movie_aspect());   /* the shape the game's own movies get */
             else glr_present_black(ww, wh);
             SDL_GL_SwapWindow(g_window);
         }
@@ -1627,6 +1640,12 @@ void window_field(CPUState* cpu) {
     g_cpu_ref = cpu;
     poll_events();
     sync_game_screen_option(cpu);
+    if (g_resize_pending && !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN)) {
+        /* Out of full screen (the system puts back the window's old size,
+           which can be another shape's): the size for the shape now. */
+        g_resize_pending = false;
+        set_window_size();
+    }
     uicolors_frame(cpu);
     menu_set_shape_locked(!in_front_end());
     {
