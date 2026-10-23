@@ -44,6 +44,7 @@ param(
     [switch]$DumpTextures,
     [switch]$DumpAudio,
     [switch]$UisLog,
+    [switch]$LodLog,
     [switch]$CardTrace,
     [string[]]$Press = @(),
     [string]$Disc = "C:\nfls2\disc",
@@ -108,6 +109,7 @@ elseif ($GPU) { $gameArgs += @("--gpu") }
 if ($Debug) { $gameArgs += @("--debug") }
 if ($CardTrace) { $gameArgs += @("--cardtrace") }
 if ($UisLog) { $gameArgs += @("--uis-log") }
+if ($LodLog) { $gameArgs += @("--lod-log") }
 if (-not $NoTextures -and (Test-Path $Textures)) { $gameArgs += @("--textures", $Textures) }
 if (Test-Path $Replace) { $gameArgs += @("--replace", $Replace) }
 if ($DumpAudio) {
@@ -132,7 +134,7 @@ if ($start) { $report = $log[($start - 1)..($log.Count - 1)] } else { $report = 
 # Slow stretches (the window logs a perf line each second the game runs below full speed).
 $perf = @($log | Select-String -Pattern "^perf:|^audio:|^hitch:" | ForEach-Object { $_.Line })
 $gpuLines = @($log | Select-String -Pattern "^gpu:|^custom textures:" | ForEach-Object { $_.Line })
-$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:|^window: player|^window: controller|^window: wrote memdump|^uis:|^ui colors:|^window: game.s screen option" | ForEach-Object { $_.Line })
+$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:|^window: player|^window: controller|^window: wrote memdump|^uis:|^lod:|^ui colors:|^window: game.s screen option" | ForEach-Object { $_.Line })
 $cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
 $txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })
 $ct = @($log | Select-String -Pattern "^cardtrace:" | ForEach-Object { $_.Line })

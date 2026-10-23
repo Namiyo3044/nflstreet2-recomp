@@ -99,6 +99,7 @@ add_executable(nfls2
     src/runtime/textscan.c
     src/runtime/textpatch.c
     src/runtime/uicolors.c
+    src/runtime/lodfix.c
     src/runtime/uismenu.c
     src/runtime/interrupts.c
     src/runtime/mmio.c

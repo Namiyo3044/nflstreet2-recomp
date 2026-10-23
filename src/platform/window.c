@@ -13,6 +13,7 @@
 #include "runtime/disc.h"
 #include "runtime/uicolors.h"
 #include "runtime/uismenu.h"
+#include "runtime/lodfix.h"
 
 #include <SDL3/SDL.h>
 
@@ -688,6 +689,8 @@ static u32 be32(const u8* p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((
 static const u32 k_wide_consts[] = {0x002A012Cu, 0x002A0134u, 0x002A83F0u};
 #define F32_16_9 0x3FE38E39u
 
+static bool g_wide_camera = true;      /* Shift+F9 (test) */
+
 static void set_game_wide_shape(CPUState* cpu) {
     /* A quarter wider than shown: the game skips what it thinks is outside
        its camera, and close players at the sides went missing a little early
@@ -695,6 +698,7 @@ static void set_game_wide_shape(CPUState* cpu) {
        renderer fits the camera to the shape shown). */
     float t = g_settings.screen_shape == 4 ? 32.0f / 9.0f : g_settings.screen_shape == 3 ? 21.0f / 9.0f : 0.0f;
     t *= 1.25f;
+    if (!g_wide_camera) t = 0.0f;
     u32 want = F32_16_9;
     if (t > 0.0f) memcpy(&want, &t, 4);
     for (size_t i = 0; i < sizeof k_wide_consts / sizeof k_wide_consts[0]; i++) {
@@ -868,7 +872,7 @@ static u8 stick_value(float v) {
 }
 
 /* ------------------------------------------------------ settings menu --- */
-#define SIDE_FILL 0x2A2B30u            /* ultrawide menus' sides */
+#define SIDE_FILL 0x1A1B1Fu            /* ultrawide menus' sides */
 static bool g_resize_pending;          /* left full screen: size the window for the shape once it has */
 
 static void set_window_size(void) {
@@ -1030,6 +1034,12 @@ static void poll_events(void) {
                     gx_raster_draw_log(interrupts_game_seconds(), 2);
                     printf("window: logging the next two frames to drawlog.txt and drawlog-short.txt\n");
                 }
+            } else if (e.key.key == SDLK_F9 && !e.key.repeat && (e.key.mod & SDL_KMOD_SHIFT)) {
+                /* Ultrawide test: the game's own wider camera on / off (off:
+                   it draws for 16:9 and the port widens the picture). */
+                g_wide_camera = !g_wide_camera;
+                printf("window: ultrawide: the game's own wider camera %s (from the next screen or match)\n",
+                       g_wide_camera ? "on" : "off");
             } else if (e.key.key == SDLK_F9 && !e.key.repeat) {
                 static const int k_next[] = {2, 2, 3, 4, 1};   /* 4:3 -> 16:9 -> 21:9 -> 32:9 -> 4:3 */
                 if (!in_front_end()) {
@@ -1650,6 +1660,7 @@ void window_field(CPUState* cpu) {
     /* Ultrawide menus: a dark grey at the sides the 16:9 backgrounds don't
        reach (matches fill the whole picture themselves). */
     gx_raster_set_side_fill(g_settings.screen_shape >= 3 && in_front_end() ? SIDE_FILL : 0u);
+    lodfix_frame(cpu);
     uicolors_frame(cpu);
     menu_set_shape_locked(!in_front_end());
     {

@@ -1358,9 +1358,13 @@ static unsigned long long g_peeks, g_peek_snapshots, g_peek_probes;
    renderer then reads that pixel back on its own thread at the end of each
    frame, and the game gets the last frame's value, instead of stopping to
    wait for the whole frame to be drawn and read back). */
-static u32 g_probe_ea, g_probe_streak, g_peeks_frame, g_peek_last_ea;
-static volatile u32 g_probe_value;
-static volatile bool g_probe_on;        /* the GPU thread reads the probe pixel after each list */
+#define PROBE_MAX 4
+static u32 g_probe_ea[PROBE_MAX], g_nprobe;            /* the pixels read frame after frame */
+static u32 g_frame_ea[PROBE_MAX], g_nframe_ea;         /* the ones read this frame */
+static u32 g_probe_streak, g_peeks_frame;
+static bool g_frame_ea_over;                           /* more than PROBE_MAX different ones this frame */
+static volatile u32 g_probe_value[PROBE_MAX];
+static volatile bool g_probe_on;        /* the GPU thread reads the probe pixels after each list */
 #define PROBE_STREAK 3u
 
 static Cmd* list_push(CmdList* l) {
@@ -1602,11 +1606,12 @@ static void worker_main(void* arg) {
                 glr_tex_copy(g_job_copy);
             else {
                 glr_run_list(g_defer ? expand_list(l) : l);
-                if (g_probe_on) {
-                    u32 ea = g_probe_ea, v = 0;
-                    glr_read_point((ea >> 2) & 0x3FFu, (ea >> 12) & 0x3FFu, (ea & 0x00400000u) != 0, &v);
-                    g_probe_value = v;
-                }
+                if (g_probe_on)
+                    for (u32 k = 0; k < g_nprobe; k++) {
+                        u32 ea = g_probe_ea[k], v = 0;
+                        glr_read_point((ea >> 2) & 0x3FFu, (ea >> 12) & 0x3FFu, (ea & 0x00400000u) != 0, &v);
+                        g_probe_value[k] = v;
+                    }
             }
         } else {
             int y0, y1;
@@ -1678,10 +1683,28 @@ static void wait_idle(void) {
 static void submit(void) {
     gx_state_serial++;                 /* the next draw starts a new list: take a fresh snapshot */
     /* Peeks this frame: one at the same pixel as before makes a probe. */
-    if (g_peeks_frame == 1 && g_peek_last_ea == g_probe_ea) g_probe_streak++;
-    else if (g_peeks_frame == 1) { g_probe_ea = g_peek_last_ea; g_probe_streak = 1; }
-    else if (g_peeks_frame > 1) g_probe_streak = 0;
+    /* Peeks this frame: a few pixels, the same ones as the frames before,
+       make probes (read for the game at the end of each frame). */
+    if (g_peeks_frame > 0) {
+        bool same = !g_frame_ea_over && g_nframe_ea == g_nprobe && g_peeks_frame <= 2u * PROBE_MAX;
+        for (u32 i = 0; same && i < g_nframe_ea; i++) {
+            bool found = false;
+            for (u32 j = 0; j < g_nprobe; j++) found |= g_probe_ea[j] == g_frame_ea[i];
+            same = found;
+        }
+        if (same) g_probe_streak++;
+        else if (!g_frame_ea_over && g_peeks_frame <= 2u * PROBE_MAX) {
+            /* a new set (only while no probe reads are in use) */
+            if (!g_probe_on) {
+                for (u32 i = 0; i < g_nframe_ea; i++) g_probe_ea[i] = g_frame_ea[i];
+                g_nprobe = g_nframe_ea;
+            }
+            g_probe_streak = 1;
+        } else g_probe_streak = 0;
+    }
     g_peeks_frame = 0;
+    g_nframe_ea = 0;
+    g_frame_ea_over = false;
     g_probe_on = g_gpu && g_workers && g_probe_streak >= PROBE_STREAK;
     start_workers();
     wait_idle();                       /* the other list is free again */
@@ -2823,10 +2846,20 @@ u32 gx_raster_peek(u32 ea) {
     g_peeks++;
     if (!gx_raster_active())
         return 0;
-    g_peek_last_ea = ea;
-    if (g_peeks_frame++ == 0 && g_probe_on && ea == g_probe_ea) {
+    g_peeks_frame++;
+    {
+        bool known = false;
+        for (u32 i = 0; i < g_nframe_ea; i++) known |= g_frame_ea[i] == ea;
+        if (!known) {
+            if (g_nframe_ea < PROBE_MAX) g_frame_ea[g_nframe_ea++] = ea;
+            else g_frame_ea_over = true;
+        }
+    }
+    int slot = -1;
+    for (u32 k = 0; g_probe_on && k < g_nprobe; k++) if (g_probe_ea[k] == ea) slot = (int)k;
+    if (slot >= 0 && g_peeks_frame <= 2u * PROBE_MAX) {
         g_peek_probes++;
-        u32 c = g_probe_value;
+        u32 c = g_probe_value[slot];
         if (ea & 0x00400000u) return c & 0x00FFFFFFu;
         if ((gx_bp[0x43] & 7u) != 1u) c |= 0xFF000000u;
         return c;

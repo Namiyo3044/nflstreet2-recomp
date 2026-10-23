@@ -548,8 +548,102 @@ static int uis_native_hook(CPUState* ctx) {
     return 1;
 }
 
+/* --lod-log (debug): who draws display lists (models) and who sets up the
+   camera's projection, each caller once with its stack, to find where the
+   game picks a player model's detail level. */
+static bool g_lod_log;
+static void print_backtrace(CPUState* cpu, u32 sp, u32 lr, const char* indent);
+static void lod_log(CPUState* ctx, u32 address) {
+    static u32 seen_dl[256], seen_proj[32];
+    static int n_dl, n_proj;
+    static unsigned long long dl_calls;
+    if (address == 0x8024E908u && false) {   /* GXBegin: only 2D goes this way (round 2) */
+        static u32 seen_b[96];
+        static int n_b;
+        u32 sp = ctx->gpr[1], f1 = 0, f2 = 0;
+        if (sp >= 0x80000000u && sp - 0x80000000u < ctx->ram_size - 8) {
+            u32 back = mem_read32(ctx, sp);
+            if (back >= 0x80000000u && back - 0x80000000u < ctx->ram_size - 8) {
+                f1 = mem_read32(ctx, back + 4);
+                u32 back2 = mem_read32(ctx, back);
+                if (back2 >= 0x80000000u && back2 - 0x80000000u < ctx->ram_size - 8) f2 = mem_read32(ctx, back2 + 4);
+            }
+        }
+        u32 key = ctx->lr ^ (f1 * 2654435761u) ^ (f2 * 40503u);
+        for (int i = 0; i < n_b; i++) if (seen_b[i] == key) return;
+        if (n_b == 96) return;
+        seen_b[n_b++] = key;
+        printf("lod: draw of %u vertices (format %u), called from:\n", ctx->gpr[5] & 0xFFFFu, ctx->gpr[4]);
+        print_backtrace(ctx, ctx->gpr[1], ctx->lr, "lod:   ");
+        return;
+    }
+    if (address == 0x80252334u) {      /* GXCallDisplayList(list, size): keyed by the whole call chain */
+        dl_calls++;
+        u32 key = ctx->lr, sp = ctx->gpr[1];
+        for (int d = 0; d < 12 && sp >= 0x80000000u && sp - 0x80000000u < ctx->ram_size - 8; d++) {
+            sp = mem_read32(ctx, sp);
+            if (sp < 0x80000000u || sp - 0x80000000u >= ctx->ram_size - 8) break;
+            key = key * 31u + mem_read32(ctx, sp + 4);
+        }
+        for (int i = 0; i < n_dl; i++) if (seen_dl[i] == key) return;
+        if (n_dl == 256) return;
+        seen_dl[n_dl++] = key;
+        printf("lod: display list 0x%08X size %u, called from:\n", ctx->gpr[3], ctx->gpr[4]);
+        print_backtrace(ctx, ctx->gpr[1], ctx->lr, "lod:   ");
+    } else if (address == 0x802286D8u) {   /* set projection (view, fov, aspect, near, far) */
+        u32 lr = ctx->lr;
+        for (int i = 0; i < n_proj; i++) if (seen_proj[i] == lr) return;
+        if (n_proj == 32) return;
+        seen_proj[n_proj++] = lr;
+        printf("lod: projection view 0x%08X fov %.3f aspect %.3f near %.3f far %.3f, called from:\n", ctx->gpr[3],
+               ctx->fpr[1], ctx->fpr[2], ctx->fpr[3], ctx->fpr[4]);
+        print_backtrace(ctx, ctx->gpr[1], lr, "lod:   ");
+    }
+}
+
+/* The engine's level-of-detail manager sizes each model by the area of its
+   bounding box on screen (0x80234070: |(x1 - x0) * (y1 - y0)| in -1..1
+   units), picks a detail level from that and demotes the smallest when too
+   many want the top one. With the camera made wider for ultrawide shapes,
+   everything is that much narrower in those units, so players dropped to
+   lower models (and flickered as the demotions moved round). The area is
+   given as at 16:9: times the camera's shape over 16:9. */
+#define LOD_AREA_FN 0x80234070u
+#define CAMERA_ASPECT 0x803ECED4u          /* the match camera's shape (r13 - 0x53CC) */
+static int g_lod_area_ok = -1;
+static bool lod_area_hook(CPUState* ctx) {
+    if (g_lod_area_ok < 0)
+        g_lod_area_ok = mem_read32(ctx, LOD_AREA_FN) == 0xC1830004u &&      /* lfs f12, 4(r3) */
+                        mem_read32(ctx, LOD_AREA_FN + 0x20u) == 0x4E800020u; /* blr */
+    static int told;
+    if (!g_lod_area_ok) {
+        if (!told++) printf("lod: detail sizes: the function isn't as expected (0x%08X), left alone\n", mem_read32(ctx, LOD_AREA_FN));
+        return false;
+    }
+    u32 a = mem_read32(ctx, CAMERA_ASPECT);
+    float aspect;
+    memcpy(&aspect, &a, 4);
+    static float last = -1.0f;
+    if (aspect != last) {
+        last = aspect;
+        printf("lod: detail sizes: camera shape %.3f -> %s\n", aspect,
+               aspect > 1.9f && aspect < 8.0f ? "areas scaled as at 16:9" : "left to the game");
+    }
+    if (!(aspect > 1.9f && aspect < 8.0f)) return false;   /* not an ultrawide camera: as the game does */
+    u32 b = ctx->gpr[3], w[4];
+    w[0] = mem_read32(ctx, b); w[1] = mem_read32(ctx, b + 4); w[2] = mem_read32(ctx, b + 0x10); w[3] = mem_read32(ctx, b + 0x14);
+    float x0, y0, x1, y1;
+    memcpy(&x0, &w[0], 4); memcpy(&y0, &w[1], 4); memcpy(&x1, &w[2], 4); memcpy(&y1, &w[3], 4);
+    float area = fabsf((x1 - x0) * (y1 - y0)) * (aspect / (16.0f / 9.0f));
+    ctx->fpr[1] = (double)area;
+    ctx->pc = ctx->lr;
+    return true;
+}
+
 int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
     if (address == UIS_NATIVE_DISPATCH && uis_native_hook(ctx)) return 1;
+    if (address == LOD_AREA_FN && false && lod_area_hook(ctx)) return 1;   /* not reached for calls inside the engine; see lodfix.c */
+    if (g_lod_log) lod_log(ctx, address);
     g_trace[g_trace_pos++ % TRACE_LEN] = address;
     if (g_cardtrace) card_trace(ctx, address);
     if (g_text_watch_until > 0) {
@@ -996,6 +1090,8 @@ int main(int argc, char** argv) {
             stop_at = strtod(argv[++i], NULL);
         } else if (strcmp(argv[i], "--dump-audio") == 0 && i + 1 < argc) {
             dump_audio = argv[++i];
+        } else if (strcmp(argv[i], "--lod-log") == 0) {
+            g_lod_log = true;
         } else if (strcmp(argv[i], "--uis-log") == 0) {
             g_uis_log = true;
         } else if (strcmp(argv[i], "--replace") == 0 && i + 1 < argc) {
