@@ -592,6 +592,67 @@ static void project(SVtx* out) {
     out->z = out->clip[2] * out->inv_w * gx_f32(vp[2]) + gx_f32(vp[5]);
 }
 
+/* Ultrawide (test): 2D is kept at 16:9 in the middle, except screen-wide
+   overlays (a colour filter over the whole picture, a flat panel), which are
+   stretched to the full width so they cover the sides too. Pictures (opaque
+   textured 2D, such as a loading screen's) stay 16:9 so they aren't
+   distorted. */
+static bool state_textured(const RenderState* rs) {
+    for (u32 i = 0; i < rs->stages && i < 16; i++)
+        if (rs->st[i].tex_on) return true;
+    return false;
+}
+
+static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest) {
+    int target = g_target_shape;
+    if (target < 3 || n < 3) return;
+    /* Positions across the 16:9 picture (-1 its left edge, 1 its right),
+       which sits in the middle of the wider one. */
+    float frame = (16.0f / 9.0f) / ultrawide_aspect(target);
+    float mn = 1e9f, mx = -1e9f, alpha = 0.0f;
+    for (u32 i = 0; i < n; i++) {
+        if (!(v[i].clip[3] > 1e-6f)) return;
+        float u = v[i].clip[0] / (v[i].clip[3] * frame);
+        if (u < mn) mn = u;
+        if (u > mx) mx = u;
+        alpha += v[i].col[0][3];
+    }
+    if (!g_setup.persp && g_setup.xs < 1.0f && mn <= -0.97f && mx >= 0.97f) {   /* screen-wide 2D */
+        if (textured && alpha / (float)n > 0.95f) return;   /* an opaque picture */
+        for (u32 i = 0; i < n; i++) {
+            v[i].clip[0] /= g_setup.xs;
+            project(&v[i]);
+        }
+        return;
+    }
+    /* A flat (untextured) overlay shape running off one side of the 16:9
+       picture (the scoreboard's red bars: menu-system shapes drawn in 3D
+       with the match camera, no depth test): it was meant to reach the
+       edge, so that end is taken to the edge of the wider picture. Scenery
+       (depth-tested) is left alone. */
+    if (g_setup.persp && ztest) return;
+    if ((mn >= -1.0f && mx <= 1.0f) || mx < -1.0f || mn > 1.0f) return;
+    if (textured) {
+        /* Textured: only long thin bars (the main menu's logo bar is a tinted
+           plain texture), not text or pictures sliding in from the side. */
+        float y0 = 1e9f, y1 = -1e9f, x0 = 1e9f, x1 = -1e9f;
+        for (u32 i = 0; i < n; i++) {
+            if (v[i].y < y0) y0 = v[i].y;
+            if (v[i].y > y1) y1 = v[i].y;
+            if (v[i].x < x0) x0 = v[i].x;
+            if (v[i].x > x1) x1 = v[i].x;
+        }
+        if (mx - mn < 0.4f || (x1 - x0) < 4.0f * (y1 - y0)) return;
+    }
+    for (u32 i = 0; i < n; i++) {
+        float u = v[i].clip[0] / (v[i].clip[3] * frame);
+        if (u < -1.0f || u > 1.0f) {
+            v[i].clip[0] = u < 0.0f ? -v[i].clip[3] : v[i].clip[3];
+            project(&v[i]);
+        }
+    }
+}
+
 /* A point between two vertices (t from a to b), interpolated in clip space. */
 static void lerp_vtx(const SVtx* a, const SVtx* b, float t, SVtx* out) {
     for (int k = 0; k < 4; k++) out->clip[k] = a->clip[k] + (b->clip[k] - a->clip[k]) * t;
@@ -1755,6 +1816,10 @@ static void dlog_short(u8 prim, u32 count, const SVtx* sv) {
     u32 stages = ((gx_bp[0x00] >> 10) & 15u) + 1, cm = gx_bp[0x41], at = gx_bp[0xF3];
     fprintf(f, "#%-4u box %4.0f,%4.0f-%4.0f,%4.0f prim %02X n%-3u cull %u stages %u", g_dlog_draws, x0, y0, x1, y1, prim,
             count, (gx_bp[0x00] >> 14) & 3u, stages);
+    /* how it was projected: 3D or 2D, the horizontal correction (wider
+       shapes), the viewport's size, and the transform unit's texgen count */
+    fprintf(f, " %s xs%.3f vp%.0fx%.0f ntex%u", XFR[0x26] ? "2D" : "3D", g_setup.xs, fabsf(gx_f32(XFR[0x1A])) * 2.0f,
+            fabsf(gx_f32(XFR[0x1B])) * 2.0f, XFR[0x3F] & 15u);
     for (u32 i = 0; i < stages && i < 4; i++) {
         u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
         fprintf(f, " [c%06X a%06X", gx_bp[0xC0 + i * 2] & 0xFFFFFFu, gx_bp[0xC1 + i * 2] & 0xFFFFFFu);
@@ -2042,6 +2107,7 @@ static const CmdList* expand_list(const CmdList* l) {
             const Vtx* raw = l->raw + c->u.draw.first;
             for (u32 k = 0; k < count; k++)
                 transform(&raw[k], &e->verts[base + k]);
+            widen_fullscreen_2d(&e->verts[base], count, state_textured(&l->states[c->state]), l->states[c->state].ztest);
             emit_prim(e, c->state, (u8)c->u.draw.prim, base, count);
         } else {
             Cmd* d = list_push(e);
@@ -2100,6 +2166,7 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
         p += decode_vertex(cpu, &fmt, p, &v);
         transform(&v, &sv[i]);
     }
+    widen_fullscreen_2d(sv, count, state_textured(&l->states[state]), l->states[state].ztest);
     if (g_dlog_at >= 0.0 && g_dlog_frames > 0 && interrupts_game_seconds() >= g_dlog_at)
         dlog_draw(prim, count, &sv[0]);
 
