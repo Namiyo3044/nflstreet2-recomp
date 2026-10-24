@@ -97,8 +97,14 @@ bool pad_add_press(const char* spec) {
     return true;
 }
 
+static bool g_skip_taps;
+void pad_set_skip_taps(bool on) { g_skip_taps = on; }
+
 void pad_poll_response(int port, double t, uint8_t out[8]) {
     uint32_t held = 0;
+    /* START down for 0.1 s in every 0.25 s, so the game sees fresh presses. */
+    if (g_skip_taps && port == 0 && t - 0.25 * (double)(long long)(t / 0.25) < 0.1)
+        held |= PAD_START;
     const PadLive g_live = g_lives[port >= 0 && port < PAD_PORTS ? port : 0];
     for (int i = 0; i < g_count && port == 0; i++) {
         Press* pr = &g_presses[i];

@@ -63,15 +63,28 @@ static u32 g_frames_at_stat;
 /* Fast-forward: no waiting for real time, few pictures shown, no sound.
    On while Tab is held, and set by the game side to skip the intro movies. */
 static bool g_turbo_forced, g_turbo_key;
+/* Skipping all the intro movies: black picture and no sound, at normal speed. */
+static bool g_hidden;
+static Uint64 g_hidden_since;
+
+void window_set_hidden(bool on) {
+    if (on && !g_hidden) {
+        g_hidden_since = SDL_GetTicksNS();
+        printf("window: hiding the intro movies while they're skipped\n");
+    } else if (!on && g_hidden) {
+        printf("startup: intro movies skipped in %.1f s\n", (double)(SDL_GetTicksNS() - g_hidden_since) * 1e-9);
+    }
+    g_hidden = on;
+}
 
 void window_set_turbo(bool on) {
     static Uint64 since;
     if (on != g_turbo_forced) {
         if (on) {
             since = SDL_GetTicksNS();
-            printf("window: fast-forward on (skipping the THX intro)\n");
+            printf("window: fast-forward on (skipping intro movies)\n");
         } else {
-            printf("startup: THX intro skipped in %.1f s\n", (double)(SDL_GetTicksNS() - since) * 1e-9);
+            printf("startup: THX intro fast-forwarded in %.1f s\n", (double)(SDL_GetTicksNS() - since) * 1e-9);
         }
     }
     g_turbo_forced = on;
@@ -114,7 +127,7 @@ void window_set_audio_dump(const char* path) {
 }
 
 static void audio_sink(const u8* samples, u32 frames, u32 rate) {
-    if (!g_audio || !frames || turbo())
+    if (!g_audio || !frames || turbo() || g_hidden)
         return;
     if (rate != g_audio_rate) {
         SDL_AudioSpec spec = {SDL_AUDIO_S16, 2, (int)rate};
@@ -1732,8 +1745,8 @@ void window_field(CPUState* cpu) {
     int prev = prof_enter(PROF_PRESENT);
     /* Fast-forward: show one field in eight; while skipping the THX intro,
        a black window. */
-    if (g_turbo_forced) {
-        if ((g_field & 7u) == 0)
+    if (g_turbo_forced || g_hidden) {
+        if (!g_turbo_forced || (g_field & 7u) == 0)
             present_black();
     } else if (!turbo() || (g_field & 7u) == 0) {
         present(cpu);

@@ -92,6 +92,8 @@ void gx_raster_set_side_fill(u32 rgb);
 void gx_raster_set_match(bool on);
 /* Rain drawn PS2-style (1) or as the GameCube draws it (0). */
 extern int g_rain_style;
+/* The game's screen filters (colour over the picture in matches) drawn (1) or not (0). */
+extern int g_screen_filters;
 /* The graphics card's internal resolution, changed while running. */
 void gx_raster_set_gpu_scale(int scale);
 

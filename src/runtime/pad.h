@@ -41,6 +41,9 @@ bool pad_add_press(const char* spec);
    buttons, main stick, C-stick, analog triggers. */
 void pad_poll_response(int port, double game_seconds, uint8_t out[8]);
 
+/* While on, port 1 taps START a few times a second (skips the intro movies). */
+void pad_set_skip_taps(bool on);
+
 /* Button names accepted by --press, for the usage text. */
 const char* pad_button_names(void);
 

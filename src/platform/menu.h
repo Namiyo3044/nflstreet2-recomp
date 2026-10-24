@@ -58,7 +58,7 @@ void menu_bind(int code);
    Window Size, Renderer and Internal Resolution, values numbered from 0.
    Setting one counts as a change (menu_take_changes). */
 #define MENU_GAME_ROWS 5
-#define MENU_RECOMP_ROWS 3
+#define MENU_RECOMP_ROWS 5
 extern const char* const k_recomp_label[MENU_RECOMP_ROWS];
 /* What the menus show about the session (the GPU, textures), kept up to date
    for the game's own settings screens too. */

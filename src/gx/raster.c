@@ -737,8 +737,48 @@ static void crop_at_sides(SVtx* v, u32 n, float frame) {
 }
 
 static const RenderState* g_wstate;    /* the state of the draw being widened */
+/* Screen filters (a Recomp setting): in a match the game lays a see-through
+   colour over the whole picture (a tint, field by field). With filters off
+   it isn't drawn. Told apart from the fades (to black, between shots), which
+   cover the screen too, by holding still: a filter keeps its colour and
+   strength frame after frame, a fade changes them. */
+int g_screen_filters = 1;              /* 1: the game's filters drawn (settings) */
+#define FILTER_STEADY 20               /* frames unchanged before an overlay counts as a filter */
+#define FILTER_MAX 8
+static struct { u32 key; u32 frame; int steady; } g_filter[FILTER_MAX];
+
+static bool filter_skip(SVtx* v, u32 n, bool capture) {
+    if (g_screen_filters || !g_hud_match || g_setup.persp || capture || n < 3) return false;
+    float xs = g_setup.xs > 1e-6f ? g_setup.xs : 1.0f, mn = 1e9f, mx = -1e9f, ylo = 1e9f, yhi = -1e9f, a = 0.0f;
+    for (u32 i = 0; i < n; i++) {
+        if (!(v[i].clip[3] > 1e-6f)) return false;
+        float x = v[i].clip[0] / (v[i].clip[3] * xs), y = v[i].clip[1] / v[i].clip[3];
+        mn = fminf(mn, x); mx = fmaxf(mx, x); ylo = fminf(ylo, y); yhi = fmaxf(yhi, y);
+        a += v[i].col[0][3];
+    }
+    a /= (float)n;
+    if (mn > -0.97f || mx < 0.97f || ylo > -0.95f || yhi < 0.95f || a > 0.9f) return false;
+    const Stage* st0 = g_wstate && g_wstate->stages ? &g_wstate->st[0] : NULL;
+    u32 key = (st0 && st0->tex_on ? st0->tex_addr : 0u) ^ ((u32)(v[0].col[0][0] * 255.0f) << 24) ^
+              ((u32)(v[0].col[0][1] * 255.0f) << 16) ^ ((u32)(v[0].col[0][2] * 255.0f) << 8) ^ (u32)(a * 255.0f);
+    int slot = -1, old = 0;
+    for (int k = 0; k < FILTER_MAX; k++) {
+        if (g_filter[k].key == key && g_frames - g_filter[k].frame <= 2u) { slot = k; break; }
+        if (g_filter[k].frame < g_filter[old].frame) old = k;
+    }
+    if (slot < 0) { slot = old; g_filter[slot].key = key; g_filter[slot].steady = 0; g_filter[slot].frame = g_frames; }
+    if (g_filter[slot].frame != g_frames) { g_filter[slot].frame = g_frames; g_filter[slot].steady++; }
+    if (g_filter[slot].steady < FILTER_STEADY) return false;
+    for (u32 i = 0; i < n; i++) {      /* out of sight */
+        v[i].clip[0] = 4.0f * v[i].clip[3];
+        project(&v[i]);
+    }
+    return true;
+}
+
 static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool capture) {
     u32 seq = ++g_tick_seq_now;        /* every draw counts (the ticker's run is unbroken) */
+    if (filter_skip(v, n, capture)) return;
     int target = g_target_shape;
     if (target < 3 || n < 2) return;   /* lines (2) too: the Gamebreaker bar's glowing outline */
     /* Positions across the 16:9 picture (-1 its left edge, 1 its right),

@@ -94,6 +94,7 @@ static void movie_read_directory(void) {
 #endif
 static u32 g_open_lines;
 static bool g_skip_intros;             /* --skip-thx: fast-forward through the THX intro movie */
+static bool g_skip_all_intros;         /* Skip Intro Videos (settings): all of them, to the title screen */
 static u32 g_movie_opens;
 
 /* Audio stream timeline: the engine's stream calls, logged with the game time. */
@@ -528,7 +529,17 @@ static int uis_native_hook(CPUState* ctx) {
         return 0;
     if (!(group == 5 && screen == 5)) uismenu_video_closed();   /* another screen loading */
     if (group == 0) { uis_main_menu_edits(ctx); uismenu_add_quit(ctx); }
-    if (group == 0 && (screen == 2 || screen == 3)) uismenu_hide_licence(ctx);   /* the title screen */
+    if (group == 0 && (screen == 2 || screen == 3)) {   /* the title screen */
+        uismenu_hide_licence(ctx);
+#ifdef NFLS2_HAVE_WINDOW
+        if (g_skip_all_intros) {
+            window_set_turbo(false);
+            window_set_hidden(false);
+            pad_set_skip_taps(false);
+            g_skip_all_intros = false;
+        }   /* the intro movies are over */
+#endif
+    }
     static u32 seen[16];
     if (group < 16 && screen < 32 && !(seen[group] & (1u << screen))) {
         seen[group] |= 1u << screen;
@@ -714,6 +725,13 @@ int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
             g_movie_fi = ctx->gpr[4];
             if (g_movie_count < 0) movie_read_directory();
             g_movie_opens++;
+            /* Skipping them all: hidden, with START tapped to skip the EA and
+               NFL Street 2 movies; THX (which can't be skipped) fast-forwarded. */
+            if (g_skip_all_intros) {
+                window_set_hidden(true);
+                pad_set_skip_taps(g_movie_opens != 2);
+                if (g_movie_opens == 2) g_skip_intros = true;
+            }
             if (g_skip_intros && g_movie_opens == 2) window_set_turbo(true);
             if (g_movie_opens == 3) {
                 if (g_skip_intros) window_set_turbo(false);
@@ -740,6 +758,7 @@ int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
         g_movie_fi = 0;
         g_movie_cur = -1;
         window_movie_end();
+        pad_set_skip_taps(false);   /* no taps between movies */
     }
 #endif
 
@@ -1025,6 +1044,8 @@ int main(int argc, char** argv) {
             gpu_scale = g_settings.renderer == 0 ? g_settings.resolution : 0;
             aspect_mode = g_settings.screen_shape;
             g_rain_style = g_settings.ps2_rain;
+            g_screen_filters = g_settings.screen_filters;
+            g_skip_all_intros = g_settings.skip_intros != 0;
             have_settings = true;
         }
     for (int i = 1; i < argc; i++) {

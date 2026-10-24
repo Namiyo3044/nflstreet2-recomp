@@ -33,6 +33,8 @@ void window_set_aspect_mode(int mode);
 
 /* Fast-forward on or off (also on while Tab is held). */
 void window_set_turbo(bool on);
+/* Black picture and no sound (while the intro movies are skipped). */
+void window_set_hidden(bool on);
 
 /* Records everything sent to the speakers to a .wav file. */
 void window_set_audio_dump(const char* path);
