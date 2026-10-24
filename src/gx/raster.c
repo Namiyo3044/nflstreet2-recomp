@@ -138,6 +138,7 @@ static void efb_to_memory(bool depth);
 static void gpu_tex_copy(const TexCopy* info);
 static const CmdList* expand_list(const CmdList* l);
 static u32 gpu_tex_copy_for(u32 map);
+static bool copy_dest_is(u32 map);
 
 void gx_raster_config(const char* dir, u32 every) {
     if (dir) {
@@ -645,11 +646,12 @@ static bool state_textured(const RenderState* rs) {
    portrait) are left alone. */
 static bool state_capture(const RenderState* rs) {
     for (u32 i = 0; i < rs->stages && i < 16; i++)
-        if (rs->st[i].tex_on && rs->st[i].efb_copy && rs->st[i].tw >= 300u && rs->st[i].th >= 200u) return true;
+        if (rs->st[i].tex_on && (rs->st[i].efb_copy || rs->st[i].from_copy) && rs->st[i].tw >= 300u && rs->st[i].th >= 200u)
+            return true;
     return false;
 }
 
-#define HUD_LOW 0.20f                  /* the top HUD: objects placed above this (-1 bottom .. 1 top) */
+#define HUD_LOW -0.25f                 /* the top HUD: objects placed above this (-1 bottom .. 1 top); low enough for a style popup sliding away as it fades */
 #define HUD_SIDE 0.30f                 /* and this far to one side (-1..1 across 16:9) */
 #define HUD_PANELS 0.55f               /* the team panels' row: placed above this */
 static u32 g_tick_seq_now, g_tick_seq = ~0u;   /* draws seen; the last music-ticker piece */
@@ -734,6 +736,7 @@ static void crop_at_sides(SVtx* v, u32 n, float frame) {
     }
 }
 
+static const RenderState* g_wstate;    /* the state of the draw being widened */
 static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool capture) {
     u32 seq = ++g_tick_seq_now;        /* every draw counts (the ticker's run is unbroken) */
     int target = g_target_shape;
@@ -760,7 +763,12 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
         alpha += v[i].col[0][3];
     }
     if (!g_setup.persp && g_setup.xs < 1.0f && mn <= -0.97f && mx >= 0.97f) {   /* screen-wide 2D */
-        if (textured && !capture && alpha / (float)n > 0.95f) return;   /* an opaque picture */
+        /* An opaque picture (a loading screen's: a big texture). A small
+           texture spread over the screen is a fill (the fade to black as a
+           match starts, 128 x 128): stretched like a flat overlay. */
+        const Stage* st0 = g_wstate && g_wstate->stages ? &g_wstate->st[0] : NULL;
+        bool picture = !st0 || (st0->tw >= 256u && st0->th >= 256u);
+        if (textured && !capture && picture && alpha / (float)n > 0.95f) return;
         for (u32 i = 0; i < n; i++) {
             v[i].clip[0] /= g_setup.xs;
             project(&v[i]);
@@ -773,6 +781,28 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
        edge, so that end is taken to the edge of the wider picture. Scenery
        (depth-tested) is left alone. */
     if (g_setup.persp && ztest) return;
+    /* A fade over the whole picture drawn as a 3D shape (the fade as a match
+       starts: the last shot, copied off, drawn over the new one with the
+       match camera, no depth test; or a flat colour in a match): it covered
+       the 16:9 picture; it is stretched across the wider one. (Menu
+       backgrounds, textured pictures, are left alone.) */
+    if (g_setup.persp && !ztest && mn <= -0.97f && mx >= 0.97f && (capture || (!textured && g_hud_match))) {
+        float ylo = 1e9f, yhi = -1e9f;
+        for (u32 i = 0; i < n; i++) {
+            float ny = v[i].clip[1] / v[i].clip[3];
+            ylo = fminf(ylo, ny); yhi = fmaxf(yhi, ny);
+        }
+        if (ylo <= -0.95f && yhi >= 0.95f) {
+            float edge = 1.0f / frame;
+            for (u32 i = 0; i < n; i++) {
+                float u = v[i].clip[0] / (v[i].clip[3] * frame);
+                if (u <= -0.97f) v[i].clip[0] = -edge * v[i].clip[3] * frame;
+                else if (u >= 0.97f) v[i].clip[0] = edge * v[i].clip[3] * frame;
+                project(&v[i]);
+            }
+            return;
+        }
+    }
     /* The music ticker (the song popup at the bottom left, in menus and
        matches) moves left like the HUD's left side. It is drawn in one
        run: its box (placed left of the middle, low down), then each piece
@@ -872,7 +902,11 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
            space, so while it is up only the panel row moves. Counted over
            this frame and the last. */
         if (g_frames != g_ovl_frame) { g_ovl_prev = g_ovl_cur; g_ovl_cur = 0; g_ovl_frame = g_frames; }
-        if (oy < -0.1f && fabsf(ou) > 0.4f && g_ovl_cur < 1000) g_ovl_cur++;
+        /* (menu-system pieces only: single quads placed with matrix 0; a
+           player's body parts aren't cards) */
+        /* (nor the music ticker's box, drawn low on the left too) */
+        if (oy < -0.1f && fabsf(ou) > 0.4f && v[0].mtx == 0 && n == 4 && g_tick_seq != seq && g_ovl_cur < 1000)
+            g_ovl_cur++;
         if (oy < HUD_PANELS && (g_ovl_cur >= HUD_OVERLAY || g_ovl_prev >= HUD_OVERLAY)) side = 1e9f;
         /* A long bar in that row placed nearer the middle but lying mostly
            to one side (a stadium's name banner before the match): with
@@ -1148,6 +1182,10 @@ static void snapshot_state(RenderState* ds) {
 
         if (s->tex_on && g_gpu)
             s->efb_copy = gpu_tex_copy_for(texmap);
+        if (s->tex_on)
+            s->from_copy = copy_dest_is(texmap);
+        if (s->tex_on)
+            s->tex_addr = (gx_bp[(texmap < 4 ? 0x94u : 0xB4u) + (texmap & 3u)] << 5) & 0x01FFFFE0u;
         if (s->tex_on) {
             const GxTexture* tex = gx_tex_get(g_cpu, texmap);
             if (tex) {
@@ -2130,7 +2168,8 @@ static void dlog_short(u8 prim, u32 count, const SVtx* sv) {
        shapes), the viewport's size, and the transform unit's texgen count */
     fprintf(f, " %s xs%.3f vp%.0fx%.0f ntex%u", XFR[0x26] ? "2D" : "3D", g_setup.xs, fabsf(gx_f32(XFR[0x1A])) * 2.0f,
             fabsf(gx_f32(XFR[0x1B])) * 2.0f, XFR[0x3F] & 15u);
-    if (count) fprintf(f, " mtx%u org%.3f,%.3f%s", sv[0].mtx, sv[0].org[0], sv[0].org[1], g_hud_match ? " match" : "");
+    if (count) fprintf(f, " mtx%u org%.3f,%.3f%s%s", sv[0].mtx, sv[0].org[0], sv[0].org[1], g_hud_match ? " match" : "",
+                       (gx_bp[0x40] & 1u) ? "" : " noz");
     for (u32 i = 0; i < stages && i < 4; i++) {
         u32 order = gx_bp[0x28 + i / 2] >> ((i & 1) ? 12 : 0);
         fprintf(f, " [c%06X a%06X", gx_bp[0xC0 + i * 2] & 0xFFFFFFu, gx_bp[0xC1 + i * 2] & 0xFFFFFFu);
@@ -2711,7 +2750,7 @@ static const CmdList* expand_list(const CmdList* l) {
             const Vtx* raw = l->raw + c->u.draw.first;
             for (u32 k = 0; k < count; k++)
                 transform(&raw[k], &e->verts[base + k]);
-            g_wl = e; g_wb = base;
+            g_wl = e; g_wb = base; g_wstate = &l->states[c->state];
             widen_fullscreen_2d(&e->verts[base], count, state_textured(&l->states[c->state]), l->states[c->state].ztest,
                                 state_capture(&l->states[c->state]));
             emit_prim(e, c->state, (u8)c->u.draw.prim, base, count, c->u.draw.lp, c->u.draw.toffs);
@@ -2798,7 +2837,7 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
         p += decode_vertex(cpu, &fmt, p, &v);
         transform(&v, &sv[i]);
     }
-    g_wl = l; g_wb = base;
+    g_wl = l; g_wb = base; g_wstate = &l->states[state];
     widen_fullscreen_2d(sv, count, state_textured(&l->states[state]), l->states[state].ztest,
                         state_capture(&l->states[state]));
     if (g_dlog_at >= 0.0 && g_dlog_frames > 0 && interrupts_game_seconds() >= g_dlog_at)
@@ -3088,6 +3127,33 @@ static u32 ram_sample_sum(u32 addr, u32 bytes) {
 }
 
 /* The GPU copy to use for a texture map, or 0. */
+/* Where the game has copied the frame buffer to (and how big), remembered
+   apart from the copies the GPU keeps: one made a while ago (the shot faded
+   out as a match starts) is still a copy of the whole picture after the GPU's
+   own records have moved on. */
+#define COPY_DESTS 16
+static struct { u32 addr, w, h; } g_copy_dests[COPY_DESTS];
+static int g_copy_dest_next;
+
+static void copy_dest_note(u32 addr, u32 w, u32 h) {
+    for (int k = 0; k < COPY_DESTS; k++)
+        if (g_copy_dests[k].addr == addr) { g_copy_dests[k].w = w; g_copy_dests[k].h = h; return; }
+    g_copy_dests[g_copy_dest_next].addr = addr;
+    g_copy_dests[g_copy_dest_next].w = w;
+    g_copy_dests[g_copy_dest_next].h = h;
+    g_copy_dest_next = (g_copy_dest_next + 1) % COPY_DESTS;
+}
+
+static bool copy_dest_is(u32 map) {
+    u32 bank = map < 4 ? 0u : 0x20u, i = map & 3u;
+    u32 image0 = gx_bp[0x88 + bank + i], image3 = gx_bp[0x94 + bank + i];
+    u32 addr = (image3 << 5) & 0x01FFFFE0u;
+    u32 w = (image0 & 0x3FFu) + 1, h = ((image0 >> 10) & 0x3FFu) + 1;
+    for (int k = 0; k < COPY_DESTS; k++)
+        if (g_copy_dests[k].addr == addr && g_copy_dests[k].w == w && g_copy_dests[k].h == h && addr) return true;
+    return false;
+}
+
 static u32 gpu_tex_copy_for(u32 map) {
     u32 bank = map < 4 ? 0u : 0x20u, i = map & 3u;
     u32 image0 = gx_bp[0x88 + bank + i], image3 = gx_bp[0x94 + bank + i];
@@ -3127,7 +3193,9 @@ void gx_raster_copy(u32 cmd) {
         efb_to_memory(depth_copy);
         TexCopy info;
         u32 dest = 0, bytes = 0;
-        if (efb_copy_to_texture(cmd, &info, &dest, &bytes) && g_gpu && info.id) {
+        bool made = efb_copy_to_texture(cmd, &info, &dest, &bytes);
+        if (made) copy_dest_note(dest, info.w, info.h);
+        if (made && g_gpu && info.id) {
             /* forget older copies at the same place, then keep this one on the GPU too */
             TexCopyRec* slot = &g_tex_copy_recs[0];
             for (int k = 0; k < TEX_COPY_RECORDS; k++) {

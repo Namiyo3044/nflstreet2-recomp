@@ -58,6 +58,17 @@ void menu_bind(int code);
    Window Size, Renderer and Internal Resolution, values numbered from 0.
    Setting one counts as a change (menu_take_changes). */
 #define MENU_GAME_ROWS 5
+#define MENU_RECOMP_ROWS 3
+extern const char* const k_recomp_label[MENU_RECOMP_ROWS];
+/* What the menus show about the session (the GPU, textures), kept up to date
+   for the game's own settings screens too. */
+void menu_set_info(const MenuInfo* info);
+int menu_recomp_row_count(int row);
+int menu_recomp_row_get(int row);
+void menu_recomp_row_set(int row, int value);
+const char* menu_recomp_row_name(int row, int value);
+const char* menu_recomp_row_help(int row);
+bool menu_recomp_row_enabled(int row);
 int menu_game_row_count(int row);
 int menu_game_row_get(int row);
 void menu_game_row_set(int row, int value);

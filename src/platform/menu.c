@@ -97,6 +97,8 @@ static bool item_enabled(int i) {
     }
 }
 
+void menu_set_info(const MenuInfo* info) { g_info = *info; }
+
 void menu_open(const MenuInfo* info) {
     g_info = *info;
     g_open = true;
@@ -220,6 +222,54 @@ const char* menu_game_row_help(int row) {
     case MI_WINSIZE: return "Change the size of the window.";
     case MI_RENDERER: return needs_restart(MI_RENDERER) ? k_restart : "Change how the game is drawn.";
     default: return "Change how sharply the game is drawn.";
+    }
+}
+
+/* The game's Recomp Settings screen (Options): the port's own additions. */
+extern int g_rain_style;
+enum { RR_RAIN, RR_TEXTURES, RR_LABELS };
+const char* const k_recomp_label[MENU_RECOMP_ROWS] = {"PS2-Style Rain", "Custom Textures", "Button Labels"};
+
+int menu_recomp_row_count(int row) { (void)row; return 2; }
+
+int menu_recomp_row_get(int row) {
+    switch (row) {
+    case RR_RAIN: return g_settings.ps2_rain ? 1 : 0;
+    case RR_TEXTURES: return g_settings.custom_textures ? 1 : 0;
+    default: return g_settings.nintendo_labels ? 0 : 1;
+    }
+}
+
+void menu_recomp_row_set(int row, int v) {
+    switch (row) {
+    case RR_RAIN: g_settings.ps2_rain = v != 0; g_rain_style = g_settings.ps2_rain; g_changes |= 1u << MI_COUNT; break;
+    case RR_TEXTURES:
+        if (!g_info.textures_found || g_settings.renderer != 0) return;
+        g_settings.custom_textures = v != 0;
+        g_changes |= 1u << MI_TEXTURES;
+        break;
+    default: g_settings.nintendo_labels = v == 0; g_changes |= 1u << MI_COUNT; break;
+    }
+    g_dirty = true;
+}
+
+bool menu_recomp_row_enabled(int row) {
+    return row != RR_TEXTURES || (g_info.textures_found && g_settings.renderer == 0);
+}
+
+const char* menu_recomp_row_name(int row, int v) {
+    switch (row) {
+    case RR_RAIN: return v ? "On" : "Off";
+    case RR_TEXTURES: return !g_info.textures_found ? "None Found" : v ? "On" : "Off";
+    default: return v ? "By Position" : "By Label";
+    }
+}
+
+const char* menu_recomp_row_help(int row) {
+    switch (row) {
+    case RR_RAIN: return "Rain with streaks and splashes, as on PS2.";
+    case RR_TEXTURES: return "Use the replacement textures folder.";
+    default: return "Nintendo-style pads: by label or position.";
     }
 }
 

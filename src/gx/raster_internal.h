@@ -64,6 +64,8 @@ typedef struct {
     float cbias, abias, cscale, ascale;
     bool tex_on;
     u32 efb_copy;                      /* GPU: id of a frame-buffer copy held on the GPU to use instead (0 = none) */
+    bool from_copy;                    /* the texture is where the game copied the frame buffer to */
+    u32 tex_addr;                      /* where the texture is (diagnostics) */
     u8 texcoord, chan;
     u8 tsw[4], rsw[4];
     const u32* texels;                 /* decoded texture (all mip levels); valid until the frame is drawn */

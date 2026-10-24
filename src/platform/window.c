@@ -1666,9 +1666,19 @@ void window_field(CPUState* cpu) {
     {
         /* The game's Video Settings screen: its rows read and set the
            settings, applied here as the menu's are. */
+        static const char* const k_video_label[MENU_GAME_ROWS] = {"Aspect Ratio", "Display", "Window Resolution",
+                                                                 "Internal Resolution", "Renderer"};
         static const UisVideoRows k_rows = {menu_game_row_count, menu_game_row_get, menu_game_row_set,
-                                            menu_game_row_name, menu_game_row_help, menu_game_row_enabled};
-        uismenu_set_video_rows(&k_rows);
+                                            menu_game_row_name, menu_game_row_help, menu_game_row_enabled,
+                                            MENU_GAME_ROWS, "Video Settings", k_video_label};
+        static const UisVideoRows k_recomp = {menu_recomp_row_count, menu_recomp_row_get, menu_recomp_row_set,
+                                              menu_recomp_row_name, menu_recomp_row_help, menu_recomp_row_enabled,
+                                              MENU_RECOMP_ROWS, "Recomp Settings", k_recomp_label};
+        uismenu_set_video_rows(&k_rows, &k_recomp);
+        if (!menu_is_open()) {
+            MenuInfo mi = {g_gpu, g_gpu_scale, hires_has_folder()};
+            menu_set_info(&mi);
+        }
         uismenu_video_frame(cpu);
         if (!menu_is_open()) {
             unsigned ch = menu_take_changes();

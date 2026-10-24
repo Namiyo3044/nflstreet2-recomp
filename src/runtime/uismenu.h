@@ -17,6 +17,7 @@
 #define UIS_FN_AUDIO 0x7A53u
 #define UIS_FN_VIDEO_BACK 0x7A54u   /* 1 once when back from Video Settings */
 #define UIS_FN_FLICKER_DONE 0x7A55u /* after the quit dialog: the text flicker finished */
+#define UIS_FN_RECOMP 0x7A56u       /* ... and to open the port's Recomp Settings (Options list) */
 
 /* The main menu's text-flicker pieces shown again in full (a dialog opened
    while one was flickering stopped it part way, leaving text hidden). */
@@ -43,8 +44,15 @@ typedef struct {
     const char* (*name)(int row, int value);
     const char* (*help)(int row);
     bool (*enabled)(int row);          /* can be used now (else greyed out and skipped) */
+    int rows;                          /* how many (2-5) */
+    const char* title;
+    const char* const* labels;         /* each row's label */
 } UisVideoRows;
-void uismenu_set_video_rows(const UisVideoRows* rows);
+/* The two screens made from Audio Settings: Video Settings (page 0) and
+   Recomp Settings (page 1). */
+void uismenu_set_video_rows(const UisVideoRows* video, const UisVideoRows* recomp);
+/* Which of them the next Audio Settings screen in video mode is. */
+void uismenu_set_video_page(int page);
 
 /* Video Settings is open (the Audio Settings screen in video mode). */
 bool uismenu_video_active(CPUState* cpu);

@@ -401,7 +401,7 @@ static void uis_main_menu_edits(CPUState* ctx) {
 }
 
 static bool g_video_screen;            /* the Options list asked for Video Settings */
-static bool g_video_back;              /* ... and the cursor goes back to it */
+static int g_video_back;               /* ... and the cursor goes back to it (1 Video, 2 Recomp Settings) */
 
 static int uis_native_hook(CPUState* ctx) {
     if (g_uis_ok < 0)
@@ -440,10 +440,13 @@ static int uis_native_hook(CPUState* ctx) {
         ctx->pc = ctx->lr;
         return 1;
     }
-    if ((ctx->gpr[3] == UIS_FN_VIDEO || ctx->gpr[3] == UIS_FN_AUDIO) && group == 0) {
-        /* The Options list opens Audio Settings for both entries; this says
-           which (Video Settings: the same screen in video mode). */
-        g_video_screen = g_video_back = ctx->gpr[3] == UIS_FN_VIDEO;
+    if ((ctx->gpr[3] == UIS_FN_VIDEO || ctx->gpr[3] == UIS_FN_RECOMP || ctx->gpr[3] == UIS_FN_AUDIO) && group == 0) {
+        /* The Options list opens Audio Settings for all three entries; this
+           says which (Video / Recomp Settings: the same screen in video mode,
+           with that page's rows). */
+        g_video_screen = ctx->gpr[3] != UIS_FN_AUDIO;
+        g_video_back = ctx->gpr[3] == UIS_FN_VIDEO ? 1 : ctx->gpr[3] == UIS_FN_RECOMP ? 2 : 0;
+        uismenu_set_video_page(ctx->gpr[3] == UIS_FN_RECOMP);
         mem_write32(ctx, ctx->gpr[8], 0);
         ctx->gpr[3] = 1;
         ctx->pc = ctx->lr;
@@ -480,8 +483,8 @@ static int uis_native_hook(CPUState* ctx) {
     }
     if (ctx->gpr[3] == UIS_FN_VIDEO_BACK && group == 0) {
         /* Back on Options from Audio Settings' screen: was it Video Settings? */
-        mem_write32(ctx, ctx->gpr[8], g_video_back ? 1u : 0u);
-        g_video_back = false;
+        mem_write32(ctx, ctx->gpr[8], (u32)g_video_back);   /* 0 Audio, 1 Video, 2 Recomp Settings */
+        g_video_back = 0;
         ctx->gpr[3] = 1;
         ctx->pc = ctx->lr;
         return 1;
