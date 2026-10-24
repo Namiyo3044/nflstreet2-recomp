@@ -101,12 +101,47 @@ static void near_hide(CPUState* cpu, float scale) {
     g_near_have = true;
 }
 
+/* Rain (and snow): the game's weather particles (0x801A69A8 sets them up,
+   0x801A6AF8 moves them: a drop reaching the ground leaves a splash there,
+   fading, and starts again at the top). Weather setup (0x801A762C) gives
+   rain 96 drops with splashes starting at alpha 100, except on one field
+   (the field index at 0x8030E6E8 is 2: The Alley), where it cuts them to 10
+   drops at alpha 20: the splashes then fail the alpha test (16) almost at
+   once and never show. With PS2-style rain on, the full settings are put
+   back there. */
+#define WEATHER_MODE 0x003ECC34u       /* r13 - 0x566C: 0 none, 1 snow, 2 rain */
+#define WEATHER_COUNT 0x003EB858u      /* r13 - 0x6A48: drops moved and drawn */
+#define WEATHER_SPLASH_A 0x003ECC3Du   /* r13 - 0x5663: a splash's starting alpha */
+#define WEATHER_DROP_A 0x003ECC3Cu     /* r13 - 0x5664: a drop's alpha */
+#define WEATHER_SPEED 0x003ECC38u      /* r13 - 0x5668: fall per frame (float) */
+#define RAIN_SPEED 1.2f
+extern int g_rain_style;
+
+static void weather(CPUState* cpu) {
+    if (!g_rain_style || rd(cpu, WEATHER_MODE) != 2u) return;
+    if (rd(cpu, WEATHER_COUNT) == 10u && cpu->ram[WEATHER_SPLASH_A] == 0x14u && cpu->ram[WEATHER_DROP_A] == 0x14u) {
+        wr(cpu, WEATHER_COUNT, 0x60u);
+        cpu->ram[WEATHER_SPLASH_A] = 0x64u;
+        cpu->ram[WEATHER_DROP_A] = 0x64u;
+        printf("rain: full rain settings put back (96 drops, splashes)\n");
+    }
+    /* The fall speed (r13 - 0x5668, -0.3 a frame for rain): the PS2's rain
+       falls a little faster. */
+    u32 sp = rd(cpu, WEATHER_SPEED);
+    if (sp == 0xBE99999Au) {
+        float f = -0.3f * RAIN_SPEED;
+        u32 v; memcpy(&v, &f, 4);
+        wr(cpu, WEATHER_SPEED, v);
+    }
+}
+
 bool lodfix_frame(CPUState* cpu) {
     if (!cpu || !cpu->ram || cpu->ram_size < 0x01800000u) return false;
     float aspect = asf(rd(cpu, CAMERA_ASPECT));
     float scale = aspect > 1.9f && aspect < 8.0f ? aspect / (16.0f / 9.0f) : 1.0f;
     caps(cpu, scale);
     near_hide(cpu, scale);
+    weather(cpu);
     u32 n = rd(cpu, REG_COUNT);
     if (n > 512) return false;
     for (u32 i = 0; i < n; i++) {

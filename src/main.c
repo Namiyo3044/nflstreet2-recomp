@@ -1021,6 +1021,7 @@ int main(int argc, char** argv) {
             window_height = settings_window_height(g_settings.window_size);
             gpu_scale = g_settings.renderer == 0 ? g_settings.resolution : 0;
             aspect_mode = g_settings.screen_shape;
+            g_rain_style = g_settings.ps2_rain;
             have_settings = true;
         }
     for (int i = 1; i < argc; i++) {

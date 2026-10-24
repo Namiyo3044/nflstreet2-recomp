@@ -90,6 +90,8 @@ const char* gx_raster_gpu_name(void);
 void gx_raster_set_side_fill(u32 rgb);
 /* A match is on (ultrawide: the match HUD's team panels move out). */
 void gx_raster_set_match(bool on);
+/* Rain drawn PS2-style (1) or as the GameCube draws it (0). */
+extern int g_rain_style;
 /* The graphics card's internal resolution, changed while running. */
 void gx_raster_set_gpu_scale(int scale);
 

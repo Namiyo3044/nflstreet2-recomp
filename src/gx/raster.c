@@ -2307,16 +2307,297 @@ static void emit_tri(CmdList* l, u32 state, u32 a, u32 b, u32 c) {
         push_tri(l, state, poly[0], poly[i], poly[i + 1]);
 }
 
+/* Lines and points: GX draws them as screen-space quads, lines widened
+   across (up/down for flat lines, sideways for steep ones) by the line width
+   and points as squares of the point size (both in sixths of a pixel, BP
+   0x22). Texture coordinates can spread across the quad (the "texture
+   offset", per coordinate in BP 0x30 + 2i); otherwise every corner keeps
+   the vertex's own. Rain, sparks and outlines are drawn this way. */
+static const float k_tex_off[8] = {0.0f, 1.0f / 16.0f, 1.0f / 8.0f, 1.0f / 4.0f, 1.0f / 2.0f, 1.0f, 1.0f, 1.0f};
+
+static void emit_quad_from(CmdList* l, u32 state, const u32 src[4], const float off[4][2], const float toff[4][2],
+                           u32 tc_mask) {
+    u32 b = list_verts(l, 4);           /* may move the pool */
+    if (b == ~0u) return;
+    float sx = fabsf(gx_f32(XFR[0x1A])), sy = fabsf(gx_f32(XFR[0x1B]));
+    if (!(sx > 0.0f) || !(sy > 0.0f)) return;
+    for (int k = 0; k < 4; k++) {
+        SVtx* o = &l->verts[b + (u32)k];
+        *o = l->verts[src[k]];
+        o->clip[0] += off[k][0] / sx * o->clip[3];
+        o->clip[1] -= off[k][1] / sy * o->clip[3];   /* screen y runs down */
+        for (int t = 0; t < MAX_TC; t++)
+            if (tc_mask & (1u << t)) {
+                o->tc[t][0] += toff[k][0] * o->tc[t][2];
+                o->tc[t][1] += toff[k][1] * o->tc[t][2];
+            }
+        project(o);
+    }
+    /* GX never culls lines and points: wind the quad so the face culling
+       set for triangles keeps it (2 keeps a negative area, 1 a positive). */
+    const SVtx* p0 = &l->verts[b];
+    const SVtx* p1 = &l->verts[b + 1];
+    const SVtx* p2 = &l->verts[b + 2];
+    float area = (p1->x - p0->x) * (p2->y - p0->y) - (p1->y - p0->y) * (p2->x - p0->x);
+    u32 cull = l->states[state].cull;
+    bool flip = (cull == 2 && area > 0.0f) || (cull == 1 && area < 0.0f);
+    if (flip) {
+        emit_tri(l, state, b, b + 2, b + 1);
+        emit_tri(l, state, b, b + 3, b + 2);
+    } else {
+        emit_tri(l, state, b, b + 1, b + 2);
+        emit_tri(l, state, b, b + 2, b + 3);
+    }
+}
+
+static void emit_line(CmdList* l, u32 state, u32 a, u32 c, u32 lp, u32 toffs) {
+    const SVtx* va = &l->verts[a];
+    const SVtx* vc = &l->verts[c];
+    if (!va->valid || !vc->valid) return;
+    float half = (float)(lp & 0xFFu) / 12.0f;
+    if (half <= 0.0f) half = 1.0f / 12.0f;
+    float dx = vc->x - va->x, dy = vc->y - va->y;
+    float ox = 0.0f, oy = 0.0f;
+    if (fabsf(dx) >= fabsf(dy)) oy = half; else ox = half;
+    float t = k_tex_off[(lp >> 16) & 7u];
+    const u32 src[4] = {a, a, c, c};
+    const float off[4][2] = {{-ox, -oy}, {ox, oy}, {ox, oy}, {-ox, -oy}};
+    const float to[4][2] = {{0, 0}, {fabsf(dx) >= fabsf(dy) ? 0.0f : t, fabsf(dx) >= fabsf(dy) ? t : 0.0f},
+                            {fabsf(dx) >= fabsf(dy) ? 0.0f : t, fabsf(dx) >= fabsf(dy) ? t : 0.0f}, {0, 0}};
+    emit_quad_from(l, state, src, off, to, toffs & 0xFFu);
+}
+
+static void emit_point(CmdList* l, u32 state, u32 a, u32 lp, u32 toffs) {
+    if (!l->verts[a].valid) return;
+    float half = (float)((lp >> 8) & 0xFFu) / 12.0f;
+    if (half <= 0.0f) half = 1.0f / 12.0f;
+    float t = k_tex_off[(lp >> 19) & 7u];
+    const u32 src[4] = {a, a, a, a};
+    const float off[4][2] = {{-half, -half}, {half, -half}, {half, half}, {-half, half}};
+    const float to[4][2] = {{0, 0}, {t, 0}, {t, t}, {0, t}};
+    emit_quad_from(l, state, src, off, to, (toffs >> 8) & 0xFFu);
+}
+
+/* ------------------------------------------------------------- rain --- */
+/* The rain (PS2 style, an option): the game draws each drop as a short line
+   from where it is to where it was a moment before (two matrices on the
+   same point), opaque (blend off, passed by the alpha test). Drawn here as
+   a longer streak instead: the line carried on back the same way (in clip
+   space, which keeps it straight in the scene), see-through and fading
+   towards its far end. The game's own splashes are drawn as it draws them
+   (with the full rain settings put back, they show: see lodfix.c). */
+#define RAIN_FLAG 0x80000000u
+#define RAIN_STRETCH 5.5f              /* streak length, in the game's drop lengths */
+#define RAIN_SPLASH_ALPHA 0.3f         /* the game's splashes, this opaque */
+#define RAIN_DROPS 36                  /* of each rain box's 96 drops, how many are drawn */
+#define RAIN_ALPHA 0.12f               /* a streak's opacity at its lower end */
+int g_rain_style = 1;                  /* 1: PS2-style rain (settings) */
+
+static u32 rain_state(CmdList* l, u32 state) {
+    if (l->ns == l->cap_s) {
+        u32 cap = l->cap_s * 2;
+        RenderState* ns = (RenderState*)realloc(l->states, sizeof(RenderState) * cap);
+        if (!ns) return state;
+        l->states = ns;
+        l->cap_s = cap;
+    }
+    RenderState* d = &l->states[l->ns];
+    rs_copy(d, &l->states[state]);
+    d->blend = true; d->sfac = 4; d->dfac = 5; d->subtract = false; d->blend_alpha = true;
+    d->at_always = true; d->at_f0 = 7; d->at_f1 = 7; d->at_logic = 0;
+    d->zupdate = false;
+    return l->ns++;
+}
+
+/* More rain: each drop also falls in RAIN_COPIES other places beside it,
+   moved sideways in the scene (not up or down, so they land, and splash,
+   on the ground with it). A sideways move is the same for every point, so
+   it is worked out straight in clip space from the camera's rotation and
+   the projection. Drops are counted through each frame so a drop's splash
+   (drawn just after it) gets the same copies. */
+#define SPLASH_FLAG 0x40000000u
+#define RAIN_COPIES 0
+#define RAIN_SPREAD 8.0f               /* how far beside it (scene units; the game's rain box is 16 across) */
+#define RAIN_LEAN 0.15f                 /* how much of the drops' own slant the streaks keep */
+static const CmdList* g_rain_list;
+static u32 g_rain_nv, g_rain_k;
+
+static float rain_hash(u32 k, u32 d) {
+    u32 h = k * 0x9E3779B1u ^ (d + 1u) * 0x85EBCA77u;
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12;
+    return (float)(h & 0xFFFFu) / 65535.0f;
+}
+
+/* clip-space change for a move of w in the scene (v's matrix's rotation) */
+static void rain_clip_delta(const SVtx* v, const float w[3], float out[4]) {
+    const u32* pr = &XFR[0x20];
+    const u32* m = &XFM[(v->mtx * 4u) & 0x3FFu];
+    float ex = gx_f32(m[0]) * w[0] + gx_f32(m[1]) * w[1] + gx_f32(m[2]) * w[2];
+    float ey = gx_f32(m[4]) * w[0] + gx_f32(m[5]) * w[1] + gx_f32(m[6]) * w[2];
+    float ez = gx_f32(m[8]) * w[0] + gx_f32(m[9]) * w[1] + gx_f32(m[10]) * w[2];
+    out[0] = (gx_f32(pr[0]) * ex + gx_f32(pr[1]) * ez) * g_setup.xs;
+    out[1] = gx_f32(pr[2]) * ey + gx_f32(pr[3]) * ez;
+    out[2] = gx_f32(pr[4]) * ez;
+    out[3] = -ez;
+}
+
+/* scene move for a clip-space change (the reverse) */
+static bool rain_world_delta(const SVtx* v, const float d[4], float out[3]) {
+    const u32* pr = &XFR[0x20];
+    const u32* m = &XFM[(v->mtx * 4u) & 0x3FFu];
+    float p0 = gx_f32(pr[0]), p1 = gx_f32(pr[1]), p2 = gx_f32(pr[2]), p3 = gx_f32(pr[3]);
+    if (!(fabsf(p0) > 1e-9f) || !(fabsf(p2) > 1e-9f) || !(fabsf(g_setup.xs) > 1e-9f)) return false;
+    float ez = -d[3], ex = (d[0] / g_setup.xs - p1 * ez) / p0, ey = (d[1] - p3 * ez) / p2;
+    for (int i = 0; i < 3; i++) out[i] = gx_f32(m[i]) * ex + gx_f32(m[4 + i]) * ey + gx_f32(m[8 + i]) * ez;
+    return true;
+}
+
+/* the scene's up axis: the one pointing most up the screen */
+static int rain_up(const SVtx* v) {
+    const u32* m = &XFM[(v->mtx * 4u) & 0x3FFu];
+    int up = 0;
+    for (int i = 1; i < 3; i++)
+        if (fabsf(gx_f32(m[4 + i])) > fabsf(gx_f32(m[4 + up]))) up = i;
+    return up;
+}
+
+static void rain_offset(u32 k, u32 d, int up, float w[3]) {
+    int s1 = (up + 1) % 3, s2 = (up + 2) % 3;
+    w[0] = w[1] = w[2] = 0.0f;
+    w[s1] = (rain_hash(k, d * 2) - 0.5f) * 2.0f * RAIN_SPREAD;
+    w[s2] = (rain_hash(k, d * 2 + 1) - 0.5f) * 2.0f * RAIN_SPREAD;
+}
+
+static void rain_streak(CmdList* l, u32 state, const SVtx* a_in, const float tip[4]) {
+    SVtx a = *a_in, pe = *a_in;          /* the pool may move */
+    memcpy(pe.clip, tip, sizeof pe.clip);
+    if (!(pe.clip[3] > 1e-6f) || !a.valid) return;
+    project(&pe);
+    float sx = fabsf(gx_f32(XFR[0x1A])), sy = fabsf(gx_f32(XFR[0x1B]));
+    float dx = pe.x - a.x, dy = pe.y - a.y, len = sqrtf(dx * dx + dy * dy);
+    if (!(sx > 0.0f) || !(sy > 0.0f) || len < 1e-4f) return;
+    float half = 0.4f, nx = -dy / len * half, ny = dx / len * half;
+    u32 b = list_verts(l, 4);
+    if (b == ~0u) return;
+    const SVtx* src[4] = {&a, &a, &pe, &pe};
+    const float sg[4] = {-1.0f, 1.0f, 1.0f, -1.0f}, al[4] = {RAIN_ALPHA, RAIN_ALPHA, 0.0f, 0.0f};
+    for (int k = 0; k < 4; k++) {
+        SVtx* o = &l->verts[b + (u32)k];
+        *o = *src[k];
+        o->clip[0] += sg[k] * nx / sx * o->clip[3];
+        o->clip[1] -= sg[k] * ny / sy * o->clip[3];
+        for (int ch = 0; ch < 3; ch++) o->col[0][ch] = fminf(1.0f, a.col[0][ch] * 1.1f + 0.05f);
+        o->col[0][3] = al[k];
+        project(o);
+    }
+    emit_tri(l, state, b, b + 1, b + 2);
+    emit_tri(l, state, b, b + 2, b + 3);
+}
+
+/* A splash's state: as the game's, without its alpha test (16), so made
+   fainter it still lasts as long. */
+static u32 splash_state(CmdList* l, u32 state) {
+    if (l->ns == l->cap_s) {
+        u32 cap = l->cap_s * 2;
+        RenderState* ns = (RenderState*)realloc(l->states, sizeof(RenderState) * cap);
+        if (!ns) return state;
+        l->states = ns;
+        l->cap_s = cap;
+    }
+    RenderState* d = &l->states[l->ns];
+    rs_copy(d, &l->states[state]);
+    d->at_always = true; d->at_f0 = 7; d->at_f1 = 7; d->at_logic = 0;
+    d->zupdate = false;                /* (its clear parts no longer cut out by the test) */
+    return l->ns++;
+}
+
+static void emit_rain(CmdList* l, u32 state, u32 ia, u32 ic) {
+    if (l != g_rain_list || l->nv < g_rain_nv) { g_rain_k = 0; g_rain_list = l; }   /* a new frame */
+    g_rain_nv = l->nv;
+    u32 k = g_rain_k++;
+    SVtx a = l->verts[ia], c = l->verts[ic];   /* a: where it is; c: where it was */
+    if (!a.valid || !c.valid) return;
+    /* the streak: back along the drop's own line, its slant cut down
+       (worked out in the scene, then back into clip space) */
+    float d[4] = {c.clip[0] - a.clip[0], c.clip[1] - a.clip[1], c.clip[2] - a.clip[2], c.clip[3] - a.clip[3]};
+    float w[3];
+    int up = rain_up(&a);
+    if (rain_world_delta(&a, d, w)) {
+        float wl = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        for (int i = 0; i < 3; i++) if (i != up) w[i] *= RAIN_LEAN;
+        float nl = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        if (nl > 1e-9f) for (int i = 0; i < 3; i++) w[i] *= wl / nl * RAIN_STRETCH;
+        rain_clip_delta(&a, w, d);
+    } else {
+        for (int i = 0; i < 4; i++) d[i] *= RAIN_STRETCH;
+    }
+    for (u32 n = 0; n <= RAIN_COPIES; n++) {
+        SVtx at = a;
+        if (n) {
+            float off[3], oc[4];
+            rain_offset(k, n, up, off);
+            rain_clip_delta(&a, off, oc);
+            for (int i = 0; i < 4; i++) at.clip[i] += oc[i];
+            if (!(at.clip[3] > 1e-6f)) continue;
+            project(&at);
+            at.near_d = at.clip[2] + at.clip[3]; at.far_d = -at.clip[2];
+        }
+        float tip[4] = {at.clip[0] + d[0], at.clip[1] + d[1], at.clip[2] + d[2], at.clip[3] + d[3]};
+        rain_streak(l, state, &at, tip);
+    }
+}
+
+/* A drop's splash (the game's quad), also where its copies land. */
+static void emit_splash_copies(CmdList* l, u32 state, u32 q) {
+    if (!g_rain_k) return;
+    u32 k = g_rain_k - 1u;                       /* the drop just drawn */
+    int up = rain_up(&l->verts[q]);
+    for (u32 n = 1; n <= RAIN_COPIES; n++) {
+        float off[3], oc[4];
+        rain_offset(k, n, up, off);
+        rain_clip_delta(&l->verts[q], off, oc);
+        u32 b = list_verts(l, 4);
+        if (b == ~0u) return;
+        bool ok = true;
+        for (u32 i = 0; i < 4; i++) {
+            SVtx* o = &l->verts[b + i];
+            *o = l->verts[q + i];
+            for (int j = 0; j < 4; j++) o->clip[j] += oc[j];
+            if (!(o->clip[3] > 1e-6f)) ok = false;
+            o->near_d = o->clip[2] + o->clip[3]; o->far_d = -o->clip[2];
+            project(o);
+        }
+        if (!ok) continue;
+        emit_tri(l, state, b, b + 1, b + 2);
+        emit_tri(l, state, b, b + 2, b + 3);
+    }
+}
+
+/* BP state lines and points need (recorded with each draw). */
+static void line_point_state(u32* lp, u32* toffs) {
+    *lp = gx_bp[0x22] & 0xFFFFFFu;
+    u32 m = 0;
+    for (u32 i = 0; i < 8; i++) {
+        u32 ss = gx_bp[0x30 + i * 2];
+        if ((ss >> 18) & 1u) m |= 1u << i;
+        if ((ss >> 19) & 1u) m |= 1u << (8 + i);
+    }
+    *toffs = m;
+}
+
 /* Triangles of a primitive whose transformed vertices are at base..base+count. */
-static void emit_prim(CmdList* l, u32 state, u8 prim, u32 base, u32 count) {
+static void emit_prim(CmdList* l, u32 state, u8 prim, u32 base, u32 count, u32 lp, u32 toffs) {
 #define EMIT(i0, i1, i2) emit_tri(l, state, base + (i0), base + (i1), base + (i2))
 
     switch (prim & 0xF8) {
     case 0x80:
     case 0x88:
         for (u32 i = 0; i + 3 < count; i += 4) {
+            if (toffs & SPLASH_FLAG)   /* the game's splash, fainter */
+                for (u32 j = 0; j < 4; j++) l->verts[base + i + j].col[0][3] *= RAIN_SPLASH_ALPHA;
             EMIT(i, i + 1, i + 2);
             EMIT(i, i + 2, i + 3);
+            if (toffs & SPLASH_FLAG) emit_splash_copies(l, state, base + i);
         }
         break;
     case 0x90:
@@ -2334,6 +2615,18 @@ static void emit_prim(CmdList* l, u32 state, u8 prim, u32 base, u32 count) {
     case 0xA0:
         for (u32 i = 1; i + 1 < count; i++)
             EMIT(0, i, i + 1);
+        break;
+    case 0xA8:   /* lines */
+        for (u32 i = 0; i + 1 < count; i += 2) {
+            if (toffs & RAIN_FLAG) emit_rain(l, state, base + i, base + i + 1);
+            else emit_line(l, state, base + i, base + i + 1, lp, toffs);
+        }
+        break;
+    case 0xB0:   /* line strip */
+        for (u32 i = 0; i + 1 < count; i++) emit_line(l, state, base + i, base + i + 1, lp, toffs);
+        break;
+    case 0xB8:   /* points */
+        for (u32 i = 0; i < count; i++) emit_point(l, state, base + i, lp, toffs);
         break;
     default:
         break;
@@ -2421,7 +2714,7 @@ static const CmdList* expand_list(const CmdList* l) {
             g_wl = e; g_wb = base;
             widen_fullscreen_2d(&e->verts[base], count, state_textured(&l->states[c->state]), l->states[c->state].ztest,
                                 state_capture(&l->states[c->state]));
-            emit_prim(e, c->state, (u8)c->u.draw.prim, base, count);
+            emit_prim(e, c->state, (u8)c->u.draw.prim, base, count, c->u.draw.lp, c->u.draw.toffs);
         } else {
             Cmd* d = list_push(e);
             if (d) *d = *c;
@@ -2435,13 +2728,36 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
         note_projection();
     if (!gx_raster_active() || count == 0)
         return;
-    if ((gx_bp[0x00] >> 14 & 3u) == 3u)
-        return;                        /* cull everything */
+    if ((gx_bp[0x00] >> 14 & 3u) == 3u && (prim & 0xF8) < 0xA8)
+        return;                        /* cull everything (triangles; lines and points aren't culled) */
     g_cpu = cpu;
     if (g_u8f[255] == 0.0f)
         for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;
     CmdList* l = &g_lists[g_rec];
     u32 state = list_state(l);
+    bool rain = (prim & 0xF8) == 0xA8 && g_rain_style && g_hud_match && !l->states[state].blend;
+    if (rain) state = rain_state(l, state);
+    /* The game draws its rain a box at a time (16 x 16 x 8, tiled over the
+       camera's view, 0x801A7880) but stops after 22 boxes in a frame (the
+       count at 0x803ECC2C, bumped after each box drawn), so with a wide
+       view the far or high boxes went missing and rain stopped in mid-air.
+       While a box is being drawn the count is set back, so every box in
+       view is drawn. */
+    if (rain && cpu->ram_size > 0x003ECC30u) {
+        u8* cnt = cpu->ram + 0x003ECC2Cu;
+        cnt[0] = cnt[1] = cnt[2] = cnt[3] = 0;
+        /* How many of a box's 96 drops are drawn is worked out again each
+           frame from the rain's strength (0x801A7784: strength x 96, at
+           0x803EB858), which keeps The Alley at a handful; RAIN_DROPS of
+           them are drawn from here on (all 96 always move). */
+        u8* num = cpu->ram + 0x003EB858u;
+        num[0] = num[1] = num[2] = 0; num[3] = RAIN_DROPS;
+    }
+    /* each drop's splash is drawn straight after its line (a quad) */
+    static bool prev_rain;
+    bool splash = !rain && prev_rain && (prim & 0xF8) == 0x80;
+    prev_rain = rain;
+    if (splash) state = splash_state(l, state);
 
     if (g_defer) {                     /* decode now (RAM may change), transform on the GPU thread */
         u32 first = list_raw(l, count);
@@ -2460,6 +2776,9 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
         c->u.draw.prim = prim;
         c->u.draw.count = count;
         c->u.draw.first = first;
+        line_point_state(&c->u.draw.lp, &c->u.draw.toffs);
+        if (rain) c->u.draw.toffs |= RAIN_FLAG;
+        if (splash) c->u.draw.toffs |= SPLASH_FLAG;
         return;
     }
 
@@ -2485,7 +2804,11 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
     if (g_dlog_at >= 0.0 && g_dlog_frames > 0 && interrupts_game_seconds() >= g_dlog_at)
         dlog_draw(prim, count, &sv[0]);
 
-    emit_prim(l, state, prim, base, count);
+    u32 lp, toffs;
+    line_point_state(&lp, &toffs);
+    if (rain) toffs |= RAIN_FLAG;
+    if (splash) toffs |= SPLASH_FLAG;
+    emit_prim(l, state, prim, base, count, lp, toffs);
 }
 
 void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) {

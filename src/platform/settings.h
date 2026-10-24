@@ -32,6 +32,7 @@ typedef struct {
     int pad_bind[GCI_COUNT];
     int keyboard_player;               /* 0-3: the player the keyboard controls */
     int nintendo_labels;               /* 1: Nintendo-style controllers by their labels (A = A), 0: by position */
+    int ps2_rain;                      /* 1: rain drawn PS2-style (streaks, more drops, splashes), 0: as on GameCube */
 } Settings;
 
 extern Settings g_settings;

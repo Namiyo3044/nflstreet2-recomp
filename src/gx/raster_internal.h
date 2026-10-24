@@ -108,7 +108,8 @@ typedef struct {
     union {
         u32 vi[3];                     /* triangle: indices into the list's vertex pool */
         CopyCmd copy;
-        struct { u32 prim, count, first; } draw;   /* deferred draw: decoded vertices in raw[] */
+        struct { u32 prim, count, first, lp, toffs; } draw;   /* deferred draw: decoded vertices in raw[];
+                                                                 line / point size and texture offsets */
         struct { u32 addr, n, off; } xf;           /* transform unit writes: n words from xfdata[off] */
     } u;
 } Cmd;

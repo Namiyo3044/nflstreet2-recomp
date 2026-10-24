@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-Settings g_settings = {0, 4, 0, 0, 3, 1, {0}, {0}, 0, 1};
+Settings g_settings = {0, 4, 0, 0, 3, 1, {0}, {0}, 0, 1, 1};
 
 const char* const k_gc_input_names[GCI_COUNT] = {
     "a", "b", "x", "y", "z", "start", "l", "r",
@@ -44,6 +44,7 @@ bool settings_load(const char* path) {
         else if (strcmp(key, "custom_textures") == 0) s->custom_textures = atoi(val) != 0;
         else if (strcmp(key, "keyboard_player") == 0) s->keyboard_player = clampi(atoi(val), 1, 4) - 1;
         else if (strcmp(key, "nintendo_labels") == 0) s->nintendo_labels = atoi(val) != 0;
+        else if (strcmp(key, "ps2_rain") == 0) s->ps2_rain = atoi(val) != 0;
         else if (strncmp(key, "key_", 4) == 0 || strncmp(key, "pad_", 4) == 0) {
             for (int i = 0; i < GCI_COUNT; i++)
                 if (strcmp(key + 4, k_gc_input_names[i]) == 0) {
@@ -74,6 +75,7 @@ void settings_save(void) {
     fprintf(f, "custom_textures=%d\n", s->custom_textures);
     fprintf(f, "keyboard_player=%d\n", s->keyboard_player + 1);
     fprintf(f, "nintendo_labels=%d\n", s->nintendo_labels);
+    fprintf(f, "ps2_rain=%d\n", s->ps2_rain);
     fprintf(f, "# Controls (set from the menu): key_ = keyboard key code, pad_ = controller button / stick code,\n"
                "# -1 = nothing, 0 = the default.\n");
     for (int i = 0; i < GCI_COUNT; i++) fprintf(f, "key_%s=%d\n", k_gc_input_names[i], s->key_bind[i]);
