@@ -42,6 +42,33 @@ Paths to DolRecomp and the generated code default to the layout above; override 
 Options: `--max-steps N` (default 50,000,000), `--quiet` (don't list functions as they are
 first entered), `--skip-hash` (run a DOL that isn't the verified build).
 
+## Credits
+
+**NFL Street 2** is © Electronic Arts / EA SPORTS BIG. This is an unofficial fan project, not
+affiliated with or endorsed by EA, the NFL or Nintendo.
+
+**The NFL Street 2 decomp** ([mitsevox/nflstreet2](https://github.com/mitsevox/nflstreet2)),
+by the team behind NFL Street Reborn. Their mapping of the game's functions is what the
+recompiler is given to know where each function starts and ends (see `tools\export_symbols.py`
+in the layout above). This repo contains none of the decomp's source code, and the two are
+separate projects: the decomp is rebuilding the game as readable C, while this port recompiles
+the original program as it is. Thanks for all the work understanding this game.
+
+**[DolRecomp](https://github.com/expansionpak/dolrecomp)**: the static recompiler and the CPU
+runtime this port is built on (GPLv3).
+
+Libraries used (SDL is downloaded at build time; the rest are in `src/third_party`):
+
+- [SDL 3](https://github.com/libsdl-org/SDL): window, input and sound (zlib licence)
+- [pl_mpeg](https://github.com/phoboslab/pl_mpeg) by Dominic Szablewski: replacement movie
+  playback (MIT)
+- [stb_image, stb_image_write, stb_truetype](https://github.com/nothings/stb) by Sean Barrett:
+  textures, screenshots and menu text (public domain / MIT)
+- [bcdec](https://github.com/iOrange/bcdec) by Sergii "iOrange" Kudlai: compressed texture
+  decoding (MIT / Unlicense)
+- [Anton](https://github.com/googlefonts/AntonFont) font by The Anton Project Authors: the
+  port's own menus (SIL Open Font License 1.1, see `src/third_party/Anton-OFL.txt`)
+
 ## Licence note
 
 The port links DolRecomp's CPU runtime (`src/cpu/cpu.c`), which is GPLv3, so the port as a

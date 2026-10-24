@@ -229,7 +229,7 @@ const char* menu_game_row_help(int row) {
 extern int g_rain_style, g_screen_filters;
 enum { RR_RAIN, RR_FILTERS, RR_TEXTURES, RR_LABELS, RR_INTROS };
 const char* const k_recomp_label[MENU_RECOMP_ROWS] = {"PS2-Style Rain", "Screen Filters", "Custom Textures",
-                                                      "Button Labels", "Skip Intro Videos"};
+                                                      "Nintendo Buttons", "Skip Intro Videos"};
 
 int menu_recomp_row_count(int row) { (void)row; return 2; }
 
@@ -280,7 +280,7 @@ const char* menu_recomp_row_help(int row) {
     case RR_FILTERS: return "The colour tint over the picture in matches.";
     case RR_TEXTURES: return "Use the replacement textures folder.";
     case RR_INTROS: return "Hides and skips the intro videos. Applies next start.";
-    default: return "Nintendo-style pads: by label or position.";
+    default: return "For Nintendo pads: A/B/X/Y by label or position.";
     }
 }
 
