@@ -332,6 +332,7 @@ static u32 decode_vertex(CPUState* cpu, const VtxFormat* f, const u8* p, Vtx* v)
 /* ---------------------------------------------------------- transform --- */
 
 static float clamp01(float v);
+static void rain_flush(CmdList* l);   /* held rain streaks drawn (below) */
 static float g_u8f[256];               /* i / 255 */
 
 static void unpack(u32 rgba, float out[4]) {
@@ -997,8 +998,12 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
         if (g_frames != g_ovl_frame) { g_ovl_prev = g_ovl_cur; g_ovl_cur = 0; g_ovl_frame = g_frames; }
         /* (menu-system pieces only: single quads placed with matrix 0; a
            player's body parts aren't cards) */
-        /* (nor the music ticker's box, drawn low on the left too) */
-        if (oy < -0.1f && fabsf(ou) > 0.4f && v[0].mtx == 0 && n == 4 && g_tick_seq != seq && g_ovl_cur < 1000)
+        /* (nor the music ticker's box, drawn low on the left too, nor
+           what lies along the very bottom: the REPLAY prompt, its button
+           and the turbo bar, up after a play just as the style point
+           popups are; the play cards reach higher) */
+        if (oy < -0.1f && fabsf(ou) > 0.4f && v[0].mtx == 0 && n == 4 && g_tick_seq != seq && yhi >= -0.55f &&
+            g_ovl_cur < 1000)
             g_ovl_cur++;
         if (oy < HUD_PANELS && (g_ovl_cur >= HUD_OVERLAY || g_ovl_prev >= HUD_OVERLAY)) side = 1e9f;
         /* A long bar in that row placed nearer the middle but lying mostly
@@ -2098,6 +2103,7 @@ static void submit(void) {
     wait_idle();                       /* the other list is free again */
     gx_tex_collect_garbage();          /* texture memory the finished frame used */
     CmdList* l = &g_lists[g_rec];
+    if (!g_defer) rain_flush(l);       /* held rain streaks (deferred: when the list is expanded) */
     if (g_gpu && !g_workers) {         /* no thread could be started: draw here */
         glr_run_list(g_defer ? expand_list(l) : l);
     } else if (!g_workers) {
@@ -2556,7 +2562,6 @@ static u32 rain_state(CmdList* l, u32 state) {
 #define SPLASH_FLAG 0x40000000u
 #define RAIN_COPIES 0
 #define RAIN_SPREAD 8.0f               /* how far beside it (scene units; the game's rain box is 16 across) */
-#define RAIN_LEAN 0.15f                 /* how much of the drops' own slant the streaks keep */
 static const CmdList* g_rain_list;
 static u32 g_rain_nv, g_rain_k;
 
@@ -2606,6 +2611,38 @@ static void rain_offset(u32 k, u32 d, int up, float w[3]) {
     w[s2] = (rain_hash(k, d * 2 + 1) - 0.5f) * 2.0f * RAIN_SPREAD;
 }
 
+/* The streaks are see-through and leave the depth alone, so whatever the
+   game draws after its rain (distant buildings, walls behind a ledge)
+   would paint over them; the game's own opaque drops set the depth, which
+   kept those behind. They are held back and drawn after the rest of the
+   3D scene instead: before the first 2D draw after them (the HUD, screen
+   filters), a frame-buffer copy, or the end of the list. */
+static struct { CmdList* l; u32 (*t)[4]; u32 n, cap; } g_rain_held;
+
+static void rain_hold(CmdList* l, u32 state, u32 a, u32 b, u32 c) {
+    if (g_rain_held.l != l) g_rain_held.n = 0;
+    g_rain_held.l = l;
+    if (g_rain_held.n == g_rain_held.cap) {
+        u32 cap = g_rain_held.cap ? g_rain_held.cap * 2 : 1024;
+        u32 (*t)[4] = (u32 (*)[4])realloc(g_rain_held.t, sizeof(*t) * cap);
+        if (!t) { emit_tri(l, state, a, b, c); return; }
+        g_rain_held.t = t;
+        g_rain_held.cap = cap;
+    }
+    u32* t = g_rain_held.t[g_rain_held.n++];
+    t[0] = state; t[1] = a; t[2] = b; t[3] = c;
+}
+
+static void rain_flush(CmdList* l) {
+    if (g_rain_held.l != l) { g_rain_held.n = 0; return; }
+    u32 n = g_rain_held.n;
+    g_rain_held.n = 0;                 /* (emit_tri doesn't come back here) */
+    for (u32 i = 0; i < n; i++) {
+        const u32* t = g_rain_held.t[i];
+        emit_tri(l, t[0], t[1], t[2], t[3]);
+    }
+}
+
 static void rain_streak(CmdList* l, u32 state, const SVtx* a_in, const float tip[4]) {
     SVtx a = *a_in, pe = *a_in;          /* the pool may move */
     memcpy(pe.clip, tip, sizeof pe.clip);
@@ -2628,8 +2665,8 @@ static void rain_streak(CmdList* l, u32 state, const SVtx* a_in, const float tip
         o->col[0][3] = al[k];
         project(o);
     }
-    emit_tri(l, state, b, b + 1, b + 2);
-    emit_tri(l, state, b, b + 2, b + 3);
+    rain_hold(l, state, b, b + 1, b + 2);
+    rain_hold(l, state, b, b + 2, b + 3);
 }
 
 /* A splash's state: as the game's, without its alpha test (16), so made
@@ -2655,20 +2692,26 @@ static void emit_rain(CmdList* l, u32 state, u32 ia, u32 ic) {
     u32 k = g_rain_k++;
     SVtx a = l->verts[ia], c = l->verts[ic];   /* a: where it is; c: where it was */
     if (!a.valid || !c.valid) return;
-    /* the streak: back along the drop's own line, its slant cut down
-       (worked out in the scene, then back into clip space) */
+    /* the streak: straight up in the scene from where the drop is, as long
+       as RAIN_STRETCH of the game's drop lengths. The game's line runs from
+       the drop through the camera of a moment before, so it also carries
+       the camera's own movement (and is turned round in a rewinding
+       replay); only how far it falls is taken from it, and that is
+       averaged over the drops, so the streaks stay upright and at the
+       drop's own depth. */
     float d[4] = {c.clip[0] - a.clip[0], c.clip[1] - a.clip[1], c.clip[2] - a.clip[2], c.clip[3] - a.clip[3]};
     float w[3];
     int up = rain_up(&a);
+    static float fall;                 /* the drops' fall, averaged (scene units) */
     if (rain_world_delta(&a, d, w)) {
-        float wl = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-        for (int i = 0; i < 3; i++) if (i != up) w[i] *= RAIN_LEAN;
-        float nl = sqrtf(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-        if (nl > 1e-9f) for (int i = 0; i < 3; i++) w[i] *= wl / nl * RAIN_STRETCH;
-        rain_clip_delta(&a, w, d);
-    } else {
-        for (int i = 0; i < 4; i++) d[i] *= RAIN_STRETCH;
+        float f = fabsf(w[up]);
+        if (f > 1e-4f && f < 16.0f) fall = fall > 0.0f ? fall * 0.95f + f * 0.05f : f;
     }
+    if (!(fall > 0.0f)) return;
+    const u32* m = &XFM[(a.mtx * 4u) & 0x3FFu];
+    w[0] = w[1] = w[2] = 0.0f;
+    w[up] = (gx_f32(m[4 + up]) >= 0.0f ? 1.0f : -1.0f) * fall * RAIN_STRETCH;   /* up the screen */
+    rain_clip_delta(&a, w, d);
     for (u32 n = 0; n <= RAIN_COPIES; n++) {
         SVtx at = a;
         if (n) {
@@ -2725,6 +2768,7 @@ static void line_point_state(u32* lp, u32* toffs) {
 
 /* Triangles of a primitive whose transformed vertices are at base..base+count. */
 static void emit_prim(CmdList* l, u32 state, u8 prim, u32 base, u32 count, u32 lp, u32 toffs) {
+    if (g_rain_held.n && !g_setup.persp) rain_flush(l);   /* 2D after the rain: the streaks first */
 #define EMIT(i0, i1, i2) emit_tri(l, state, base + (i0), base + (i1), base + (i2))
 
     switch (prim & 0xF8) {
@@ -2854,10 +2898,12 @@ static const CmdList* expand_list(const CmdList* l) {
                                 state_capture(&l->states[c->state]));
             emit_prim(e, c->state, (u8)c->u.draw.prim, base, count, c->u.draw.lp, c->u.draw.toffs);
         } else {
+            if (c->type == CMD_COPY) rain_flush(e);
             Cmd* d = list_push(e);
             if (d) *d = *c;
         }
     }
+    rain_flush(e);
     return e;
 }
 
@@ -3319,6 +3365,7 @@ void gx_raster_copy(u32 cmd) {
     }
 
     if (active && (to_xfb || clear)) {
+        if (!g_defer) rain_flush(&g_lists[g_rec]);   /* (deferred: when the list is expanded) */
         Cmd* c = list_push(&g_lists[g_rec]);
         if (c) {
             CopyCmd* cp = &c->u.copy;
