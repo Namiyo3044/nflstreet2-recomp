@@ -94,6 +94,9 @@ void gx_raster_set_match(bool on);
 extern int g_rain_style;
 /* The game's screen filters (colour over the picture in matches) drawn (1) or not (0). */
 extern int g_screen_filters;
+/* Shiny highlights added on lit models (0 off, 1 subtle, 2 accurate) (the graphics card renderer
+   only), as the PS2 and Xbox versions have; settings. */
+extern int g_specular;
 /* The graphics card's internal resolution, changed while running. */
 void gx_raster_set_gpu_scale(int scale);
 

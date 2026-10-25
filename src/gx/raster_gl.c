@@ -150,6 +150,7 @@ static const char* k_fs =
     "        R[m.y].a = ares;\n"
     "    }\n"
     "    vec4 o = clamp(R[0], 0.0, 1.0);\n"
+    "    if (g0.w != 0) o.rgb = min(o.rgb + v_col1.rgb, 1.0);\n"
     "    if (g0.y == 0) {\n"
     "        int av = int(o.a * 255.0 + 0.5);\n"
     "        bool r0 = acmp(g1.x, av, g1.z), r1 = acmp(g1.y, av, g1.w);\n"
@@ -676,6 +677,7 @@ static void fill_state(GlState* o, const RenderState* ds) {
     o->g0[0] = (s32)ds->stages;
     o->g0[1] = ds->at_always;
     o->g0[2] = (s32)ds->at_logic;
+    o->g0[3] = ds->spec_add;
     o->g1[0] = (s32)ds->at_f0; o->g1[1] = (s32)ds->at_f1;
     o->g1[2] = (s32)ds->at_ref0; o->g1[3] = (s32)ds->at_ref1;
     memcpy(o->reg_init, ds->reg_init, sizeof(o->reg_init));

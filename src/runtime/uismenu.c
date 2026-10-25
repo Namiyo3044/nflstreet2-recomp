@@ -833,8 +833,9 @@ void uismenu_hide_licence(CPUState* cpu) {
 #define PV_VARS (PV_BASE + 0x0C00u)     /* the copies' text variables */
 #define PV_HEAP (PV_BASE + 0x1000u)     /* the copies themselves */
 #define PV_END (PV_BASE + 0x8000u)
-#define VROWS 5                          /* rows on the screen: the original + 4 copies */
+#define VROWS 6                          /* rows on the screen: the original + 5 copies */
 #define VROW_DY 50.0f                    /* the rows' spacing (the volume rows' own) */
+#define VROW_DY6 40.0f                   /* with six rows: closer, so they take the room five did */
 #define AUD_NOBJ 0x22u
 #define AUD_NVAR 0x27u
 #define AUD_NFUNC 7u
@@ -883,7 +884,7 @@ static u32 g_vrow[VROWS];              /* the rows' instances (0: the original) 
 static u32 g_vh;                       /* the video screen's script header (0: not open) */
 static u32 g_vhelp;                    /* its help line's text record */
 static u32 g_vhelp_var, g_vhelp_buf;
-static u32 g_vval_var[5], g_vval_buf[5];
+static u32 g_vval_var[VROWS], g_vval_buf[VROWS];
 static bool g_vstarted;                /* its rows have been given their values */
 static int g_vlast[VROWS];
 static const UisVideoRows* g_vcb;      /* the open screen's rows */
@@ -1008,7 +1009,7 @@ static int video_rows(u32 h) {
         g_vrow[c] = crow;
         /* One row lower. */
         union { u32 u; float f; } y;
-        y.u = rd(row + 0x0C); y.f += VROW_DY * (float)c; wr(crow + 0x0C, y.u);
+        y.u = rd(row + 0x0C); y.f += (g_vn >= 6 ? VROW_DY6 : VROW_DY) * (float)c; wr(crow + 0x0C, y.u);
         /* Its own text buffers: the text records point at variables. */
         u32 vrec = h + rd(crow + 0x368), lrec = h + rd(crow + 0x370);
         if (!in_ram(vrec, 0x40) || !in_ram(lrec, 0x40)) return c;
@@ -1025,7 +1026,7 @@ static int video_rows(u32 h) {
     g_vrow_text[0] = h + voff;
     /* Up / down: each row's focus links (+0x6c next, +0x68 previous: has
        one, the row itself, the other row; script-relative instances) chain
-       the five rows; the copies still pointed at the volume rows. */
+       the rows; the copies still pointed at the volume rows. */
     /* The link blocks are packed against the next data in the script (a
        block with no link has no third word: what follows is something
        else, the row's box among it), so each link gets a block of its own.

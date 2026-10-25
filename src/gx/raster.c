@@ -362,6 +362,7 @@ typedef struct {
     float mat[2][4], amb[2][4];
     LightSetup light[8];
     bool lit, chan1, persp;
+    bool spec;                         /* a highlight is added (spec_wanted) */
     u32 ntex;
     float xs;                          /* horizontal correction of the projection (1 = none) */
 } DrawSetup;
@@ -459,6 +460,56 @@ static float projection_correction(void) {
     return 1.0f;
 }
 
+/* Specular highlights (an option; the PS2 and Xbox versions have them,
+   the GameCube's lighting doesn't). Added to what the game's lighting gives
+   on the setup its players use: colour channel 0 lit, with a diffuse
+   function, lights without attenuation (positions only) and the second
+   channel unused. The highlight is worked out per vertex from the same
+   lights, carried in the unused second colour and added on the GPU after
+   the texture stages. */
+static bool spec_wanted(const u32* xf) {   /* xf: the transform registers to look at */
+    if (!g_specular || !g_gpu) return false;
+    u32 c = xf[0x0E];
+    u32 mask = ((c >> 2) & 0xFu) | (((c >> 11) & 0xFu) << 4);
+    return (c & 2u) && ((c >> 7) & 3u) != 0 && ((c >> 9) & 3u) == 2u && mask && (xf[0x09] & 3u) < 2u &&
+           xf[0x26] == 0;
+}
+
+/* Sharpness (lower: broader) and brightness (a share of the light's
+   colour) for 1 Subtle and 2 Accurate (as on PS2). */
+static const float k_spec_power[3] = {0.0f, 24.0f, 16.0f};
+static const float k_spec_strength[3] = {0.0f, 0.45f, 0.7f};
+
+static void spec_light(const float pos[3], const float nrm[3], float out[4]) {
+    u32 c = g_setup.cctrl[0];
+    u32 mask = ((c >> 2) & 0xFu) | (((c >> 11) & 0xFu) << 4);
+    float v[3] = {-pos[0], -pos[1], -pos[2]};
+    float vl = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    int lv = g_specular == 1 ? 1 : 2;
+    float power = k_spec_power[lv], strength = k_spec_strength[lv];
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+    if (vl < 1e-9f) return;
+    for (int k = 0; k < 3; k++) v[k] /= vl;
+    for (u32 n = 0; n < 8; n++) {
+        if (!(mask & (1u << n)))
+            continue;
+        const LightSetup* L = &g_setup.light[n];
+        float l[3] = {L->lp[0] - pos[0], L->lp[1] - pos[1], L->lp[2] - pos[2]};
+        float ll = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+        if (ll < 1e-9f) continue;
+        for (int k = 0; k < 3; k++) l[k] /= ll;
+        if (nrm[0] * l[0] + nrm[1] * l[1] + nrm[2] * l[2] <= 0.0f) continue;
+        float hv[3] = {l[0] + v[0], l[1] + v[1], l[2] + v[2]};
+        float hl = sqrtf(hv[0] * hv[0] + hv[1] * hv[1] + hv[2] * hv[2]);
+        if (hl < 1e-9f) continue;
+        float nh = (nrm[0] * hv[0] + nrm[1] * hv[1] + nrm[2] * hv[2]) / hl;
+        if (nh <= 0.0f) continue;
+        float s = powf(nh, power) * strength;
+        for (int k = 0; k < 3; k++) out[k] += L->col[k] * s;
+    }
+    for (int k = 0; k < 3; k++) out[k] = clamp01(out[k]);
+}
+
 static void draw_setup(void) {
     DrawSetup* d = &g_setup;
     u32 mask = 0;
@@ -475,6 +526,7 @@ static void draw_setup(void) {
     d->lit = ((XFR[0x0E] | XFR[0x0F] | XFR[0x10] | XFR[0x11]) & 2u) != 0;
     d->chan1 = (XFR[0x09] & 3u) >= 2u;
     d->persp = XFR[0x26] == 0;
+    d->spec = spec_wanted(XFR);
     d->ntex = XFR[0x3F] & 15u;
     d->xs = projection_correction();
     for (u32 n = 0; n < 8; n++) {
@@ -743,6 +795,7 @@ static const RenderState* g_wstate;    /* the state of the draw being widened */
    cover the screen too, by holding still: a filter keeps its colour and
    strength frame after frame, a fade changes them. */
 int g_screen_filters = 1;              /* 1: the game's filters drawn (settings) */
+int g_specular;                        /* highlights on lit models: 0 off, 1 subtle, 2 accurate (settings; graphics card only) */
 #define FILTER_STEADY 20               /* frames unchanged before an overlay counts as a filter */
 #define FILTER_MAX 8
 static struct { u32 key; u32 frame; int steady; } g_filter[FILTER_MAX];
@@ -1093,6 +1146,8 @@ static void transform(const Vtx* in, SVtx* out) {
     channel(in, 0, vpos, vn, out->col[0]);
     if (g_setup.chan1)                         /* second colour channel in use */
         channel(in, 1, vpos, vn, out->col[1]);
+    else if (g_setup.spec)                     /* the highlight, added on the GPU */
+        spec_light(vpos, vn, out->col[1]);
     else
         out->col[1][0] = out->col[1][1] = out->col[1][2] = out->col[1][3] = 0.0f;
     u32 ntex = g_setup.ntex;
@@ -1293,6 +1348,7 @@ static void snapshot_state(RenderState* ds) {
     ds->ntex = gx_xf_reg[0x3F] & 15u;
     if (ds->ntex > MAX_TC) ds->ntex = MAX_TC;
     ds->cull = (gx_bp[0x00] >> 14) & 3u;
+    ds->spec_add = spec_wanted(gx_xf_reg);   /* the live registers (the game thread's) */
 }
 
 /* ---------------------------------------------------------------- TEV --- */
@@ -2120,6 +2176,7 @@ static int g_dlog_frames;              /* frames still to log once started */
 static FILE* g_dlog;
 static FILE* g_dlog_short;             /* one line per draw */
 static u32 g_dlog_draws;
+static u32 g_dlog_cullall;            /* draws dropped as "cull all" this logged frame */
 
 void gx_raster_draw_log(double at_seconds, int frames) {
     g_dlog_at = at_seconds;
@@ -2314,7 +2371,9 @@ static void dlog_draw(u8 prim, u32 count, const SVtx* first) {
 
 static void dlog_frame_end(void) {
     if (g_dlog_short && g_dlog)
-        fprintf(g_dlog_short, "-- end of frame %u\n", g_frames + 1);
+        fprintf(g_dlog_short, "-- end of frame %u (%u draws skipped: the game had culling set to everything)\n",
+                g_frames + 1, g_dlog_cullall);
+    g_dlog_cullall = 0;
     if (g_dlog && --g_dlog_frames <= 0) {
         fclose(g_dlog);
         g_dlog = NULL;
@@ -2470,7 +2529,7 @@ static void emit_point(CmdList* l, u32 state, u32 a, u32 lp, u32 toffs) {
 #define RAIN_SPLASH_ALPHA 0.3f         /* the game's splashes, this opaque */
 #define RAIN_DROPS 36                  /* of each rain box's 96 drops, how many are drawn */
 #define RAIN_ALPHA 0.12f               /* a streak's opacity at its lower end */
-int g_rain_style = 1;                  /* 1: PS2-style rain (settings) */
+int g_rain_style = 1;                  /* 1: rain as on PS2 / Xbox (The Alley; settings) */
 
 static u32 rain_state(CmdList* l, u32 state) {
     if (l->ns == l->cap_s) {
@@ -2807,8 +2866,10 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
         note_projection();
     if (!gx_raster_active() || count == 0)
         return;
-    if ((gx_bp[0x00] >> 14 & 3u) == 3u && (prim & 0xF8) < 0xA8)
+    if ((gx_bp[0x00] >> 14 & 3u) == 3u && (prim & 0xF8) < 0xA8) {
+        if (g_dlog) g_dlog_cullall++;
         return;                        /* cull everything (triangles; lines and points aren't culled) */
+    }
     g_cpu = cpu;
     if (g_u8f[255] == 0.0f)
         for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;

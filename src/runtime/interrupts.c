@@ -101,6 +101,8 @@ void interrupts_poll(CPUState* cpu) {
     }
 
     mmio_ai_dma_tick(cpu);
+    mmio_di_tick(cpu);
+    mmio_dma_tick(cpu);
     exi_tick(cpu->timebase);
 
     if (!(cpu->msr & MSR_EE))

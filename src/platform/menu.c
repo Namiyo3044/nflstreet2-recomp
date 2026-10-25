@@ -226,12 +226,13 @@ const char* menu_game_row_help(int row) {
 }
 
 /* The game's Recomp Settings screen (Options): the port's own additions. */
-extern int g_rain_style, g_screen_filters;
-enum { RR_RAIN, RR_FILTERS, RR_TEXTURES, RR_LABELS, RR_INTROS };
-const char* const k_recomp_label[MENU_RECOMP_ROWS] = {"PS2-Style Rain", "Screen Filters", "Custom Textures",
-                                                      "Nintendo Buttons", "Skip Intro Videos"};
+extern int g_rain_style, g_screen_filters, g_specular;
+enum { RR_RAIN, RR_FILTERS, RR_TEXTURES, RR_SPECULAR, RR_LABELS, RR_INTROS };
+const char* const k_recomp_label[MENU_RECOMP_ROWS] = {"The Alley Rain", "Screen Filters", "Custom Textures",
+                                                      "Specular Highlights", "Nintendo Buttons",
+                                                      "Skip Intro Videos"};
 
-int menu_recomp_row_count(int row) { (void)row; return 2; }
+int menu_recomp_row_count(int row) { return row == RR_SPECULAR ? 3 : 2; }
 
 int menu_recomp_row_get(int row) {
     switch (row) {
@@ -239,6 +240,7 @@ int menu_recomp_row_get(int row) {
     case RR_FILTERS: return g_settings.screen_filters ? 1 : 0;
     case RR_TEXTURES: return g_settings.custom_textures ? 1 : 0;
     case RR_INTROS: return g_settings.skip_intros ? 1 : 0;
+    case RR_SPECULAR: return g_settings.specular;
     default: return g_settings.nintendo_labels ? 0 : 1;
     }
 }
@@ -257,18 +259,28 @@ void menu_recomp_row_set(int row, int v) {
         g_changes |= 1u << MI_TEXTURES;
         break;
     case RR_INTROS: g_settings.skip_intros = v != 0; g_changes |= 1u << MI_COUNT; break;
+    case RR_SPECULAR:
+        if (g_settings.renderer != 0) return;
+        g_settings.specular = v < 0 ? 0 : v > 2 ? 2 : v;
+        g_specular = g_settings.specular;
+        g_changes |= 1u << MI_COUNT;
+        break;
     default: g_settings.nintendo_labels = v == 0; g_changes |= 1u << MI_COUNT; break;
     }
     g_dirty = true;
 }
 
 bool menu_recomp_row_enabled(int row) {
-    return row != RR_TEXTURES || (g_info.textures_found && g_settings.renderer == 0);
+    if (row == RR_TEXTURES) return g_info.textures_found && g_settings.renderer == 0;
+    if (row == RR_SPECULAR) return g_settings.renderer == 0;
+    return true;
 }
 
 const char* menu_recomp_row_name(int row, int v) {
     switch (row) {
-    case RR_RAIN: case RR_FILTERS: case RR_INTROS: return v ? "On" : "Off";
+    case RR_RAIN: return v ? "PS2/Xbox" : "GameCube";
+    case RR_FILTERS: case RR_INTROS: return v ? "On" : "Off";
+    case RR_SPECULAR: return v == 2 ? "Accurate" : v == 1 ? "Subtle" : "Off";
     case RR_TEXTURES: return !g_info.textures_found ? "None Found" : v ? "On" : "Off";
     default: return v ? "By Position" : "By Label";
     }
@@ -276,10 +288,11 @@ const char* menu_recomp_row_name(int row, int v) {
 
 const char* menu_recomp_row_help(int row) {
     switch (row) {
-    case RR_RAIN: return "Rain with streaks and splashes, as on PS2.";
+    case RR_RAIN: return "PS2/Xbox: more rain, with streaks and splashes.";
     case RR_FILTERS: return "The colour tint over the picture in matches.";
     case RR_TEXTURES: return "Use the replacement textures folder.";
     case RR_INTROS: return "Hides and skips the intro videos. Applies next start.";
+    case RR_SPECULAR: return "Shiny highlights on players. Accurate: as on PS2.";
     default: return "For Nintendo pads: A/B/X/Y by label or position.";
     }
 }

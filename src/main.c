@@ -11,6 +11,7 @@
 #include "runtime/hle_exceptions.h"
 #include "runtime/interrupts.h"
 #include "runtime/pad.h"
+#include "runtime/credits.h"
 #include "gx/fifo.h"
 #include "gx/raster.h"
 #include "gx/hires.h"
@@ -343,6 +344,7 @@ static void card_trace(CPUState* ctx, u32 address) {
 #define UIS_FN_SCREEN_OK 0x38u          /* (screen) -> whether that screen can be shown */
 static int g_uis_ok = -1;              /* the code looks as expected (checked once) */
 static bool g_uis_log;                /* --uis-log */
+static bool g_uis_trace;              /* --uis-trace: every call, in order */
 
 /* Edits to the main menu's scripts (menu group 0), each a comparison with
    the console value the menu keeps (Xbox 1, GameCube 2):
@@ -401,6 +403,38 @@ static void uis_main_menu_edits(CPUState* ctx) {
     }
 }
 
+/* Replaces a menu text (a whole string) with a shorter one, in place, and
+   the length in the text variables that point at it. */
+static int uis_retext(u8* ram, u32 size, const char* old, const char* rep) {
+    u32 ol = (u32)strlen(old), nl = (u32)strlen(rep);
+    int done = 0;
+    if (nl > ol) return 0;
+    for (u32 o = 0x00800000u; o + ol + 1 < size; o++) {
+        if (ram[o] != (u8)old[0] || memcmp(ram + o, old, ol + 1) != 0) continue;
+        memset(ram + o, 0, ol);
+        memcpy(ram + o, rep, nl);
+        u32 addr = 0x80000000u | o;
+        for (u32 v = 0x00800000u; v + 12 <= size; v++)
+            if (ram[v + 11] == (u8)addr && rd_be32(ram + v + 8) == addr && rd_be32(ram + v) == 1 &&
+                rd_be32(ram + v + 4) == ol) {
+                ram[v + 4] = (u8)(nl >> 24); ram[v + 5] = (u8)(nl >> 16);
+                ram[v + 6] = (u8)(nl >> 8); ram[v + 7] = (u8)nl;
+            }
+        done++;
+    }
+    return done;
+}
+
+/* The Credits list without Madden NFL 2005 (the PS2 demo, not in the
+   GameCube game; uis_main_menu_edits brings in the other versions' list):
+   just Credits and Previews. The port's own credits are at the start of
+   the game's credits roll (credits.c). */
+static void uis_credits_list(CPUState* ctx) {
+    if (!ctx->ram || ctx->ram_size < 0x01800000u) return;
+    if (uis_retext(ctx->ram, ctx->ram_size, "|Credits|Previews|Madden NFL 2005", "|Credits|Previews"))
+        printf("uis: Credits list: Madden NFL 2005 left out\n");
+}
+
 static bool g_video_screen;            /* the Options list asked for Video Settings */
 static int g_video_back;               /* ... and the cursor goes back to it (1 Video, 2 Recomp Settings) */
 
@@ -414,6 +448,17 @@ static int uis_native_hook(CPUState* ctx) {
 #ifdef NFLS2_HAVE_WINDOW
     if (group == 0 || group == 5) window_note_front_end();   /* a menu is up (main menu, options screens) */
 #endif
+    if (g_uis_trace) {                 /* --uis-trace: every call, in order (first 20000) */
+        static int lines;
+        if (lines < 20000) {
+            lines++;
+            u32 argc = ctx->gpr[6];
+            printf("uist: %7.2f g%u s%u %s%X:", interrupts_game_seconds(), group, screen,
+                   ctx->gpr[3] & 0x80000000u ? "K" : "", ctx->gpr[3] & 0x7FFFFFFFu);
+            for (u32 k = 0; k < argc && k < 5; k++) printf(" %d", (int)mem_read32(ctx, ctx->gpr[7] + 4 * k));
+            printf("\n");
+        }
+    }
     if (g_uis_log) {                   /* --uis-log: each distinct call once */
         static u32 seen_calls[1024];
         static int n_seen;
@@ -528,7 +573,7 @@ static int uis_native_hook(CPUState* ctx) {
     if (ctx->gpr[3] != UIS_FN_PLATFORM)
         return 0;
     if (!(group == 5 && screen == 5)) uismenu_video_closed();   /* another screen loading */
-    if (group == 0) { uis_main_menu_edits(ctx); uismenu_add_quit(ctx); }
+    if (group == 0) { uis_main_menu_edits(ctx); uis_credits_list(ctx); uismenu_add_quit(ctx); }
     if (group == 0 && (screen == 2 || screen == 3)) {   /* the title screen */
         uismenu_hide_licence(ctx);
 #ifdef NFLS2_HAVE_WINDOW
@@ -690,7 +735,7 @@ int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
         else if (address == 0x8026B7D8u && g_cbl_n)
             cbl_free(ctx);
     }
-    if ((address == g_dvd_open || address == g_dvd_path) && address && g_open_lines < 300) {
+    if ((address == g_dvd_open || address == g_dvd_path) && address && (g_debug || g_open_lines < 300)) {
         char path[96];
         u32 p = ctx->gpr[3];
         u32 n = 0;
@@ -1045,6 +1090,7 @@ int main(int argc, char** argv) {
             aspect_mode = g_settings.screen_shape;
             g_rain_style = g_settings.ps2_rain;
             g_screen_filters = g_settings.screen_filters;
+            g_specular = g_settings.specular;
             g_skip_all_intros = g_settings.skip_intros != 0;
             have_settings = true;
         }
@@ -1117,6 +1163,8 @@ int main(int argc, char** argv) {
             dump_audio = argv[++i];
         } else if (strcmp(argv[i], "--lod-log") == 0) {
             g_lod_log = true;
+        } else if (strcmp(argv[i], "--uis-trace") == 0) {
+            g_uis_trace = true;
         } else if (strcmp(argv[i], "--uis-log") == 0) {
             g_uis_log = true;
         } else if (strcmp(argv[i], "--replace") == 0 && i + 1 < argc) {

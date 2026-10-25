@@ -35,6 +35,7 @@ typedef struct {
     int ps2_rain;                      /* 1: rain drawn PS2-style (streaks, more drops, splashes), 0: as on GameCube */
     int screen_filters;                /* 1: the game's colour filters over the picture in matches, 0: off */
     int skip_intros;                   /* 1: boot straight to the title screen (intro movies fast-forwarded) */
+    int specular;                      /* highlights on lit models (graphics card only): 0 off (as on GameCube), 1 subtle, 2 accurate (PS2) */
 } Settings;
 
 extern Settings g_settings;

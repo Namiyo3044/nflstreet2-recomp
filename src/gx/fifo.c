@@ -228,11 +228,14 @@ static size_t parse_one(CPUState* cpu, const u8* p, size_t avail, bool in_dl) {
                 gx_xf_mem[addr] = v;
             else if (addr >= 0x1000u && addr < 0x1100u) {
                 /* Of the transform registers, the renderer's state snapshot
-                   only reads the texture coordinate count (0x103F); the rest
-                   (matrix indices, lighting, projection, ...) are read per
-                   vertex. Matrix index changes come before nearly every draw
-                   and mustn't force a fresh snapshot each time. */
-                if (addr == 0x103Fu && gx_xf_reg[0x3F] != v)
+                   only reads the texture coordinate count (0x103F) and, for
+                   the specular option, the colour count, channel 0's
+                   lighting and the projection type (0x1009, 0x100E,
+                   0x1026); the rest (matrix indices, lights, ...) are read
+                   per vertex. Matrix index changes come before nearly every
+                   draw and mustn't force a fresh snapshot each time. */
+                if ((addr == 0x103Fu || addr == 0x1009u || addr == 0x100Eu || addr == 0x1026u) &&
+                    gx_xf_reg[addr - 0x1000u] != v)
                     gx_state_serial++;
                 gx_xf_reg[addr - 0x1000u] = v;
             }

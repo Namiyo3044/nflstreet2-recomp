@@ -107,7 +107,7 @@ static void near_hide(CPUState* cpu, float scale) {
    rain 96 drops with splashes starting at alpha 100, except on one field
    (the field index at 0x8030E6E8 is 2: The Alley), where it cuts them to 10
    drops at alpha 20: the splashes then fail the alpha test (16) almost at
-   once and never show. With PS2-style rain on, the full settings are put
+   once and never show. With PS2/Xbox rain on, the full settings are put
    back there. */
 #define WEATHER_MODE 0x003ECC34u       /* r13 - 0x566C: 0 none, 1 snow, 2 rain */
 #define WEATHER_COUNT 0x003EB858u      /* r13 - 0x6A48: drops moved and drawn */
@@ -123,7 +123,7 @@ static void weather(CPUState* cpu) {
         wr(cpu, WEATHER_COUNT, 0x60u);
         cpu->ram[WEATHER_SPLASH_A] = 0x64u;
         cpu->ram[WEATHER_DROP_A] = 0x64u;
-        printf("rain: full rain settings put back (96 drops, splashes)\n");
+        printf("rain: full rain settings put back (splashes on)\n");
     }
     /* The fall speed (r13 - 0x5668, -0.3 a frame for rain): the PS2's rain
        falls a little faster. */
@@ -135,6 +135,40 @@ static void weather(CPUState* cpu) {
     }
 }
 
+/* Menu fonts kept loaded. The game's resource manager counts the users of
+   each font loaded from uis_font.dat (a 16-bit count per font) and frees a
+   font when the count drops to 0. In the port the big font's count keeps
+   drifting down (more releases than uses) during the credits roll, so it
+   reached 0 and was freed while the title and headings still used it, and
+   they popped in and out. While a font is loaded its count is kept at
+   least FONT_FLOOR, so it isn't freed by the drift; leaving a screen still
+   frees them all (that sets the counts to 0). All of uis_font.dat is
+   163 KB, within the manager's room for it.
+   Resource manager 1 (r13 - 0x6364); its table of file types at +0xC,
+   0x24 bytes each; type 2 is uis_font.dat (its name at +0xC); +0x1E the
+   number of fonts, +0x20 the fonts (8 bytes: count, state, -, data). */
+#define RES_MGR1 0x003EBF3Cu           /* 0x803F22A0 - 0x6364 */
+#define FONT_NAME 0x802EBE98u          /* "uis_font.dat" */
+#define FONT_FLOOR 64u
+static void font_pin(CPUState* cpu) {
+    u32 mgr = rd(cpu, RES_MGR1);
+    if (!ok(cpu, mgr, 0x10)) return;
+    u32 tab = rd(cpu, mgr - 0x80000000u + 0xC);
+    if (!ok(cpu, tab, 3 * 0x24)) return;
+    u32 e = tab - 0x80000000u + 2 * 0x24;
+    if (rd(cpu, e + 0xC) != FONT_NAME) return;
+    u32 items = rd(cpu, e + 0x20);
+    int n = (int16_t)(rd(cpu, e + 0x1C) & 0xFFFFu);
+    if (n <= 0 || n > 16 || !ok(cpu, items, (u32)n * 8)) return;
+    for (int i = 0; i < n; i++) {
+        u32 it = items - 0x80000000u + (u32)i * 8;
+        u32 count = rd(cpu, it) >> 16;
+        if (!rd(cpu, it + 4) || count == 0 || count >= FONT_FLOOR) continue;
+        cpu->ram[it] = (u8)(FONT_FLOOR >> 8);
+        cpu->ram[it + 1] = (u8)FONT_FLOOR;
+    }
+}
+
 bool lodfix_frame(CPUState* cpu) {
     if (!cpu || !cpu->ram || cpu->ram_size < 0x01800000u) return false;
     float aspect = asf(rd(cpu, CAMERA_ASPECT));
@@ -142,6 +176,7 @@ bool lodfix_frame(CPUState* cpu) {
     caps(cpu, scale);
     near_hide(cpu, scale);
     weather(cpu);
+    font_pin(cpu);
     u32 n = rd(cpu, REG_COUNT);
     if (n > 512) return false;
     for (u32 i = 0; i < n; i++) {

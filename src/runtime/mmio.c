@@ -5,6 +5,7 @@
 #include "gx/fifo.h"
 #include "runtime/disc.h"
 #include "runtime/pad.h"
+#include "runtime/credits.h"
 #include "runtime/interrupts.h"
 #include "audio/ax_hle.h"
 
@@ -82,6 +83,8 @@ static void set16(u32 off, u16 v) { reg_set(off, v, 2); }
 static u32 g_dsp_mail;
 static bool g_dsp_mail_valid;
 static u16 g_dsp_csr = DSP_CSR_HALT;
+static bool g_ar_busy;                 /* an ARAM transfer not yet reported finished */
+static u64 g_ar_done_at;
 
 /* Audio DMA: while running, each buffer of length*32 bytes (16-bit stereo at
    32 kHz, 4 bytes per sample) takes that long to play, and its end raises the
@@ -134,7 +137,19 @@ static void aram_dma(CPUState* cpu) {
     } else {
         memcpy(g_aram + ar, cpu->ram + mm, len);
     }
-    g_dsp_csr |= DSP_CSR_ARINT;
+    /* Like the disc, the transfer is reported finished a little later (as
+       on the console: ~50 us plus the bytes at ~64 MB/s), with the DMA
+       busy bit set until then. A new one finishes the previous at once. */
+    if (g_ar_busy) g_dsp_csr |= DSP_CSR_ARINT;
+    g_ar_busy = true;
+    g_ar_done_at = cpu->timebase + 2025u + (u64)len * 40500000ull / 64000000ull;
+}
+
+static void aram_dma_tick(CPUState* cpu) {
+    if (g_ar_busy && cpu->timebase >= g_ar_done_at) {
+        g_ar_busy = false;
+        g_dsp_csr |= DSP_CSR_ARINT;
+    }
 }
 
 static bool dsp_read(u32 off, u8 size, u32* out) {
@@ -156,7 +171,7 @@ static bool dsp_read(u32 off, u8 size, u32* out) {
         g_dsp_mail_valid = false;
         return true;
     case 0x0A: /* CSR: reset completes instantly, no DMA ever in progress */
-        *out = g_dsp_csr & ~(DSP_CSR_RES | 0x0200u | 0x0400u);
+        *out = (g_dsp_csr & ~(DSP_CSR_RES | 0x0200u | 0x0400u)) | (g_ar_busy ? 0x0200u : 0u);
         return true;
     case 0x16: /* ARAM refresh/ready: bit 0 set means ARAM is usable */
         *out = reg16(off) | 1u;
@@ -388,6 +403,9 @@ static bool di_interrupt_pending(void) {
 }
 
 static unsigned long long g_di_cmd_count[256];
+#define DI_DONE_TICKS 20250ull          /* 0.5 ms of the 40.5 MHz timebase */
+static u64 g_di_done_at;
+static bool g_di_busy;
 static u32 g_di_stream_log;
 
 static void di_execute(CPUState* cpu) {
@@ -416,6 +434,7 @@ static void di_execute(CPUState* cpu) {
             if (mar + n <= cpu->ram_size) {
                 disc_read(offset, cpu->ram + mar, n);
                 note_disc_read(mar, n, offset);
+                credits_on_disc_read(offset, cpu->ram + mar, n);
             }
             set16(DI_LENGTH, 0);
             reg_set(DI_LENGTH, 0, 4);
@@ -455,8 +474,23 @@ static void di_execute(CPUState* cpu) {
         break;
     }
     (void)len;
-    reg_set(DI_CR, cr & ~1u, 4);      /* transfer finished */
-    g_di_sr |= DI_SR_TCINT;
+    /* The data is there at once, but the drive reports it done a little
+       later, as a real one would: games that start a read and then note
+       that they are waiting for it expect to get there first. */
+    g_di_done_at = cpu->timebase + DI_DONE_TICKS;
+    g_di_busy = true;
+}
+
+void mmio_dma_tick(CPUState* cpu) {
+    aram_dma_tick(cpu);
+}
+
+void mmio_di_tick(CPUState* cpu) {
+    if (g_di_busy && cpu->timebase >= g_di_done_at) {
+        g_di_busy = false;
+        reg_set(DI_CR, reg_get(DI_CR, 4) & ~1u, 4);   /* transfer finished */
+        g_di_sr |= DI_SR_TCINT;
+    }
 }
 
 static bool di_read(u32 off, u8 size, u32* out) {
@@ -964,6 +998,8 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
 
 u64 mmio_next_event(void) {
     u64 a = g_ai_dma_on ? g_ai_dma_next : ~0ull, b = exi_next_event();
+    if (g_di_busy && g_di_done_at < a) a = g_di_done_at;
+    if (g_ar_busy && g_ar_done_at < a) a = g_ar_done_at;
     return a < b ? a : b;
 }
 

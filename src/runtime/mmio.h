@@ -49,6 +49,10 @@ void mmio_si_field(void);
 
 /* Audio DMA timing: raises the AI DMA interrupt as output buffers finish. */
 void mmio_ai_dma_tick(CPUState* cpu);
+/* Reports a disc transfer finished once its time has come. */
+void mmio_di_tick(CPUState* cpu);
+/* Reports an ARAM transfer finished once its time has come. */
+void mmio_dma_tick(CPUState* cpu);
 
 /* Where finished audio buffers go: `frames` stereo samples, 16-bit
    big-endian, right channel first, at `rate` Hz. NULL (default) = nowhere. */
