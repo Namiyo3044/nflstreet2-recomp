@@ -118,7 +118,7 @@ static void near_hide(CPUState* cpu, float scale) {
 extern int g_rain_style;
 
 static void weather(CPUState* cpu) {
-    if (!g_rain_style || rd(cpu, WEATHER_MODE) != 2u) return;
+    if (g_rain_style != 1 || rd(cpu, WEATHER_MODE) != 2u) return;
     if (rd(cpu, WEATHER_COUNT) == 10u && cpu->ram[WEATHER_SPLASH_A] == 0x14u && cpu->ram[WEATHER_DROP_A] == 0x14u) {
         wr(cpu, WEATHER_COUNT, 0x60u);
         cpu->ram[WEATHER_SPLASH_A] = 0x64u;

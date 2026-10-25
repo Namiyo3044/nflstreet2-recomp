@@ -44,7 +44,7 @@ bool settings_load(const char* path) {
         else if (strcmp(key, "custom_textures") == 0) s->custom_textures = atoi(val) != 0;
         else if (strcmp(key, "keyboard_player") == 0) s->keyboard_player = clampi(atoi(val), 1, 4) - 1;
         else if (strcmp(key, "nintendo_labels") == 0) s->nintendo_labels = atoi(val) != 0;
-        else if (strcmp(key, "ps2_rain") == 0) s->ps2_rain = atoi(val) != 0;
+        else if (strcmp(key, "ps2_rain") == 0) { int v = atoi(val); s->ps2_rain = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (strcmp(key, "screen_filters") == 0) s->screen_filters = atoi(val) != 0;
         else if (strcmp(key, "skip_intros") == 0) s->skip_intros = atoi(val) != 0;
         else if (strcmp(key, "specular") == 0) { int v = atoi(val); s->specular = v < 0 ? 0 : v > 2 ? 2 : v; }

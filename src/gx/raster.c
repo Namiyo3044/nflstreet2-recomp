@@ -2529,7 +2529,7 @@ static void emit_point(CmdList* l, u32 state, u32 a, u32 lp, u32 toffs) {
 #define RAIN_SPLASH_ALPHA 0.3f         /* the game's splashes, this opaque */
 #define RAIN_DROPS 36                  /* of each rain box's 96 drops, how many are drawn */
 #define RAIN_ALPHA 0.12f               /* a streak's opacity at its lower end */
-int g_rain_style = 1;                  /* 1: rain as on PS2 / Xbox (The Alley; settings) */
+int g_rain_style = 1;                  /* The Alley's rain: 0 as on GameCube, 1 as on PS2 / Xbox, 2 off (settings) */
 
 static u32 rain_state(CmdList* l, u32 state) {
     if (l->ns == l->cap_s) {
@@ -2875,7 +2875,10 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
         for (int i = 0; i < 256; i++) g_u8f[i] = (float)i / 255.0f;
     CmdList* l = &g_lists[g_rec];
     u32 state = list_state(l);
-    bool rain = (prim & 0xF8) == 0xA8 && g_rain_style && g_hud_match && !l->states[state].blend;
+    bool drop = (prim & 0xF8) == 0xA8 && g_hud_match && !l->states[state].blend;   /* a raindrop (a line) */
+    if (drop && g_rain_style == 2)
+        return;                        /* rain off */
+    bool rain = drop && g_rain_style == 1;
     if (rain) state = rain_state(l, state);
     /* The game draws its rain a box at a time (16 x 16 x 8, tiled over the
        camera's view, 0x801A7880) but stops after 22 boxes in a frame (the

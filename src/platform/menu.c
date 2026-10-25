@@ -232,11 +232,15 @@ const char* const k_recomp_label[MENU_RECOMP_ROWS] = {"The Alley Rain", "Screen 
                                                       "Specular Highlights", "Nintendo Buttons",
                                                       "Skip Intro Videos"};
 
-int menu_recomp_row_count(int row) { return row == RR_SPECULAR ? 3 : 2; }
+int menu_recomp_row_count(int row) { return row == RR_SPECULAR || row == RR_RAIN ? 3 : 2; }
+
+/* The rain row shows Off, GameCube, PS2/Xbox; the setting keeps 0 GameCube,
+   1 PS2/Xbox (its old meanings) and 2 off. */
+static const int k_rain_row[3] = {2, 0, 1};   /* row value -> setting */
 
 int menu_recomp_row_get(int row) {
     switch (row) {
-    case RR_RAIN: return g_settings.ps2_rain ? 1 : 0;
+    case RR_RAIN: return g_settings.ps2_rain == 2 ? 0 : g_settings.ps2_rain == 1 ? 2 : 1;
     case RR_FILTERS: return g_settings.screen_filters ? 1 : 0;
     case RR_TEXTURES: return g_settings.custom_textures ? 1 : 0;
     case RR_INTROS: return g_settings.skip_intros ? 1 : 0;
@@ -247,7 +251,11 @@ int menu_recomp_row_get(int row) {
 
 void menu_recomp_row_set(int row, int v) {
     switch (row) {
-    case RR_RAIN: g_settings.ps2_rain = v != 0; g_rain_style = g_settings.ps2_rain; g_changes |= 1u << MI_COUNT; break;
+    case RR_RAIN:
+        g_settings.ps2_rain = k_rain_row[v < 0 ? 0 : v > 2 ? 2 : v];
+        g_rain_style = g_settings.ps2_rain;
+        g_changes |= 1u << MI_COUNT;
+        break;
     case RR_FILTERS:
         g_settings.screen_filters = v != 0;
         g_screen_filters = g_settings.screen_filters;
@@ -278,7 +286,7 @@ bool menu_recomp_row_enabled(int row) {
 
 const char* menu_recomp_row_name(int row, int v) {
     switch (row) {
-    case RR_RAIN: return v ? "PS2/Xbox" : "GameCube";
+    case RR_RAIN: return v == 2 ? "PS2/Xbox" : v == 1 ? "GameCube" : "Off";
     case RR_FILTERS: case RR_INTROS: return v ? "On" : "Off";
     case RR_SPECULAR: return v == 2 ? "Accurate" : v == 1 ? "Subtle" : "Off";
     case RR_TEXTURES: return !g_info.textures_found ? "None Found" : v ? "On" : "Off";

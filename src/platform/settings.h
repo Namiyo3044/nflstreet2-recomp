@@ -32,7 +32,7 @@ typedef struct {
     int pad_bind[GCI_COUNT];
     int keyboard_player;               /* 0-3: the player the keyboard controls */
     int nintendo_labels;               /* 1: Nintendo-style controllers by their labels (A = A), 0: by position */
-    int ps2_rain;                      /* 1: rain drawn PS2-style (streaks, more drops, splashes), 0: as on GameCube */
+    int ps2_rain;                      /* The Alley's rain: 1 PS2 / Xbox (streaks, more drops, splashes), 0 as on GameCube, 2 off */
     int screen_filters;                /* 1: the game's colour filters over the picture in matches, 0: off */
     int skip_intros;                   /* 1: boot straight to the title screen (intro movies fast-forwarded) */
     int specular;                      /* highlights on lit models (graphics card only): 0 off (as on GameCube), 1 subtle, 2 accurate (PS2) */
