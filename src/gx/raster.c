@@ -719,6 +719,8 @@ static u32 g_wb;
 static int g_ovl_cur, g_ovl_prev;      /* pieces placed low and to the side, this / last frame */
 static u32 g_ovl_frame;
 #define HUD_OVERLAY 4                  /* that many: the play-calling screen is up */
+static int g_card_cur, g_card_prev;    /* play-card-sized panels this / last frame */
+#define HUD_CARDS 2                    /* that many: a play screen is up (Convert has two cards) */
 static int g_banner_cur, g_banner_prev;   /* a stadium-name banner seen this / last frame (its side) */
 static u32 g_banner_frame;
 #define HUD_SIDE_LOW 0.50f             /* below it, this far to one side (style point popups) */
@@ -995,7 +997,18 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
            button bars on both sides; its cards reach up into the popups'
            space, so while it is up only the panel row moves. Counted over
            this frame and the last. */
-        if (g_frames != g_ovl_frame) { g_ovl_prev = g_ovl_cur; g_ovl_cur = 0; g_ovl_frame = g_frames; }
+        if (g_frames != g_ovl_frame) {
+            g_ovl_prev = g_ovl_cur; g_ovl_cur = 0;
+            g_card_prev = g_card_cur; g_card_cur = 0;
+            g_ovl_frame = g_frames;
+        }
+        /* A play card: a big plain (untextured) panel, anywhere across the
+           screen. (The HUD's big messages, "1st Down", are textures with
+           room around the letters, as big; the cards' backgrounds are
+           plain.) */
+        if (!textured && v[0].mtx == 0 && n == 4 && mx - mn > 0.2f && mx - mn < 1.2f && yhi - ylo > 0.35f && yhi - ylo < 1.4f &&
+            g_card_cur < 1000)
+            g_card_cur++;
         /* (menu-system pieces only: single quads placed with matrix 0; a
            player's body parts aren't cards) */
         /* (nor the music ticker's box, drawn low on the left too, nor
@@ -1003,9 +1016,12 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
            and the turbo bar, up after a play just as the style point
            popups are; the play cards reach higher) */
         if (oy < -0.1f && fabsf(ou) > 0.4f && v[0].mtx == 0 && n == 4 && g_tick_seq != seq && yhi >= -0.55f &&
-            g_ovl_cur < 1000)
+            g_ovl_cur < 1000) {
             g_ovl_cur++;
-        if (oy < HUD_PANELS && (g_ovl_cur >= HUD_OVERLAY || g_ovl_prev >= HUD_OVERLAY)) side = 1e9f;
+        }
+        if (oy < HUD_PANELS && (g_ovl_cur >= HUD_OVERLAY || g_ovl_prev >= HUD_OVERLAY || g_card_cur >= HUD_CARDS ||
+                                g_card_prev >= HUD_CARDS))
+            side = 1e9f;
         /* A long bar in that row placed nearer the middle but lying mostly
            to one side (a stadium's name banner before the match): with
            its side, so the name stays inside it. */
