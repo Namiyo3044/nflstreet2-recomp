@@ -13,3 +13,5 @@ shot_*.bmp
 tex_*.bmp
 memdump-crash.bin
 drawlog*.txt
+hudlog*.txt
+play-join.txt
