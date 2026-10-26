@@ -1659,6 +1659,12 @@ static void menu_loop(CPUState* cpu) {
     printf("window: video menu closed\n");
 }
 
+/* Keeps the window answering the system (no "not responding") while the
+   game waits, e.g. for the other netplay player; the events stay queued. */
+void window_keep_alive(void) {
+    SDL_PumpEvents();
+}
+
 void window_field(CPUState* cpu) {
     g_field++;
     g_cpu_ref = cpu;

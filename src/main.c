@@ -9,6 +9,8 @@
 #include "runtime/dol.h"
 #include "runtime/hle_cpu.h"
 #include "runtime/hle_exceptions.h"
+#include "runtime/netsync.h"
+#include "runtime/netplay.h"
 #include "runtime/interrupts.h"
 #include "runtime/pad.h"
 #include "runtime/credits.h"
@@ -1046,7 +1048,10 @@ static void usage(const char* argv0) {
             "         [--window (play in a window at real-time speed)] [--scale N (window size, default 2)]\n"
             "         [--skip-thx (window: skip the THX intro movie)]\n"
             "         [--replace DIR (files there are read instead of the disc's, e.g. DIR/moviedat.dat)]\n"
-            "         [--memcard FILE (memory card image in slot A; created if missing)]\n"
+            "         [--memcard FILE (memory card image in slot A; created if missing)] [--memcard-readonly]\n"
+            "         [--record-input FILE | --play-input FILE (controller answers, for repeatable runs)]\n"
+            "         [--sync-log FILE [--sync-every FIELDS] (hashes of game memory, to compare runs)] [--rtc SECONDS]\n"
+            "         [--net-host [PORT] | --net-join ADDRESS[:PORT] (netplay; port 7120)] [--net-delay FIELDS]\n"
             "         [--text FILE (game text replacements, default text-replacements.txt) | --no-text]\n"
             "         [--ui-colors FILE (menu shape colours, default ui-colors.txt) | --no-ui-colors]\n"
             "         [--aspect auto|4:3|16:9 (screen shape; auto follows the game's widescreen option)]\n"
@@ -1055,6 +1060,19 @@ static void usage(const char* argv0) {
             "         [--textures DIR (custom textures, Dolphin format)] [--dump-textures DIR]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
+}
+
+/* A hash of a file's contents (0 if missing): settings files both netplay
+   players must have the same. */
+static unsigned file_hash(const char* path) {
+    if (!path) return 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    unsigned h = 2166136261u;
+    int c;
+    while ((c = fgetc(f)) != EOF) h = (h ^ (unsigned)c) * 16777619u;
+    fclose(f);
+    return h;
 }
 
 int main(int argc, char** argv) {
@@ -1072,6 +1090,13 @@ int main(int argc, char** argv) {
     bool have_settings = false;
     bool idle_skip = true;
     const char* memcard_path = NULL;
+    const char* record_input = NULL;   /* netsync: repeatable runs */
+    const char* play_input = NULL;
+    const char* sync_log = NULL;
+    unsigned sync_every = 60;
+    bool net_host = false;             /* netplay */
+    const char* net_join = NULL;
+    int net_port = 0, net_delay = 3;
     const char* text_path = "text-replacements.txt";
     const char* colors_path = "ui-colors.txt";
     bool skip_hash = false;
@@ -1118,6 +1143,25 @@ int main(int argc, char** argv) {
             colors_path = NULL;
         } else if (strcmp(argv[i], "--memcard") == 0 && i + 1 < argc) {
             memcard_path = argv[++i];
+        } else if (strcmp(argv[i], "--memcard-readonly") == 0) {
+            exi_set_memcard_readonly(true);
+        } else if (strcmp(argv[i], "--rtc") == 0 && i + 1 < argc) {
+            netsync_set_rtc((u32)strtoul(argv[++i], NULL, 10));
+        } else if (strcmp(argv[i], "--record-input") == 0 && i + 1 < argc) {
+            record_input = argv[++i];
+        } else if (strcmp(argv[i], "--play-input") == 0 && i + 1 < argc) {
+            play_input = argv[++i];
+        } else if (strcmp(argv[i], "--sync-log") == 0 && i + 1 < argc) {
+            sync_log = argv[++i];
+        } else if (strcmp(argv[i], "--net-host") == 0) {
+            net_host = true;
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') net_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--net-join") == 0 && i + 1 < argc) {
+            net_join = argv[++i];
+        } else if (strcmp(argv[i], "--net-delay") == 0 && i + 1 < argc) {
+            net_delay = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--sync-every") == 0 && i + 1 < argc) {
+            sync_every = (unsigned)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--skip-thx") == 0) {
             g_skip_intros = true;
         } else if (strcmp(argv[i], "--no-idle-skip") == 0) {
@@ -1217,6 +1261,40 @@ int main(int argc, char** argv) {
     gx_raster_config_xfb(xfb_every);
     if (draw_log)
         gx_raster_render_all();        /* logged frames must be drawn */
+    if (net_host || net_join) {
+        /* (Before the window opens: waiting for the other player would
+           leave it not responding.)
+           The settings that change the game have to match (else the two
+           games part); the host's clock and memory card are used by both. */
+        char fp[512];
+        snprintf(fp, sizeof fp, "shape=%d rain=%d intros=%d thx=%d text=%08x colors=%08x idle=%d",
+                 aspect_mode, g_rain_style, g_skip_all_intros ? 1 : 0, g_skip_intros ? 1 : 0, file_hash(text_path),
+                 file_hash(colors_path), idle_skip ? 1 : 0);
+        for (char* p = fp; *p; p++) if (*p == ' ' && p[1] == ' ') *p = '_';
+        if (net_host) {
+            if (memcard_path) {
+                FILE* f = fopen(memcard_path, "rb");
+                if (f) {
+                    fseek(f, 0, SEEK_END);
+                    long n = ftell(f);
+                    fseek(f, 0, SEEK_SET);
+                    u8* d = n > 0 ? (u8*)malloc((size_t)n) : NULL;
+                    if (d && fread(d, 1, (size_t)n, f) == (size_t)n) netplay_set_card(d, (u32)n);
+                    free(d);
+                    fclose(f);
+                }
+            }
+            if (!netplay_host(net_port, net_delay, fp)) return 1;
+        } else {
+            if (!netplay_join(net_join, net_delay, fp)) return 1;
+            u32 n = 0;
+            const u8* d = netplay_card(&n);
+            memcard_path = NULL;       /* the host's card instead of this PC's */
+            if (d && !exi_insert_memcard_data(0, d, n, "the host's memory card"))
+                fprintf(stderr, "warning: the host's memory card couldn't be used\n");
+        }
+        pad_set_connected(1, true);
+    }
     if (want_window) {
 #ifdef NFLS2_HAVE_WINDOW
         window_set_aspect_mode(aspect_mode);
@@ -1226,6 +1304,7 @@ int main(int argc, char** argv) {
             return 1;
         gx_raster_render_all();
         interrupts_set_field_callback(window_field);
+        netplay_set_idle(window_keep_alive);
         if (!max_steps_given)
             max_steps = ~0ull;         /* play until the window is closed */
 #else
@@ -1253,6 +1332,12 @@ int main(int argc, char** argv) {
     mmio_install(&cpu);
     if (memcard_path && !exi_insert_memcard(0, memcard_path))
         fprintf(stderr, "warning: running without a memory card\n");
+    if (play_input && !netsync_play(play_input))
+        return 1;
+    if (record_input && !play_input && !netsync_record(record_input))
+        return 1;
+    if (sync_log)
+        netsync_log_open(sync_log, sync_every);
 
     u32 entry = dol_load(&cpu, disc_dir, skip_hash);
     if (!entry)
@@ -1422,6 +1507,8 @@ int main(int argc, char** argv) {
     printf("\n");
     hle_exceptions_report();
     interrupts_report();
+    netsync_report();
+    netplay_report();
     gx_fifo_report();
     gx_raster_report();
     disc_report();

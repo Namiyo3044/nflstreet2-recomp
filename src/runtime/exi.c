@@ -1,4 +1,5 @@
 #include "runtime/exi.h"
+#include "runtime/netsync.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,8 +81,11 @@ static u32 card_address(const Card* c) {
            (c->args[3] & 0x7Fu);
 }
 
+static bool g_card_readonly;
+void exi_set_memcard_readonly(bool on) { g_card_readonly = on; }
+
 static void card_save(Card* c, u32 offset, u32 bytes) {
-    if (!c->file)
+    if (!c->file || g_card_readonly)   /* read-only: saves stay in memory for this run */
         return;
     if (fseek(c->file, (long)offset, SEEK_SET) != 0 || fwrite(c->data + offset, 1, bytes, c->file) != bytes)
         fprintf(stderr, "memory card: couldn't write %s\n", c->path);
@@ -141,6 +145,25 @@ bool exi_insert_memcard(int slot, const char* path) {
     c->status = 0x41;
     c->present = true;
     printf("memory card: slot %c = %s (%u blocks)\n", 'A' + slot, path, size / SECTOR_SIZE - 5);
+    return true;
+}
+
+bool exi_insert_memcard_data(int slot, const u8* data, u32 size, const char* name) {
+    if (slot < 0 || slot > 1 || !data) return false;
+    u32 mbit = (u32)((unsigned long long)size * 8u / (1024u * 1024u));
+    if (!(mbit == 4 || mbit == 8 || mbit == 16 || mbit == 32 || mbit == 64 || mbit == 128)) return false;
+    Card* c = &g_card[slot];
+    memset(c, 0, sizeof(*c));
+    snprintf(c->path, sizeof(c->path), "%s", name);
+    c->data = (u8*)malloc(size);
+    if (!c->data) return false;
+    memcpy(c->data, data, size);
+    c->file = NULL;                    /* kept in memory only */
+    c->size = size;
+    c->id = mbit;
+    c->status = 0x41;
+    c->present = true;
+    printf("memory card: slot %c = %s (%u blocks, in memory only)\n", 'A' + slot, name, size / SECTOR_SIZE - 5);
     return true;
 }
 
@@ -252,7 +275,7 @@ static void sram_init(void) {
 
 /* Seconds since 2000-01-01, the GameCube RTC epoch. */
 static u32 rtc_now(void) {
-    return (u32)(time(NULL) - 946684800);
+    return netsync_rtc((u32)(time(NULL) - 946684800));
 }
 
 static u8 ipl_byte(u8 in) {

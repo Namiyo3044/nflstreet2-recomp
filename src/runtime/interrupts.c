@@ -11,6 +11,8 @@
 #include "runtime/interrupts.h"
 #include "runtime/mmio.h"
 #include "runtime/exi.h"
+#include "runtime/netsync.h"
+#include "runtime/netplay.h"
 #include "gx/raster.h"
 
 #include <stdio.h>
@@ -90,6 +92,7 @@ void interrupts_poll(CPUState* cpu) {
        enables (DI1 at the top of the frame, DI0 at the field boundary). */
     while (cpu->timebase >= g_next_field) {
         g_next_field += FIELD_TICKS;
+        netplay_field(cpu, g_fields + 1);   /* netplay: both players' controllers for this field */
         mmio_vi_raise(g_field ? 0u : 1u);
         mmio_si_field();
         mmio_pe_field();
@@ -98,6 +101,7 @@ void interrupts_poll(CPUState* cpu) {
         gx_raster_xfb_field(cpu, g_fields, mmio_reg(0x201C, 4), mmio_reg(0x2048, 2), mmio_reg(0x2000, 2));
         if (g_field_cb)
             g_field_cb(cpu);
+        netsync_field(cpu, g_fields);
     }
 
     mmio_ai_dma_tick(cpu);

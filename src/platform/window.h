@@ -44,6 +44,8 @@ void window_set_audio_dump(const char* path);
 void window_trust_screen_shape(void);
 
 /* Once per video field: present the frame, read input, wait for real time. */
+/* Keeps the window answering the system while the game waits. */
+void window_keep_alive(void);
 void window_field(CPUState* cpu);
 
 /* True once the user has closed the window or pressed Esc. */

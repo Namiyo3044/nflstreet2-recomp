@@ -1,4 +1,6 @@
 #include "pad.h"
+#include "runtime/netsync.h"
+#include "runtime/netplay.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,7 +41,14 @@ void pad_set_connected(int port, bool connected) {
 }
 
 bool pad_connected(int port) {
-    return port >= 0 && port < PAD_PORTS && g_connected[port];
+    bool net;
+    if (netplay_connected(port, &net)) return net;   /* netplay: ports 1 and 2 */
+    /* (what the game is told: recorded, or replaced in playback) */
+    return netsync_connected(port, port >= 0 && port < PAD_PORTS && g_connected[port]);
+}
+
+void pad_get_live(int port, PadLive* out) {
+    *out = g_lives[port >= 0 && port < PAD_PORTS ? port : 0];
 }
 
 typedef struct { double at, hold; uint32_t bits; int state; } Press;
@@ -105,8 +114,9 @@ void pad_poll_response(int port, double t, uint8_t out[8]) {
     /* START down for 0.1 s in every 0.25 s, so the game sees fresh presses. */
     if (g_skip_taps && port == 0 && t - 0.25 * (double)(long long)(t / 0.25) < 0.1)
         held |= PAD_START;
-    const PadLive g_live = g_lives[port >= 0 && port < PAD_PORTS ? port : 0];
-    for (int i = 0; i < g_count && port == 0; i++) {
+    PadLive g_live = g_lives[port >= 0 && port < PAD_PORTS ? port : 0];
+    bool net = netplay_pad(port, &g_live);   /* netplay: both players' controllers, in step */
+    for (int i = 0; i < g_count && port == 0 && !net; i++) {
         Press* pr = &g_presses[i];
         bool down = t >= pr->at && t < pr->at + pr->hold;
         if (down)
@@ -132,6 +142,7 @@ void pad_poll_response(int port, double t, uint8_t out[8]) {
     /* analog triggers: scripted presses push them fully */
     out[6] = held & BTN_L ? 0xFF : g_live.trigger_l;
     out[7] = held & BTN_R ? 0xFF : g_live.trigger_r;
+    netsync_poll(port, out);   /* recorded, or replaced in playback */
 }
 
 const char* pad_button_names(void) {

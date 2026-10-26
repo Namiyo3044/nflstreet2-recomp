@@ -101,6 +101,8 @@ add_executable(nfls2
     src/runtime/uicolors.c
     src/runtime/lodfix.c
     src/runtime/credits.c
+    src/runtime/netsync.c
+    src/runtime/netplay.c
     src/runtime/uismenu.c
     src/runtime/interrupts.c
     src/runtime/mmio.c
@@ -117,6 +119,9 @@ if(NFLS2_WINDOW)
     else()
         target_link_libraries(nfls2 PRIVATE SDL3::SDL3)
     endif()
+endif()
+if(WIN32)
+    target_link_libraries(nfls2 PRIVATE ws2_32)   # netplay sockets
 endif()
 if(NOT WIN32)
     find_package(Threads REQUIRED)

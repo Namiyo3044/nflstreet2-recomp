@@ -18,6 +18,14 @@
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
 #   .\play.ps1 -ShowTHX        (keep the THX intro; it is skipped by default)
 #   .\play.ps1 -Aspect 16:9    (screen shape for this run: 4:3 or 16:9)
+#   .\play.ps1 -Record         (netplay groundwork: record every controller input to C:\nfls2\netsync\input.rec, with
+#                               a sync log of game memory; the memory card isn't written to)
+#   .\play.ps1 -Replay         (play that recording back, write a second sync log and compare the two)
+#   .\play.ps1 -NetHost        (netplay: wait for another player to join; you are player 1. -NetPort N, default 7120)
+#   .\play.ps1 -Join 1.2.3.4   (netplay: join a host at that address; you are player 2. Log in play-join.txt)
+#                               -NetDelay N: fields of input delay (default 3; more for a distant connection).
+#                               Both players need the same settings that change the game (screen shape, rain,
+#                               Skip Intro Videos, text-replacements.txt, ui-colors.txt); the host's memory card is used.
 #
 # Keyboard (the defaults; change them in the F1 menu under Controls): arrows = stick, X = A, Z = B, C = X, S = Y, D = Z, Q / W = L / R,
 #           Enter = START, I J K L = C-stick, T F G H = D-pad
@@ -48,6 +56,12 @@ param(
     [switch]$UisTrace,
     [switch]$LodLog,
     [switch]$CardTrace,
+    [switch]$Record,
+    [switch]$Replay,
+    [switch]$NetHost,
+    [string]$Join = "",
+    [int]$NetPort = 7120,
+    [int]$NetDelay = 3,
     [string[]]$Press = @(),
     [string]$Disc = "C:\nfls2\disc",
     [string]$Map = "C:\nfls2\symbols\main.map"
@@ -93,8 +107,13 @@ if (-not (Get-Command cmake -ErrorAction SilentlyContinue) -or $env:VSCMD_ARG_TG
     }
 }
 
-cmake --build build
-if ($LASTEXITCODE -ne 0) { Write-Host "Build failed." -ForegroundColor Red; exit 1 }
+if (Get-Process nfls2 -ErrorAction SilentlyContinue) {
+    # (a second copy, e.g. both netplay players on one PC: the running game can't be rebuilt)
+    Write-Host "The game is already running: using the build as it is."
+} else {
+    cmake --build build
+    if ($LASTEXITCODE -ne 0) { Write-Host "Build failed." -ForegroundColor Red; exit 1 }
+}
 
 New-Item -ItemType Directory -Force -Path (Split-Path $Settings) | Out-Null
 $gameArgs = @($Disc, "--map", $Map, "--quiet", "--window", "--dump-every", "0", "--settings", $Settings)
@@ -128,16 +147,38 @@ if (-not $NoMemCard) {
     $gameArgs += @("--memcard", $MemCard)
 }
 
+$netDir = "C:\nfls2\netsync"
+if ($Record -or $Replay) {
+    New-Item -ItemType Directory -Force -Path $netDir | Out-Null
+    $gameArgs += @("--memcard-readonly")
+    if ($Replay) {
+        $gameArgs += @("--play-input", "$netDir\input.rec", "--sync-log", "$netDir\sync-replay.txt")
+    } else {
+        $gameArgs += @("--record-input", "$netDir\input.rec", "--sync-log", "$netDir\sync-record.txt")
+    }
+}
+
+$logFile = "play.txt"
+if ($NetHost) {
+    $gameArgs += @("--net-host", $NetPort, "--net-delay", $NetDelay)
+    Write-Host "Netplay: waiting for the other player on port $NetPort..."
+} elseif ($Join -ne "") {
+    $addr = if ($Join.Contains(":")) { $Join } else { "${Join}:$NetPort" }
+    $gameArgs += @("--net-join", $addr, "--net-delay", $NetDelay)
+    $logFile = "play-join.txt"
+    Write-Host "Netplay: joining $addr..."
+}
+
 Write-Host "Starting the game window... (Esc to quit)"
-& .\build\nfls2.exe @gameArgs *> play.txt
+& .\build\nfls2.exe @gameArgs *> $logFile
 # Copy the end-of-run report (where the game stopped and why) to the clipboard.
-$log = Get-Content play.txt
+$log = Get-Content $logFile
 $start = ($log | Select-String -Pattern "^=== stopped" | Select-Object -Last 1).LineNumber
 if ($start) { $report = $log[($start - 1)..($log.Count - 1)] } else { $report = $log | Select-Object -Last 80 }
 # Slow stretches (the window logs a perf line each second the game runs below full speed).
 $perf = @($log | Select-String -Pattern "^perf:|^audio:|^hitch:" | ForEach-Object { $_.Line })
 $gpuLines = @($log | Select-String -Pattern "^gpu:|^custom textures:" | ForEach-Object { $_.Line })
-$startup = @($log | Select-String -Pattern "^startup:|^disc: replacement|^movie:|^window: player|^window: controller|^window: wrote memdump|^uis:|^lod:|^rain:|^credits:|^ui colors:|^window: game.s screen option" | ForEach-Object { $_.Line })
+$startup = @($log | Select-String -Pattern "^netplay:|^netsync:|^startup:|^disc: replacement|^movie:|^window: player|^window: controller|^window: wrote memdump|^uis:|^lod:|^rain:|^credits:|^ui colors:|^window: game.s screen option" | ForEach-Object { $_.Line })
 $cbl = @($log | Select-String -Pattern "cblist:" | ForEach-Object { $_.Line })
 $txt = @($log | Select-String -Pattern "^text:|^textcall:" | ForEach-Object { $_.Line })
 $ct = @($log | Select-String -Pattern "^cardtrace:" | ForEach-Object { $_.Line })
@@ -150,4 +191,8 @@ if ($perf.Count -gt 0) { $report = @("slow seconds and hitches: $($perf.Count) l
 if ($startup.Count -gt 0) { $report = $startup + $report }
 if ($gpuLines.Count -gt 0) { $report = ($gpuLines | Select-Object -First 30) + $report }
 $report -join "`r`n" | Set-Clipboard
-Write-Host "Game closed. Report copied to the clipboard (full log: play.txt)" -ForegroundColor Green
+Write-Host "Game closed. Report copied to the clipboard (full log: $logFile)" -ForegroundColor Green
+
+if ($Replay -and (Test-Path "$netDir\sync-record.txt") -and (Test-Path "$netDir\sync-replay.txt")) {
+    & "$PSScriptRoot\tools\synccompare.ps1" "$netDir\sync-record.txt" "$netDir\sync-replay.txt"
+}

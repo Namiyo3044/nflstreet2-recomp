@@ -28,6 +28,9 @@ enum {
 /* Sets a port's live state (called by the window once per video field). */
 void pad_set_live(int port, const PadLive* live);
 
+/* A port's live state as the window last set it (netplay sends it). */
+void pad_get_live(int port, PadLive* out);
+
 /* Whether a controller is plugged into the port (at the start only port 1). */
 void pad_set_connected(int port, bool connected);
 bool pad_connected(int port);
