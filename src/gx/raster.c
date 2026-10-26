@@ -752,6 +752,7 @@ static float g_band_cur = 9.0f, g_band_prev = 9.0f;   /* the stadium banner's lo
 #define HUD_CARDS 2                    /* that many: a play screen is up (Convert has two cards) */
 static u32 g_banner_frame;
 #define HUD_SIDE_LOW 0.50f             /* below it, this far to one side (style point popups) */
+#define HUD_POPUP_LOW 0.30f            /* and no lower than this (players' names are) */
 static volatile int g_hud_match;       /* a match is on (set from the game thread) */
 void gx_raster_set_match(bool on) { g_hud_match = on; }
 
@@ -1029,6 +1030,9 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
            (the big messages' banner, sliding in from a side) or anything
            across the middle stays where the game puts it. */
         if (oy < HUD_PANELS && (!textured || (mn < 0.0f && mx > 0.0f))) side = 1e9f;
+        /* The popups stack down from 0.57 (0.55, 0.45, ...); a player's name,
+           placed by the player and lower down, goes with the player. */
+        if (oy < HUD_POPUP_LOW) side = 1e9f;
         /* The play-calling screen fills the lower half with play cards and
            button bars on both sides; its cards reach up into the popups'
            space, so while it is up only the panel row moves. Counted over
