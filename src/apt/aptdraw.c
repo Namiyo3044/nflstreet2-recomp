@@ -93,9 +93,7 @@ static Font* font_named(const char* name) {
 static const Glyph* glyph(Font* f, unsigned char c) {
     if (f->g[c].have) return &f->g[c];
     if (c >= 'a' && c <= 'z' && f->g[c - 32].have) return &f->g[c - 32];
-    if (f->g['?'].have) return &f->g['?'];
-    if (f->g[' '].have) return &f->g[' '];
-    return NULL;
+    return NULL;                         /* (not in this font: left out) */
 }
 static int kern_of(Font* f, unsigned char a, unsigned char b) {
     for (int i = 0; i < f->nkern; i++) if (f->kern[i].a == a && f->kern[i].b == b) return f->kern[i].amt;
@@ -469,22 +467,101 @@ static void draw_glyphs(Target* t, Font* f, float x, float y, const char* s, siz
     }
 }
 
-static void draw_text(Draw* dr, Target* t, Obj* o, const float* M, const CX* cx) {
-    VM* vm = dr->vm;
-    DispExt* d = o->d;
-    const char* txt = d->text ? d->text->s : "";
-    if (d->var && d->parent) {
-        Val v = vm_lookup_var(vm, d->parent, d->var);
-        if (v.t != V_UNDEF) txt = v_cstr(vm, v);
+/* the text as the fonts' codes: UTF-8 pairs (as in some of the movies' strings) to one byte */
+static char* to_latin1(const char* s) {
+    size_t n = strlen(s);
+    char* o = (char*)malloc(n + 1);
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c == 0xC2 || c == 0xC3) && i + 1 < n && ((unsigned char)s[i + 1] & 0xC0) == 0x80) {
+            o[k++] = (char)(((c & 0x1F) << 6) | ((unsigned char)s[i + 1] & 0x3F));
+            i++;
+        } else o[k++] = (char)c;
     }
-    if (!txt[0] || !strcmp(txt, "undefined") || !strcmp(txt, "false") || !strcmp(txt, "null") || !strcmp(txt, "NaN")) return;
+    o[k] = 0;
+    return o;
+}
+
+static Font* font_of(VM* vm, DispExt* d) {
     const char* fname = "STREET_BodyFont";
     if (d->font) {
         AptFile* of = NULL; int oc = 0;
         AptChar* fc = vm_resolve_char(vm, d->file, d->font, &of, &oc);
         if (fc && fc->type == CH_FONT && fc->fontname) fname = fc->fontname;
     }
-    Font* fnt = font_named(fname);
+    return font_named(fname);
+}
+
+/* lines of a text: wrapped at `width` (if wrap) and at line breaks; fn gets each */
+typedef void (*LineFn)(void* u, int index, const char* s, size_t n, float w);
+static int layout(Font* fnt, const char* txt, float scale, float width, bool wrap, LineFn fn, void* u) {
+    int index = 0;
+    const char* p = txt;
+    for (;;) {
+        const char* e = p;
+        while (*e && *e != '\n' && *e != '\r') e++;
+        const char* ls = p;
+        for (;;) {
+            const char* le = e;
+            if (wrap) {
+                const char* best = NULL;
+                const char* q = ls;
+                while (q <= e) {
+                    const char* sp = q;
+                    while (sp < e && *sp != ' ') sp++;
+                    if (best && text_width(fnt, ls, (size_t)(sp - ls), scale) > width) break;
+                    best = sp;
+                    if (sp >= e) break;
+                    q = sp + 1;
+                }
+                le = best ? best : e;
+            }
+            if (fn) fn(u, index, ls, (size_t)(le - ls), text_width(fnt, ls, (size_t)(le - ls), scale));
+            index++;
+            if (le >= e) break;
+            ls = le + 1;
+        }
+        if (!*e) break;
+        p = e + 1;
+    }
+    return index;
+}
+
+static void widest(void* u, int index, const char* s, size_t n, float w) { (void)index; (void)s; (void)n; if (w > *(float*)u) *(float*)u = w; }
+
+/* a text field's text size in its own units (textWidth / textHeight) */
+void aptdraw_text_size(VM* vm, Obj* o, float* w, float* h) {
+    DispExt* d = o->d;
+    *w = *h = 0;
+    Font* fnt = font_of(vm, d);
+    if (!fnt || !d->text || !d->text->len) return;
+    char* txt = to_latin1(d->text->s);
+    float scale = d->height / (float)fnt->height;
+    float wmax = 0;
+    int n = layout(fnt, txt, scale, d->rect[2] - d->rect[0] - 4, d->wordwrap || d->multiline, widest, &wmax);
+    free(txt);
+    *w = wmax;
+    *h = n * fnt->height * scale;
+}
+
+typedef struct { Target* t; Font* fnt; float lx, rx, width, y, lh, sx, scale; int align; uint32_t col; } TextDraw;
+static void draw_line(void* u, int index, const char* s, size_t n, float w) {
+    TextDraw* td = (TextDraw*)u;
+    float x = td->align == 2 ? td->lx + (td->width - w) / 2 : td->align == 1 ? td->rx - w - 2 * td->sx : td->lx + 2 * td->sx;
+    draw_glyphs(td->t, td->fnt, x, td->y + index * td->lh, s, n, td->scale, td->col);
+}
+
+static void draw_text(Draw* dr, Target* t, Obj* o, const float* M, const CX* cx) {
+    VM* vm = dr->vm;
+    DispExt* d = o->d;
+    const char* src = d->text ? d->text->s : "";
+    if (d->var && d->parent) {
+        Val v = vm_lookup_var(vm, d->parent, d->var);
+        if (v.t != V_UNDEF) src = v_cstr(vm, v);
+    }
+    if (!src[0] || !strcmp(src, "undefined") || !strcmp(src, "false") || !strcmp(src, "null") || !strcmp(src, "NaN")) return;
+    Font* fnt = font_of(vm, d);
     if (!fnt) return;
     float sy = sqrtf(M[2] * M[2] + M[3] * M[3]), sx = sqrtf(M[0] * M[0] + M[1] * M[1]);
     float scale = d->height / (float)fnt->height * sy;
@@ -497,41 +574,10 @@ static void draw_text(Draw* dr, Target* t, Obj* o, const float* M, const CX* cx)
     apply(M, d->rect[2], d->rect[3], &rx, &by);
     float width = rx - lx;
     if (width < 1) width = 1;
-    float lh = fnt->height * scale;
-    float y = ty + 2 * sy;
-    bool wrap = d->wordwrap || d->multiline;
-    const char* p = txt;
-    for (;;) {
-        const char* e = p;
-        while (*e && *e != '\n' && *e != '\r') e++;
-        /* one paragraph [p, e) */
-        const char* ls = p;
-        while (1) {
-            const char* le = e;
-            if (wrap) {
-                /* the longest run of words that fits */
-                const char* best = NULL;
-                const char* q = ls;
-                while (q <= e) {
-                    const char* sp = q;
-                    while (sp < e && *sp != ' ') sp++;
-                    if (best && text_width(fnt, ls, (size_t)(sp - ls), scale) > width - 4 * sy) break;
-                    best = sp;
-                    if (sp >= e) break;
-                    q = sp + 1;
-                }
-                le = best ? best : e;
-            }
-            float w = text_width(fnt, ls, (size_t)(le - ls), scale);
-            float x = d->align == 2 ? lx + (width - w) / 2 : d->align == 1 ? rx - w - 2 * sx : lx + 2 * sx;
-            draw_glyphs(t, fnt, x, y, ls, (size_t)(le - ls), scale, col);
-            y += lh;
-            if (le >= e) break;
-            ls = le + 1;
-        }
-        if (!*e) break;
-        p = e + 1;
-    }
+    char* txt = to_latin1(src);
+    TextDraw td = {t, fnt, lx, rx, width, ty + 2 * sy, fnt->height * scale, sx, scale, d->align, col};
+    layout(fnt, txt, scale, width - 4 * sy, d->wordwrap || d->multiline, draw_line, &td);
+    free(txt);
 }
 
 static void draw_obj(Draw* dr, Target* t, Obj* o, const float* PM, const CX* pcx);

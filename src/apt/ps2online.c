@@ -23,6 +23,11 @@ static const struct { const char* name; const char* dat; int idx; } k_shell[] = 
 static const char* const k_sonlogin[] = {"EmptyScreen", "PreMenuAnim", "TCLGN002", "TCLGN003", "TCLGN004", "TCLGN005", "TCLGN007",
                                          "TCLGN008", "TCLGN009", "TCLGN011", "TCLGN012", "TCLGN042", NULL};
 static const char* const k_sonmenu[] = {"TCMNU001", "TCPRM001", "TCPRM003", "TCPRM004", NULL};
+/* screens found in the other packs by their own scripts' names */
+static const struct { const char* name; const char* dat; int idx; } k_screens[] = {
+    {"TCGEN043", "SONGENRL", 4}, {"TCGEN044", "SONGENRL", 5}, {"TCPLN001", "SONGENRL", 6}, {"TCPLN002", "SONGENRL", 7},
+    {"TCCHT001", "SONLOBBY", 3}, {"TCCHT006", "SONLOBBY", 4}, {"TCCHT010", "SONLOBBY", 5}, {"TCSET007", "SONSETTG", 0},
+};
 static const struct { const char* name; int idx; } k_libs[] = {{"eaStd", 4}, {"eaExt", 0}, {"eaSku", 3}, {"eaOnline", 2}, {"eaGame", 1}};
 
 typedef struct { char dat[16]; int idx; AptFile* f; } Loaded;
@@ -35,6 +40,7 @@ static struct {
     Loaded files[96]; int nfiles;
     const char* lib_names[5]; AptFile* libs[5];
     int ticks;
+    char flow[48];                     /* the last flow the screens asked to change to (once) */
     void (*log)(const char* msg);
     /* the message being sent (Msg.Start .. Msg.End) */
     char msg_id[96];
@@ -87,6 +93,8 @@ static AptFile* resolve_movie(VM* vm, const char* url) {
     }
     for (int i = 0; k_sonlogin[i]; i++) if (!strcmp(k_sonlogin[i], base)) return movie("SONLOGIN", i);
     for (int i = 0; k_sonmenu[i]; i++) if (!strcmp(k_sonmenu[i], base)) return movie("SONMENU", i);
+    for (size_t i = 0; i < sizeof k_screens / sizeof k_screens[0]; i++)
+        if (!strcmp(k_screens[i].name, base)) return movie(k_screens[i].dat, k_screens[i].idx);
     return NULL;
 }
 
@@ -190,7 +198,14 @@ static Val msg_end(VM* vm, Val self, int argc, Val* argv, void* data) {
     int nf = argc > 0 ? argc - 1 : 0;
     if (!nf) {
         Val r = sample_single(vm, g.msg_id);
-        vm_logf(vm, "MSG %s -> %s", g.msg_id, v_cstr(vm, r));
+        char a[160]; size_t n = 0; a[0] = 0;
+        for (int i = 0; i < g.msg_nargs && i < 4 && n < 120; i++)
+            n += (size_t)snprintf(a + n, sizeof a - n, "%s%.30s", i ? ", " : "", g.msg_args[i].t == V_OBJ ? "[obj]" : v_cstr(vm, g.msg_args[i]));
+        vm_logf(vm, "MSG %s(%s) -> %s", g.msg_id, a, v_cstr(vm, r));
+        if (!strcmp(g.msg_id, "MsgFlowScriptChangeFlow") && g.msg_nargs) {
+            snprintf(g.flow, sizeof g.flow, "%s", v_cstr(vm, g.msg_args[0]));
+            vm_logf(vm, "the screens change to flow %s", g.flow);
+        }
         return r;
     }
     Obj* o = obj_new(vm, vm->object_proto);
@@ -222,24 +237,18 @@ static void go_online(VM* vm) {
     vm_call_method(vm, fg, "SetConnectionStatus", 1, &t);
 }
 
-bool ps2o_files_present(const char* dir) {
+const char* ps2o_missing_file(const char* dir) {
+    static char name[32];
     for (int i = 0; k_required[i]; i++) {
         char path[640];
         snprintf(path, sizeof path, "%s/%s.DAT", dir, k_required[i]);
         FILE* f = fopen(path, "rb");
-        if (!f) return false;
+        if (!f) { snprintf(name, sizeof name, "%s.DAT", k_required[i]); return name; }
         fclose(f);
     }
-    return true;
+    return NULL;
 }
-
-static void show_screen(const char* url) {
-    VM* vm = g.vm;
-    Val mf = obj_get(vm, vm->glob, "MasterFlow");
-    if (mf.t != V_OBJ) { vm_logf(vm, "no MasterFlow"); return; }
-    Val args[2] = {v_str(vm, url), obj_get(vm, vm->glob, "sPathOnlineSDK")};
-    vm_call_method(vm, mf.o, "Load", 2, args);
-}
+bool ps2o_files_present(const char* dir) { return ps2o_missing_file(dir) == NULL; }
 
 bool ps2o_open(const char* dir, void (*log)(const char* msg)) {
     ps2o_close();
@@ -248,6 +257,7 @@ bool ps2o_open(const char* dir, void (*log)(const char* msg)) {
         snprintf(g.dir, sizeof g.dir, "%s", dir);
     }
     g.ticks = 0;
+    g.flow[0] = 0;
     g.log = log;
     if (!ps2o_files_present(dir)) return false;
     AptFile* shell = movie("SGENERAL", 3);
@@ -287,8 +297,7 @@ bool ps2o_open(const char* dir, void (*log)(const char* msg)) {
         vm_tick(vm, 1000.0 / 30);
         if (i == 2) go_online(vm);
     }
-    vm_gc(vm);
-    show_screen("Gallery/GAL_SONMENU_000");
+    vm_gc(vm);                         /* (the online flow has put up its main menu by now) */
     return true;
 }
 
@@ -296,7 +305,10 @@ bool ps2o_is_open(void) { return g.open; }
 
 void ps2o_tick(void) {
     if (!g.open) return;
+    g.vm->trace = getenv("APT_TRACE_TICK") != NULL;
+    if (g.vm->trace) g.vm->logs = 0;
     vm_tick(g.vm, 1000.0 / 30);
+    g.vm->trace = false;
     if (++g.ticks % 30 == 0) vm_gc(g.vm);
 }
 
@@ -306,6 +318,45 @@ void ps2o_draw(uint32_t* px, int w, int h) {
     float scale = h / 480.0f;
     if (854 * scale > w) scale = w / 854.0f;
     aptdraw_levels(g.vm, px, w, h, scale, (w - 854 * scale) * 0.5f, (h - 480 * scale) * 0.5f, 0xFF000000u);
+}
+
+void ps2o_button(int button, bool down) {
+    static const int codes[] = {38, 40, 37, 39, 302, 303, 304, 305, 301, 300, 306, 307, 308, 309};
+    if (!g.open || button < 0 || button >= (int)(sizeof codes / sizeof codes[0])) return;
+    g.vm->trace = getenv("APT_TRACE") != NULL;
+    if (g.vm->trace) g.vm->logs = 0;
+    vm_key(g.vm, codes[button], 0, down);
+    g.vm->trace = false;
+}
+
+bool ps2o_take_flow(char* out, size_t cap) {
+    if (!g.flow[0]) return false;
+    snprintf(out, cap, "%s", g.flow);
+    g.flow[0] = 0;
+    return true;
+}
+
+static void dump(VM* vm, Obj* o, int depth, int maxd) {
+    DispExt* d = o->d;
+    printf("%*s%s %s ch%d vis%d a%.0f x%.1f y%.1f s%.0f/%.0f f%d kids%d%s%s\n", depth * 2, "", d->name ? d->name->s : "?",
+           o->kind == OK_CLIP ? "clip" : o->kind == OK_TEXT ? "text" : "shape", d->chid, d->visible, d->alpha, d->m[4], d->m[5],
+           d->xs, d->ys, d->frame, d->nkids, o->kind == OK_TEXT && d->text ? " text=" : "", o->kind == OK_TEXT && d->text ? d->text->s : "");
+    (void)vm;
+    if (depth < maxd) for (int i = 0; i < d->nkids; i++) dump(vm, d->kids[i].o, depth + 1, maxd);
+}
+void ps2o_debug_tree(const char* path, int maxd) {
+    if (!g.open) return;
+    Obj* o = vm_resolve_path(g.vm, path, g.vm->levels[0]);
+    if (o && (o->kind == OK_CLIP || o->kind == OK_TEXT || o->kind == OK_SHAPE)) dump(g.vm, o, 0, maxd);
+    else printf("no %s\n", path);
+}
+
+void ps2o_debug_get(const char* path, const char* prop) {
+    if (!g.open) return;
+    Obj* o = vm_resolve_path(g.vm, path, g.vm->levels[0]);
+    if (!o) { printf("no %s\n", path); return; }
+    Val v = obj_get(g.vm, o, prop);
+    printf("%s.%s = %s (type %d)\n", path, prop, v_cstr(g.vm, v), v.t);
 }
 
 void ps2o_close(void) {

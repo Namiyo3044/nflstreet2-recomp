@@ -52,7 +52,7 @@ typedef struct {
     int frame; bool playing; Child* kids; int nkids, capkids;
     AptEvent* events; AptFile* events_file; int nevents;
     /* text */
-    Str* text; uint32_t color; Str* var; float rect[4]; float height; int align, font, multiline, wordwrap; bool html;
+    Str* text; uint32_t color; Str* var; float rect[4]; float height; int align, font, multiline, wordwrap, autosize; bool html;
 } DispExt;
 
 struct Obj {
@@ -102,6 +102,10 @@ struct VM {
     /* the running script functions' this (newest last; natives don't count) */
     Val this_stack[128]; int nthis;
     Obj* focus;
+    bool trace;                         /* log every script call */
+    /* keys: the code / character of the press being sent, Key.addListener's listeners */
+    int key_code, key_ascii; bool key_down[512];
+    Obj** key_listeners; int nkey_listeners, capkey_listeners;
 };
 
 /* life */
@@ -140,6 +144,10 @@ Obj* vm_resolve_path(VM* vm, const char* path, Obj* base);
 bool vm_world(Obj* o, float out[6]);    /* o's matrix to the stage */
 void vm_bounds(VM* vm, Obj* o, Obj* space, float out[4], bool* any);
 void vm_logf(VM* vm, const char* fmt, ...);
+/* A button pressed / let go (Key codes: 37-40 the pad's directions, 300 Select,
+   301 Start, 302 X, 303 Circle, 304 Triangle, 305 Square, 306-311 L1 R1 L2 R2 L3 R3):
+   onKeyDown / onKeyUp for Key's listeners and the highlighted clips. */
+void vm_key(VM* vm, int code, int ascii, bool down);
 /* a character id in a movie, following imports into the libraries */
 AptChar* vm_resolve_char(VM* vm, AptFile* f, int cid, AptFile** of, int* ocid);
 /* for the host's boot sequence */

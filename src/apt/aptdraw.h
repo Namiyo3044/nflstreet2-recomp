@@ -10,3 +10,5 @@ void aptdraw_set_fonts(TerfPack* fonts);
    the picture is filled with bg first */
 void aptdraw_levels(VM* vm, uint32_t* px, int w, int h, float scale, float ox, float oy, uint32_t bg);
 void aptdraw_local_bounds(VM* vm, Obj* o, float out[4], bool* any);
+/* a text field's text size in its own units (its textWidth / textHeight) */
+void aptdraw_text_size(VM* vm, Obj* o, float* w, float* h);

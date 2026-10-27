@@ -1615,9 +1615,12 @@ void window_set_ps2_dir(const char* dir) { snprintf(g_ps2_dir, sizeof g_ps2_dir,
 bool window_ps2_online_available(void) {
     static int known = -1;             /* (looked for once: the files don't come and go during a run) */
     if (known < 0) {
-        known = g_ps2_dir[0] && ps2o_files_present(g_ps2_dir);
-        printf("ps2 online: %s\n", known ? "the PS2 files are there; Online shows the PS2 version's menus"
-                                          : "no PS2 files; Online shows the port's own page");
+        const char* miss = g_ps2_dir[0] ? ps2o_missing_file(g_ps2_dir) : NULL;
+        known = g_ps2_dir[0] && !miss;
+        if (!g_ps2_dir[0]) printf("ps2 online: no PS2 folder given (play.ps1 -Ps2, default C:\\nfls2\\ps2); Online shows the port's own page\n");
+        else if (miss) printf("ps2 online: %s isn't in %s; Online shows the port's own page\n", miss, g_ps2_dir);
+        else if (!g_gpu) printf("ps2 online: the PS2 files are there, but the PS2 menus need the graphics card renderer; Online shows the port's own page\n");
+        else printf("ps2 online: the PS2 files are there (%s); Online shows the PS2 version's menus\n", g_ps2_dir);
     }
     return known && g_gpu;
 }
@@ -1656,13 +1659,51 @@ static void restart_pacing(void) {
 static void menu_loop(CPUState* cpu);
 
 static void ps2_log(const char* msg) {
-    if (strncmp(msg, "MSG ", 4) != 0) printf("ps2 online: %s\n", msg);   /* (the engine's messages: many, every frame) */
+    /* (not the engine's messages, many every frame, nor the buttons' "no
+       method OnUP" etc.: the screens send every press to every highlighted
+       button, most of which ignore most) */
+    if (!strncmp(msg, "MSG ", 4) || !strncmp(msg, "no method On", 12) || !strncmp(msg, "no method Off", 13)) return;
+    printf("ps2 online: %s\n", msg);
 }
 
 /* The PS2 version's online menus: the game stands still (its sound paused)
    while they run, 30 frames a second, drawn at up to 720 lines and
-   stretched over the window. B / Esc leaves; A / Enter goes on to the port's
-   own Online page (hosting and joining, for now). */
+   stretched over the window. The pad and keyboard drive EA's screens as the
+   PS2 pad did: A = X (select), B = Triangle (back), Y = Circle, X = Square.
+   Leaving online mode on them (or Quick Game, which goes on to the port's
+   own host / join page for now) closes them; so do Esc and F1, at once. */
+static int ps2_key_button(SDL_Keycode k) {
+    switch (k) {
+    case SDLK_UP: return PS2O_UP;
+    case SDLK_DOWN: return PS2O_DOWN;
+    case SDLK_LEFT: return PS2O_LEFT;
+    case SDLK_RIGHT: return PS2O_RIGHT;
+    case SDLK_X: case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_SPACE: return PS2O_X;
+    case SDLK_Z: case SDLK_BACKSPACE: return PS2O_TRIANGLE;
+    case SDLK_S: return PS2O_CIRCLE;
+    case SDLK_C: return PS2O_SQUARE;
+    case SDLK_Q: return PS2O_L1;
+    case SDLK_W: return PS2O_R1;
+    default: return -1;
+    }
+}
+static int ps2_pad_button(int b) {
+    switch (b) {
+    case SDL_GAMEPAD_BUTTON_DPAD_UP: return PS2O_UP;
+    case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return PS2O_DOWN;
+    case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return PS2O_LEFT;
+    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return PS2O_RIGHT;
+    case SDL_GAMEPAD_BUTTON_SOUTH: return PS2O_X;
+    case SDL_GAMEPAD_BUTTON_EAST: case SDL_GAMEPAD_BUTTON_BACK: return PS2O_TRIANGLE;
+    case SDL_GAMEPAD_BUTTON_NORTH: return PS2O_CIRCLE;
+    case SDL_GAMEPAD_BUTTON_WEST: return PS2O_SQUARE;
+    case SDL_GAMEPAD_BUTTON_START: return PS2O_START;
+    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return PS2O_L1;
+    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return PS2O_R1;
+    default: return -1;
+    }
+}
+
 static void ps2_loop(CPUState* cpu) {
     if (g_audio) SDL_PauseAudioStreamDevice(g_audio);
     all_idle();
@@ -1680,20 +1721,37 @@ static void ps2_loop(CPUState* cpu) {
     Uint64 next = SDL_GetTicksNS();
     double draw_ms = 0;
     int draws = 0;
+    int stick[2] = {0, 0};             /* the left stick as the pad's directions */
     while (!g_quit && !leave) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) g_quit = true;
-            else if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
-                SDL_Keycode k = e.key.key;
-                if (k == SDLK_ESCAPE || k == SDLK_BACKSPACE || k == SDLK_Z) leave = true;
-                else if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_SPACE || k == SDLK_X) leave = to_page = true;
-                else if (k == SDLK_F11) SDL_SetWindowFullscreen(g_window, !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN));
-            } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
-                int b = face_button(SDL_GetGamepadFromID(e.gbutton.which), e.gbutton.button);
-                if (b == SDL_GAMEPAD_BUTTON_EAST || b == SDL_GAMEPAD_BUTTON_BACK) leave = true;
-                else if (b == SDL_GAMEPAD_BUTTON_SOUTH) leave = to_page = true;
+            else if ((e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) && !e.key.repeat) {
+                if (e.key.key == SDLK_F11 && e.type == SDL_EVENT_KEY_DOWN)
+                    SDL_SetWindowFullscreen(g_window, !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN));
+                if ((e.key.key == SDLK_F1 || e.key.key == SDLK_ESCAPE) && e.type == SDL_EVENT_KEY_DOWN)
+                    leave = true;              /* (out at once, whatever the screens do) */
+                int b = ps2_key_button(e.key.key);
+                if (b >= 0) ps2o_button(b, e.type == SDL_EVENT_KEY_DOWN);
+            } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+                int b = ps2_pad_button(face_button(SDL_GetGamepadFromID(e.gbutton.which), e.gbutton.button));
+                if (b >= 0) ps2o_button(b, e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+            } else if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+                       (e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX || e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY)) {
+                int i = e.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY;
+                int d = e.gaxis.value > 20000 ? 1 : e.gaxis.value < -20000 ? -1 : 0;
+                if (d != stick[i]) {
+                    if (stick[i]) ps2o_button(i ? (stick[i] < 0 ? PS2O_UP : PS2O_DOWN) : (stick[i] < 0 ? PS2O_LEFT : PS2O_RIGHT), false);
+                    if (d) ps2o_button(i ? (d < 0 ? PS2O_UP : PS2O_DOWN) : (d < 0 ? PS2O_LEFT : PS2O_RIGHT), true);
+                    stick[i] = d;
+                }
             }
+        }
+        char flow[48];
+        if (ps2o_take_flow(flow, sizeof flow)) {
+            printf("ps2 online: the menus ask for %s\n", flow);
+            if (!strcmp(flow, "f_MainFE")) leave = true;                     /* Exit Online */
+            else if (!strcmp(flow, "f_playnow")) leave = to_page = true;     /* Quick Game: hosting / joining */
         }
         Uint64 now = SDL_GetTicksNS();
         int steps = 0;

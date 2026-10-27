@@ -458,6 +458,7 @@ bool vm_world(Obj* o, float out[6]) {
 }
 
 extern void aptdraw_local_bounds(VM* vm, Obj* o, float out[4], bool* any);   /* aptdraw.c */
+extern void aptdraw_text_size(VM* vm, Obj* o, float* w, float* h);
 void vm_bounds(VM* vm, Obj* o, Obj* space, float out[4], bool* any) {
     float b[4]; bool have = false;
     aptdraw_local_bounds(vm, o, b, &have);
@@ -553,11 +554,19 @@ static bool text_get(VM* vm, Obj* o, Str* key, Val* out) {
     DispExt* d = o->d;
     if (str_is(key, "text") || str_is(key, "htmlText")) { *out = v_s(d->text ? d->text : S("")); return true; }
     if (str_is(key, "textColor")) { *out = v_num(d->color); return true; }
-    if (str_is(key, "textWidth")) { *out = v_num((d->text ? d->text->len : 0) * d->height * 0.5); return true; }
-    if (str_is(key, "textHeight")) { *out = v_num(d->height); return true; }
+    if (str_is(key, "textWidth") || str_is(key, "textHeight")) {
+        float w, h;
+        aptdraw_text_size(vm, o, &w, &h);
+        *out = v_num(str_is(key, "textWidth") ? w : h);
+        return true;
+    }
     if (str_is(key, "length")) { *out = v_num(d->text ? d->text->len : 0); return true; }
     if (str_is(key, "variable")) { *out = d->var ? v_s(d->var) : v_null(); return true; }
-    if (str_is(key, "_width")) { *out = v_num((d->rect[2] - d->rect[0]) * d->xs / 100.0); return true; }
+    if (str_is(key, "_width")) {
+        if (d->autosize) { float w, h; aptdraw_text_size(vm, o, &w, &h); *out = v_num((w + 4) * d->xs / 100.0); return true; }
+        *out = v_num((d->rect[2] - d->rect[0]) * d->xs / 100.0);
+        return true;
+    }
     if (str_is(key, "_height")) { *out = v_num((d->rect[3] - d->rect[1]) * d->ys / 100.0); return true; }
     return disp_get(vm, o, key, out);
 }
@@ -572,7 +581,10 @@ static bool text_set(VM* vm, Obj* o, Str* key, Val v) {
     if (str_is(key, "textColor")) { d->color = (uint32_t)v_int(vm, v); return true; }
     if (str_is(key, "html")) { d->html = v_truthy(v); return true; }
     if (str_is(key, "variable")) { d->var = v_str_of(vm, v); return true; }
-    if (str_is(key, "autoSize")) return false;
+    if (str_is(key, "autoSize")) {           /* (kept as a property too) */
+        d->autosize = v.t == V_BOOL ? v.b : v.t == V_STR ? !str_is(v.s, "none") && v.s->len : 0;
+        return false;
+    }
     return disp_set(vm, o, key, v);
 }
 
@@ -947,6 +959,7 @@ static Val call_fn(VM* vm, Obj* fn, Val self, int argc, Val* argv) {
     if (f->native) return f->native(vm, self, argc, argv, f->data);
     if (!f->file) return v_undef();
     if (vm->depth > 120) { vm_logf(vm, "call depth exceeded"); return v_undef(); }
+    if (vm->trace) vm_logf(vm, "%*scall %s this=%s", vm->depth, "", f->name ? f->name->s : "?", describe(vm, self));
     Ctx c;
     memset(&c, 0, sizeof c);
     c.file = f->file; c.func = fn;
@@ -1091,6 +1104,8 @@ static void execute(VM* vm, Ctx* c, uint32_t pc, uint32_t end) {
         if (++guard > 3000000) { vm_logf(vm, "runaway loop in %s at %x", file->name, pc); return; }
         uint8_t op = in->op;
         uint32_t nx = in->next;
+        if (vm->trace && c->func && c->func->fn->name && getenv("APT_TRACE_FN") && !strcmp(getenv("APT_TRACE_FN"), c->func->fn->name->s))
+            vm_logf(vm, "  @%x op %02x sp %d top %s", pc, op, c->sp, c->sp ? v_cstr(vm, c->st[c->sp - 1]) : "-");
         switch (op) {
         case 0x00: return;
         case 0xA2: case 0xA3: PUSH(pool_at(c, in->i)); break;
@@ -1114,14 +1129,14 @@ static void execute(VM* vm, Ctx* c, uint32_t pc, uint32_t end) {
             Val o = POP();
             int n = pop_args(vm, c, args);
             Val r = call_method(vm, c, o, v_s(name), n, args);
-            if (op == 0xB3) PUSH(r);
+            if (op == 0xB3) setvar(vm, c, v_str_of(vm, POP()), r);   /* EA's "x = o.f()": the name is below */
             break;
         }
         case 0xB0: case 0xB1: {
             Str* name = pool_str(vm, c, in->i);
             int n = pop_args(vm, c, args);
             Val r = call_named(vm, c, name, n, args);
-            if (op == 0xB1) PUSH(r);
+            if (op == 0xB1) setvar(vm, c, v_str_of(vm, POP()), r);   /* "x = f()" */
             break;
         }
         case 0x1D: { Val v = POP(), n = POP(); setvar(vm, c, v_str_of(vm, n), v); break; }
@@ -1898,7 +1913,6 @@ NATIVE(n_has_own) { UNUSED; return v_bool(SELF_OBJ && argc && own_has(self.o, v_
 NATIVE(n_false) { UNUSED; return v_bool(false); }
 NATIVE(n_true) { UNUSED; return v_bool(true); }
 NATIVE(n_undef) { UNUSED; return v_undef(); }
-NATIVE(n_zero) { UNUSED; return v_num(0); }
 NATIVE(n_hundred) { UNUSED; return v_num(100); }
 NATIVE(n_add_property) {
     UNUSED;
@@ -2380,6 +2394,73 @@ NATIVE(n_mc_set_state) {
 }
 NATIVE(n_tf_format) { UNUSED; return v_obj(obj_new(vm, vm->object_proto)); }
 
+/* -- Key */
+NATIVE(n_key_code) { UNUSED; return v_num(vm->key_code); }
+NATIVE(n_key_ascii) { UNUSED; return v_num(vm->key_ascii); }
+NATIVE(n_key_isdown) { UNUSED; int c = v_int(vm, ARG(0)); return v_bool(c >= 0 && c < 512 && vm->key_down[c]); }
+NATIVE(n_key_add) {
+    UNUSED;
+    if (!argc || argv[0].t != V_OBJ) return v_bool(false);
+    for (int i = 0; i < vm->nkey_listeners; i++) if (vm->key_listeners[i] == argv[0].o) return v_bool(true);
+    if (vm->nkey_listeners == vm->capkey_listeners) {
+        vm->capkey_listeners = vm->capkey_listeners ? vm->capkey_listeners * 2 : 16;
+        vm->key_listeners = (Obj**)realloc(vm->key_listeners, (size_t)vm->capkey_listeners * sizeof(Obj*));
+    }
+    vm->key_listeners[vm->nkey_listeners++] = argv[0].o;
+    return v_bool(true);
+}
+NATIVE(n_key_remove) {
+    UNUSED;
+    for (int i = 0; argc && i < vm->nkey_listeners; i++)
+        if (argv[0].t == V_OBJ && vm->key_listeners[i] == argv[0].o) {
+            memmove(&vm->key_listeners[i], &vm->key_listeners[i + 1], (size_t)(vm->nkey_listeners - i - 1) * sizeof(Obj*));
+            vm->nkey_listeners--;
+            return v_bool(true);
+        }
+    return v_bool(false);
+}
+NATIVE(n_key_stick) {
+    UNUSED; Obj* o = obj_new(vm, vm->object_proto);
+    prop_put(o, S("fXAxisValue"), v_num(0)); prop_put(o, S("fYAxisValue"), v_num(0));
+    return v_obj(o);
+}
+
+/* the clips a press goes to: those whose state is their HIGHLIGHTED one */
+static void collect_highlighted(VM* vm, Obj* mc, Obj*** out, int* n, int* cap) {
+    DispExt* d = mc->d;
+    if (d->removed || !d->visible) return;
+    int k = prop_find(mc, S("_sState"));
+    if (k >= 0) {
+        Val st = mc->props[k].v, hl = obj_get_s(vm, mc, S("HIGHLIGHTED"));
+        if (hl.t != V_UNDEF && v_eq2(vm, st, hl)) {
+            if (*n == *cap) { *cap = *cap ? *cap * 2 : 16; *out = (Obj**)realloc(*out, (size_t)*cap * sizeof(Obj*)); }
+            (*out)[(*n)++] = mc;
+        }
+    }
+    for (int i = 0; i < d->nkids; i++) if (d->kids[i].o->kind == OK_CLIP) collect_highlighted(vm, d->kids[i].o, out, n, cap);
+}
+
+void vm_key(VM* vm, int code, int ascii, bool down) {
+    vm->key_code = code; vm->key_ascii = ascii;
+    if (code >= 0 && code < 512) vm->key_down[code] = down;
+    Obj** t = NULL; int n = 0, cap = 0;
+    for (int i = 0; i < vm->nkey_listeners; i++) {
+        if (n == cap) { cap = cap ? cap * 2 : 16; t = (Obj**)realloc(t, (size_t)cap * sizeof(Obj*)); }
+        t[n++] = vm->key_listeners[i];
+    }
+    int nl = n;
+    for (int lv = 0; lv < VM_LEVELS; lv++) if (vm->levels[lv]) collect_highlighted(vm, vm->levels[lv], &t, &n, &cap);
+    Str* ev = down ? S("onKeyDown") : S("onKeyUp");
+    for (int i = 0; i < n; i++) {
+        Obj* o = t[i];
+        if (i >= nl && o->d->removed) continue;
+        Val fn = obj_get_s(vm, o, ev);
+        if (fn.t == V_OBJ && fn.o->kind == OK_FUNC) call_fn(vm, fn.o, v_obj(o), 0, NULL);
+    }
+    free(t);
+    vm->key_code = 0; vm->key_ascii = 0;
+}
+
 static Obj* add_ctor(VM* vm, const char* name, NativeFn fn, Obj* proto) {
     Obj* c = native_fn(vm, fn, NULL, name);
     if (!proto) proto = obj_new(vm, vm->object_proto);
@@ -2455,8 +2536,11 @@ static void setup_builtins(VM* vm) {
         {"SPACE", 32}, {"LEFT", 37}, {"UP", 38}, {"RIGHT", 39}, {"DOWN", 40}, {"TAB", 9}, {"DELETEKEY", 46}, {"HOME", 36}, {"END", 35},
         {"PGUP", 33}, {"PGDN", 34}, {"INSERT", 45}, {"CAPSLOCK", 20}};
     for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) set_num(vm, K, keys[i].n, keys[i].v);
-    obj_set_native(vm, K, "isDown", n_false, NULL); obj_set_native(vm, K, "getCode", n_zero, NULL); obj_set_native(vm, K, "getAscii", n_zero, NULL);
-    static const char* const lst[] = {"addListener", "removeListener", NULL};
+    obj_set_native(vm, K, "isDown", n_key_isdown, NULL); obj_set_native(vm, K, "getCode", n_key_code, NULL);
+    obj_set_native(vm, K, "getAscii", n_key_ascii, NULL);
+    obj_set_native(vm, K, "addListener", n_key_add, NULL); obj_set_native(vm, K, "removeListener", n_key_remove, NULL);
+    obj_set_native(vm, K, "getAnalogStickInfo", n_key_stick, NULL);
+    static const char* const lst[] = {NULL};
     natives(vm, K, lst, n_true);
     prop_put(g, S("Key"), v_obj(K));
     Obj* Mo = obj_new(vm, P);
@@ -2612,6 +2696,7 @@ void vm_gc(VM* vm) {
     for (int i = 0; i < vm->nloads; i++) mark(&ms, vm->loads[i].clip);
     for (int i = 0; i < vm->nclasses; i++) { mark(&ms, vm->class_names[i]); mark(&ms, vm->class_ctors[i]); }
     for (int i = 0; i < vm->nthis && i < 128; i++) mark_val(&ms, vm->this_stack[i]);
+    for (int i = 0; i < vm->nkey_listeners; i++) mark(&ms, vm->key_listeners[i]);
     for (Gc* g = vm->gc_all; g; g = g->gc_next) if (g->pinned) { g->gc_mark = 0; mark(&ms, g); }
     while (ms.n) mark_obj_fields(&ms, (Obj*)ms.a[--ms.n]);
     free(ms.a);
@@ -2638,7 +2723,7 @@ void vm_free(VM* vm) {
     Gc* g = vm->gc_all;
     while (g) { Gc* n = g->gc_next; if (g->gc_kind == GK_STR) free(g); else obj_free((Obj*)g); g = n; }
     for (int i = 0; i < vm->nintervals; i++) free(vm->intervals[i].args);
-    free(vm->intervals); free(vm->loads); free(vm->class_names); free(vm->class_ctors);
+    free(vm->intervals); free(vm->loads); free(vm->key_listeners); free(vm->class_names); free(vm->class_ctors);
     if (g_cs_vm == vm) { free(g_cs); g_cs = NULL; g_cs_cap = g_cs_used = 0; g_cs_vm = NULL; }
     free(vm);
 }
