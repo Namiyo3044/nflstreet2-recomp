@@ -1218,8 +1218,11 @@ void glr_present(const GlrPicture* pic, unsigned target_fbo, int win_w, int win_
 static GLuint g_oprog, g_otex;
 static int g_ow, g_oh;
 
-void glr_present_overlay(const u32* px, int w, int h, bool dirty) {
-    if (!g_pready || !px || w <= 0 || h <= 0)
+void glr_present_overlay(const u32* px, int w, int h, bool dirty) { glr_present_overlay_scaled(px, w, h, w, h, dirty); }
+
+/* The same, a picture of another size stretched (smoothly) over the window. */
+void glr_present_overlay_scaled(const u32* px, int w, int h, int win_w, int win_h, bool dirty) {
+    if (!g_pready || !px || w <= 0 || h <= 0 || win_w <= 0 || win_h <= 0)
         return;
     if (!g_oprog) {
         static const char* fs =
@@ -1254,9 +1257,10 @@ void glr_present_overlay(const u32* px, int w, int h, bool dirty) {
         G(glPixelStorei)(GL_UNPACK_ALIGNMENT, 4);
         G(glTexSubImage2D)(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, px);
     }
-    G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    G(glViewport)(0, 0, w, h);
+    GLint filt = w == win_w && h == win_h ? GL_NEAREST : GL_LINEAR;
+    G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt);
+    G(glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt);
+    G(glViewport)(0, 0, win_w, win_h);
     G(glDisable)(GL_SCISSOR_TEST);
     G(glEnable)(GL_BLEND);
     G(glBlendEquationSeparate)(GL_FUNC_ADD, GL_FUNC_ADD);

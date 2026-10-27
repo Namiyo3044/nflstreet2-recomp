@@ -46,6 +46,17 @@ void window_trust_screen_shape(void);
 /* Once per video field: present the frame, read input, wait for real time. */
 /* Keeps the window answering the system while the game waits. */
 void window_keep_alive(void);
+/* The main menu's Online: opens the port's Online page (netplay). */
+void window_online_request(void);
+/* The PS2 version's online menus (apt/ps2online.h), from the player's PS2
+   files in `dir`: available once those are there (and the graphics card
+   renderer is in use). The request shows them, the game standing still. */
+void window_set_ps2_dir(const char* dir);
+bool window_ps2_online_available(void);
+void window_ps2_online_request(void);
+/* After the window closed: true (once) if it closed to restart the game for
+   netplay, with the options to restart with ("" = without netplay). */
+bool window_take_restart(char* args, size_t cap);
 void window_field(CPUState* cpu);
 
 /* True once the user has closed the window or pressed Esc. */

@@ -488,6 +488,42 @@ static int uis_native_hook(CPUState* ctx) {
         ctx->pc = ctx->lr;
         return 1;
     }
+    if (ctx->gpr[3] == UIS_FN_ONLINE && group == 0) {
+        /* The Game Modes list's Online (uismenu.c add_online): the Audio
+           Settings screen opens, in video mode with the Online rows. In a
+           netplay session: the port's own Online page (leave the session),
+           the menu staying as it is (both games alike). */
+        bool session = false;
+#ifdef NFLS2_HAVE_WINDOW
+        session = netplay_active();
+        if (session) {
+            /* Both games get the press: the page opens for the player who
+               pressed A (or both, if that can't be told). */
+            PadLive p0, p1;
+            bool a0 = netplay_pad(0, &p0) && (p0.buttons & PAD_A), a1 = netplay_pad(1, &p1) && (p1.buttons & PAD_A);
+            int me = netplay_local_port();
+            if (a0 == a1 || (me == 0 ? a0 : a1)) window_online_request();
+        }
+#endif
+        /* With the player's PS2 files: the PS2 version's online menus over
+           the game (apt/ps2online.c), the menu staying as it is. */
+        bool ps2 = false;
+#ifdef NFLS2_HAVE_WINDOW
+        if (!session && window_ps2_online_available()) {
+            ps2 = true;
+            window_ps2_online_request();
+        }
+#endif
+        bool stay = session || ps2;
+        g_video_screen = !stay;
+        g_video_back = stay ? 0 : 3;      /* (no screen opens then) */
+        uismenu_set_video_page(2);
+        printf("uis: Online picked%s\n", session ? " (in a session: the port's page)" : ps2 ? ": the PS2 online menus" : ": the Online screen");
+        mem_write32(ctx, ctx->gpr[8], stay ? 1u : 0u);   /* 1: the menu stays as it is */
+        ctx->gpr[3] = 1;
+        ctx->pc = ctx->lr;
+        return 1;
+    }
     if ((ctx->gpr[3] == UIS_FN_VIDEO || ctx->gpr[3] == UIS_FN_RECOMP || ctx->gpr[3] == UIS_FN_AUDIO) && group == 0) {
         /* The Options list opens Audio Settings for all three entries; this
            says which (Video / Recomp Settings: the same screen in video mode,
@@ -531,7 +567,25 @@ static int uis_native_hook(CPUState* ctx) {
     }
     if (ctx->gpr[3] == UIS_FN_VIDEO_BACK && group == 0) {
         /* Back on Options from Audio Settings' screen: was it Video Settings? */
-        mem_write32(ctx, ctx->gpr[8], (u32)g_video_back);   /* 0 Audio, 1 Video, 2 Recomp Settings */
+        if (g_video_back == 3) {
+            /* Online (the Game Modes list's, in by Audio Settings' way): the
+               menu's page is made Game Modes (1), where it would open on
+               Options (4). The page is the menu's argument on the script's
+               stack: six below the answer's slot (uismenu.c: "push -5; pick",
+               then "push -7; pick" with the position's copy on top). */
+            u32 slot = ctx->gpr[8], pg = 0;
+            if (mem_read32(ctx, slot - 24) == 4u && mem_read32(ctx, slot - 20) == 2u) pg = slot - 24;
+            else if (mem_read32(ctx, slot + 24) == 4u && mem_read32(ctx, slot + 20) == 2u) pg = slot + 24;
+            if (pg) mem_write32(ctx, pg, 1);
+            else {
+                g_video_back = 0;          /* not found: Options, on Audio Settings */
+                printf("uis: Online: script stack around the answer (%08X):", slot);
+                for (int k = -10; k <= 4; k++) printf(" %d", (int)mem_read32(ctx, slot + 4 * (u32)k));
+                printf("\n");
+            }
+            printf("uis: Online: back to %s\n", pg ? "Game Modes, on Online" : "Options (the menu's page wasn't found)");
+        }
+        mem_write32(ctx, ctx->gpr[8], (u32)g_video_back);   /* 0 Audio, 1 Video, 2 Recomp Settings, 3 Online */
         g_video_back = 0;
         ctx->gpr[3] = 1;
         ctx->pc = ctx->lr;
@@ -541,8 +595,13 @@ static int uis_native_hook(CPUState* ctx) {
         /* The restored main menu entries whose screens aren't in the GameCube
            game (uis_main_menu_edits): Online (0x12C; going on would also award
            the "online match" feat, then hang) and Madden NFL 2005 (0x9C, the
-           PS2 demo). "Not available", so picking them does nothing. */
+           PS2 demo). "Not available", so picking them does nothing. (Online
+           normally doesn't get here: its case is pointed at the Online screen,
+           uismenu.c add_online.) */
         u32 target = mem_read32(ctx, ctx->gpr[7]);
+#ifdef NFLS2_HAVE_WINDOW
+        if (target == 0x12Cu) window_online_request();   /* (main menu script not patched: the port's page) */
+#endif
         if (target == 0x12Cu || target == 0x9Cu) {
             mem_write32(ctx, ctx->gpr[8], 0);
             ctx->gpr[3] = 1;
@@ -1058,6 +1117,7 @@ static void usage(const char* argv0) {
             "         [--gpu (draw with the graphics card) [--res N (its internal resolution, N x 640x528)]]\n"
             "         [--settings FILE (saved video settings; switches override them)] [--software]\n"
             "         [--textures DIR (custom textures, Dolphin format)] [--dump-textures DIR]\n"
+            "         [--ps2 DIR (the PS2 version's .DAT files: Online shows its online menus)]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }
@@ -1075,7 +1135,32 @@ static unsigned file_hash(const char* path) {
     return h;
 }
 
+/* Netplay: what both players' settings have to agree on (the options that
+   change the game), as the game would start with them now. Used when
+   connecting at start-up and by the Online menu before restarting. */
+static int g_net_aspect_arg = -1;      /* --aspect given (else the settings' shape) */
+static bool g_net_thx, g_net_idle = true;
+static const char* g_net_text;
+static const char* g_net_colors;
+
+static const char* net_fingerprint(void) {
+    static char fp[512];
+    int shape = g_net_aspect_arg >= 0 ? g_net_aspect_arg : g_settings.screen_shape;
+    snprintf(fp, sizeof fp, "shape=%d rain=%d intros=%d thx=%d text=%08x colors=%08x idle=%d", shape,
+             g_settings.ps2_rain, g_settings.skip_intros ? 1 : 0, g_net_thx ? 1 : 0, file_hash(g_net_text),
+             file_hash(g_net_colors), g_net_idle ? 1 : 0);
+    return fp;
+}
+
+/* (relaunch.c) */
+static int g_argc;
+static char** g_argv;
+int relaunch_self(int argc, char** argv, const char* extra);
+static int relaunch(const char* extra) { return relaunch_self(g_argc, g_argv, extra); }
+
 int main(int argc, char** argv) {
+    g_argc = argc;
+    g_argv = argv;
     const char* disc_dir = NULL;
     const char* map_path = NULL;
     unsigned long long max_steps = 50000000ull;
@@ -1169,6 +1254,7 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "--aspect") == 0 && i + 1 < argc) {
             const char* a = argv[++i];
             aspect_mode = strcmp(a, "4:3") == 0 ? 1 : strcmp(a, "16:9") == 0 ? 2 : strcmp(a, "21:9") == 0 ? 3 : strcmp(a, "32:9") == 0 ? 4 : 0;
+            g_net_aspect_arg = aspect_mode;
         } else if (strcmp(argv[i], "--gpu") == 0) {
             if (!gpu_scale) gpu_scale = have_settings ? g_settings.resolution : 1;
         } else if (strcmp(argv[i], "--res") == 0 && i + 1 < argc) {
@@ -1213,6 +1299,11 @@ int main(int argc, char** argv) {
             g_uis_log = true;
         } else if (strcmp(argv[i], "--replace") == 0 && i + 1 < argc) {
             disc_set_replace_dir(argv[++i]);
+        } else if (strcmp(argv[i], "--ps2") == 0 && i + 1 < argc) {
+#ifdef NFLS2_HAVE_WINDOW
+            window_set_ps2_dir(argv[i + 1]);
+#endif
+            i++;
         } else if (strcmp(argv[i], "--textures") == 0 && i + 1 < argc) {
             textures_dir = argv[++i];
         } else if (strcmp(argv[i], "--dump-textures") == 0 && i + 1 < argc) {
@@ -1261,16 +1352,17 @@ int main(int argc, char** argv) {
     gx_raster_config_xfb(xfb_every);
     if (draw_log)
         gx_raster_render_all();        /* logged frames must be drawn */
+    g_net_thx = g_skip_intros;
+    g_net_idle = idle_skip;
+    g_net_text = text_path;
+    g_net_colors = colors_path;
+    netplay_set_fingerprint(net_fingerprint);
     if (net_host || net_join) {
         /* (Before the window opens: waiting for the other player would
            leave it not responding.)
            The settings that change the game have to match (else the two
            games part); the host's clock and memory card are used by both. */
-        char fp[512];
-        snprintf(fp, sizeof fp, "shape=%d rain=%d intros=%d thx=%d text=%08x colors=%08x idle=%d",
-                 aspect_mode, g_rain_style, g_skip_all_intros ? 1 : 0, g_skip_intros ? 1 : 0, file_hash(text_path),
-                 file_hash(colors_path), idle_skip ? 1 : 0);
-        for (char* p = fp; *p; p++) if (*p == ' ' && p[1] == ' ') *p = '_';
+        const char* fp = net_fingerprint();
         if (net_host) {
             if (memcard_path) {
                 FILE* f = fopen(memcard_path, "rb");
@@ -1509,16 +1601,22 @@ int main(int argc, char** argv) {
     interrupts_report();
     netsync_report();
     netplay_report();
+    netplay_close();
     gx_fifo_report();
     gx_raster_report();
     disc_report();
     ax_hle_report();
     hle_cpu_report();
     mmio_report();
+    char restart[160];
+    bool again = false;
 #ifdef NFLS2_HAVE_WINDOW
-    if (want_window)
+    if (want_window) {
+        again = window_take_restart(restart, sizeof restart);
         window_close();
+    }
 #endif
     cpu_free(&cpu);
+    if (again) return relaunch(restart);   /* netplay: into (or out of) a session */
     return 0;
 }

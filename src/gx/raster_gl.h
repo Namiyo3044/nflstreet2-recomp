@@ -83,6 +83,7 @@ void glr_present(const GlrPicture* pic, unsigned target_fbo, int win_w, int win_
 /* After glr_present: draws a window-sized picture (0xAARRGGBB, premultiplied
    alpha, top row first) over it; dirty = it changed since the last call. */
 void glr_present_overlay(const u32* px, int w, int h, bool dirty);
+void glr_present_overlay_scaled(const u32* px, int w, int h, int win_w, int win_h, bool dirty);
 
 /* A plain black window (on the window's thread, instead of glr_present). */
 void glr_present_black(int w, int h);

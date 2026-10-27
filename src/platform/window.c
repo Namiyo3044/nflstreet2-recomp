@@ -1,3 +1,4 @@
+#include "runtime/netplay.h"
 #include "runtime/prof.h"
 #include "platform/window.h"
 #include "gx/raster.h"
@@ -14,6 +15,7 @@
 #include "runtime/uicolors.h"
 #include "runtime/uismenu.h"
 #include "runtime/lodfix.h"
+#include "apt/ps2online.h"
 
 #include <SDL3/SDL.h>
 
@@ -969,6 +971,27 @@ static void menu_event(const SDL_Event* e) {
         if (cap == 2 && !menu_capturing()) axis_dir[0] = axis_dir[1] = 2;   /* ignore the stick until it's let go */
         return;
     }
+    if (menu_text_wanted() && (e->type == SDL_EVENT_TEXT_INPUT || e->type == SDL_EVENT_KEY_DOWN)) {
+        /* typing an address: letters and digits are text, not shortcuts */
+        if (e->type == SDL_EVENT_TEXT_INPUT) menu_text(e->text.text);
+        else if (e->key.key == SDLK_V && (e->key.mod & SDL_KMOD_CTRL)) {   /* paste (an address sent in a chat) */
+            char* clip = SDL_GetClipboardText();
+            if (clip) {
+                for (char* c = clip; *c; c++) if (*c == ' ' || *c == '\r' || *c == '\n' || *c == '\t') *c = 0;
+                char* start = clip;
+                while (!*start && start < clip + strlen(clip)) start++;
+                menu_text(start);
+                SDL_free(clip);
+            }
+        }
+        else if (e->key.key == SDLK_BACKSPACE || e->key.key == SDLK_DELETE) menu_text_back();
+        else if (e->key.key == SDLK_RETURN || e->key.key == SDLK_KP_ENTER) { if (!e->key.repeat) menu_action(MENU_OK); }
+        else if (e->key.key == SDLK_ESCAPE) { if (!e->key.repeat) menu_action(MENU_BACK); }
+        else if (e->key.key == SDLK_UP) menu_action(MENU_UP);
+        else if (e->key.key == SDLK_DOWN) menu_action(MENU_DOWN);
+        return;
+    }
+    if (e->type == SDL_EVENT_TEXT_INPUT) return;
     if (e->type == SDL_EVENT_KEY_DOWN) {
         switch (e->key.key) {
         case SDLK_UP: menu_action(MENU_UP); break;
@@ -1007,14 +1030,41 @@ static void menu_event(const SDL_Event* e) {
     }
 }
 
+/* The game's Online screen with the cursor on Join a Game: the keyboard
+   types the address (its letters aren't the game's buttons then); Enter
+   connects, Esc is the B button (back), the arrows still move up and down. */
+static bool g_online_typing;
+static int g_online_esc;               /* fields left of B held for Esc */
+static bool online_key(const SDL_Event* e) {
+    if (e->type == SDL_EVENT_TEXT_INPUT) { menu_online_text(e->text.text); return true; }
+    SDL_Keycode k = e->key.key;
+    if (k == SDLK_V && (e->key.mod & SDL_KMOD_CTRL)) {   /* paste (an address sent in a chat) */
+        char* clip = SDL_GetClipboardText();
+        if (clip) {
+            char* start = clip;
+            while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') start++;
+            for (char* c = start; *c; c++) if (*c == ' ' || *c == '\r' || *c == '\n' || *c == '\t') { *c = 0; break; }
+            menu_online_text(start);
+            SDL_free(clip);
+        }
+        return true;
+    }
+    if (k == SDLK_BACKSPACE || k == SDLK_DELETE) { menu_online_text_back((e->key.mod & SDL_KMOD_CTRL) != 0); return true; }
+    if (k == SDLK_RETURN || k == SDLK_KP_ENTER) { if (!e->key.repeat) menu_online_press(1); return true; }
+    if (k == SDLK_ESCAPE) { if (!e->key.repeat) g_online_esc = 6; return true; }
+    return false;                      /* F-keys etc. as always */
+}
+
 static void poll_events(void) {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (menu_is_open() && (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
-                               e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION)) {
+                               e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION || e.type == SDL_EVENT_TEXT_INPUT)) {
             menu_event(&e);
             continue;
         }
+        if (g_online_typing && (e.type == SDL_EVENT_TEXT_INPUT || e.type == SDL_EVENT_KEY_DOWN) && online_key(&e))
+            continue;
         switch (e.type) {
         case SDL_EVENT_QUIT:
             g_quit = true;
@@ -1055,7 +1105,9 @@ static void poll_events(void) {
                        g_wide_camera ? "on" : "off");
             } else if (e.key.key == SDLK_F9 && !e.key.repeat) {
                 static const int k_next[] = {2, 2, 3, 4, 1};   /* 4:3 -> 16:9 -> 21:9 -> 32:9 -> 4:3 */
-                if (!in_front_end()) {
+                if (netplay_active()) {
+                    printf("window: the screen shape can't be changed during netplay (both games have to match)\n");
+                } else if (!in_front_end()) {
                     printf("window: the screen shape can only be changed in the game's menus, not during a match\n");
                 } else {
                     set_shape_mode(k_next[g_aspect_mode]);
@@ -1164,7 +1216,12 @@ static void read_input(void) {
     int kb = g_settings.keyboard_player;
     for (int i = 0; i < PAD_PORTS; i++) {
         bool keys = i == kb;
-        st[i] = player_state(g_pads[i], keys);
+        st[i] = player_state(g_pads[i], keys && !g_online_typing);
+        if (keys && g_online_typing) {
+            const bool* ks = SDL_GetKeyboardState(NULL);
+            if (ks && ks[SDL_SCANCODE_UP] != ks[SDL_SCANCODE_DOWN]) st[i].stick_y = stick_value(ks[SDL_SCANCODE_UP] ? 1.0f : -1.0f);
+            if (g_online_esc > 0) st[i].buttons |= PAD_B;
+        }
         if (g_lost[i] && keys && pad_held(&st[i])) g_lost[i] = false;   /* the keyboard takes over */
         /* Port 1 is plugged in from the start (the game wants a controller
            there), the others once something plays as them. */
@@ -1189,6 +1246,16 @@ static void read_input(void) {
         }
         waited = 0;
         g_input_block = false;
+    }
+    if (g_online_esc > 0) g_online_esc--;
+    /* The Online screen: A on Host a Game / Join a Game starts (or stops) it. */
+    {
+        static bool was_a;
+        int page = -1, focus = uismenu_video_focus(&page);
+        bool a = false;
+        for (int i = 0; i < PAD_PORTS; i++) if (st[i].buttons & PAD_A) a = true;
+        if (page == 2 && focus >= 0 && a && !was_a) menu_online_press(focus);
+        was_a = a;
     }
     for (int i = 0; i < PAD_PORTS; i++) pad_set_live(i, &st[i]);
 }
@@ -1216,6 +1283,13 @@ static void present_gpu(CPUState* cpu) {
         const uint32_t* px = menu_draw(ww, wh, &dirty);
         glr_present_overlay(px, ww, wh, dirty);
         if (shot) g_shot_pending = true;   /* screenshots are of the game, not the menu */
+    } else {
+        NetplayStatus st;
+        if (netplay_status(&st)) {     /* the session badge */
+            bool dirty;
+            const uint32_t* px = menu_hud(ww, wh, &dirty, &st, in_front_end());
+            if (px) glr_present_overlay(px, ww, wh, dirty);
+        }
     }
     SDL_GL_SwapWindow(g_window);
 }
@@ -1514,6 +1588,9 @@ static const char* const k_previews[11] = {
 static int g_preview_req = -1;
 static bool g_quit_req;
 static bool g_video_req;
+static bool g_online_req;
+static char g_restart_args[160];
+static bool g_restart;
 
 void window_quit_request(void) {
     g_quit_req = true;
@@ -1526,6 +1603,31 @@ void window_quit_now(void) {
 
 void window_video_request(void) {
     g_video_req = true;
+}
+
+void window_online_request(void) {
+    g_online_req = true;
+}
+
+static char g_ps2_dir[512];
+static bool g_ps2_req;
+void window_set_ps2_dir(const char* dir) { snprintf(g_ps2_dir, sizeof g_ps2_dir, "%s", dir ? dir : ""); }
+bool window_ps2_online_available(void) {
+    static int known = -1;             /* (looked for once: the files don't come and go during a run) */
+    if (known < 0) {
+        known = g_ps2_dir[0] && ps2o_files_present(g_ps2_dir);
+        printf("ps2 online: %s\n", known ? "the PS2 files are there; Online shows the PS2 version's menus"
+                                          : "no PS2 files; Online shows the port's own page");
+    }
+    return known && g_gpu;
+}
+void window_ps2_online_request(void) { g_ps2_req = true; }
+
+bool window_take_restart(char* args, size_t cap) {
+    if (!g_restart) return false;
+    g_restart = false;
+    snprintf(args, cap, "%s", g_restart_args);
+    return true;
 }
 
 void window_preview_request(int index) {
@@ -1549,6 +1651,87 @@ static void restart_pacing(void) {
     g_frames_at_stat = gx_raster_frames();
     g_slept_ns = g_present_ns = 0;
     g_hitch_last = 0;
+}
+
+static void menu_loop(CPUState* cpu);
+
+static void ps2_log(const char* msg) {
+    if (strncmp(msg, "MSG ", 4) != 0) printf("ps2 online: %s\n", msg);   /* (the engine's messages: many, every frame) */
+}
+
+/* The PS2 version's online menus: the game stands still (its sound paused)
+   while they run, 30 frames a second, drawn at up to 720 lines and
+   stretched over the window. B / Esc leaves; A / Enter goes on to the port's
+   own Online page (hosting and joining, for now). */
+static void ps2_loop(CPUState* cpu) {
+    if (g_audio) SDL_PauseAudioStreamDevice(g_audio);
+    all_idle();
+    Uint64 t0 = SDL_GetTicksNS();
+    if (!ps2o_open(g_ps2_dir, ps2_log)) {
+        printf("ps2 online: the PS2 menus didn't start; the port's Online page instead\n");
+        menu_open_online();
+        menu_loop(cpu);
+        return;
+    }
+    printf("ps2 online: menus started in %.0f ms\n", (SDL_GetTicksNS() - t0) / 1e6);
+    u32* px = NULL;
+    int pw = 0, ph = 0;
+    bool leave = false, to_page = false, dirty = true;
+    Uint64 next = SDL_GetTicksNS();
+    double draw_ms = 0;
+    int draws = 0;
+    while (!g_quit && !leave) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_EVENT_QUIT) g_quit = true;
+            else if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
+                SDL_Keycode k = e.key.key;
+                if (k == SDLK_ESCAPE || k == SDLK_BACKSPACE || k == SDLK_Z) leave = true;
+                else if (k == SDLK_RETURN || k == SDLK_KP_ENTER || k == SDLK_SPACE || k == SDLK_X) leave = to_page = true;
+                else if (k == SDLK_F11) SDL_SetWindowFullscreen(g_window, !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN));
+            } else if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+                int b = face_button(SDL_GetGamepadFromID(e.gbutton.which), e.gbutton.button);
+                if (b == SDL_GAMEPAD_BUTTON_EAST || b == SDL_GAMEPAD_BUTTON_BACK) leave = true;
+                else if (b == SDL_GAMEPAD_BUTTON_SOUTH) leave = to_page = true;
+            }
+        }
+        Uint64 now = SDL_GetTicksNS();
+        int steps = 0;
+        while (now >= next && steps < 4) { ps2o_tick(); next += 33333333u; steps++; dirty = true; }
+        if (now >= next) next = now + 33333333u;   /* (far behind: no catching up) */
+        int ww = 0, wh = 0;
+        SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
+        if (ww > 0 && wh > 0) {
+            int h = wh > 720 ? 720 : wh, w = (int)((long long)ww * h / wh);
+            if (w != pw || h != ph || !px) {
+                free(px);
+                px = (u32*)malloc((size_t)w * h * 4);
+                pw = w; ph = h; dirty = true;
+            }
+            if (px && dirty) {
+                Uint64 d0 = SDL_GetTicksNS();
+                ps2o_draw(px, pw, ph);
+                draw_ms += (SDL_GetTicksNS() - d0) / 1e6;
+                draws++;
+            }
+            glr_present_black(ww, wh);
+            if (px) glr_present_overlay_scaled(px, pw, ph, ww, wh, dirty);
+            dirty = false;
+            SDL_GL_SwapWindow(g_window);
+        }
+        SDL_Delay(4);
+    }
+    if (draws) printf("ps2 online: closed (%d pictures at %dx%d, %.1f ms each)\n", draws, pw, ph, draw_ms / draws);
+    ps2o_close();
+    free(px);
+    if (to_page && !g_quit) {
+        menu_open_online();
+        menu_loop(cpu);
+        return;
+    }
+    g_input_block = true;              /* the leaving press doesn't reach the game */
+    if (g_audio) SDL_ResumeAudioStreamDevice(g_audio);
+    restart_pacing();
 }
 
 static void preview_loop(CPUState* cpu) {
@@ -1621,18 +1804,49 @@ static void preview_loop(CPUState* cpu) {
     restart_pacing();
 }
 
+/* The menu's page on screen for a moment, the game standing still (a
+   notice before the game restarts). */
+static void show_notice(CPUState* cpu, int ms) {
+    if (g_audio) SDL_PauseAudioStreamDevice(g_audio);
+    Uint64 end = SDL_GetTicksNS() + (Uint64)ms * 1000000u;
+    while (!g_quit && SDL_GetTicksNS() < end) {
+        SDL_PumpEvents();
+        present(cpu);
+        SDL_Delay(15);
+    }
+}
+
 /* The game stands still while the menu is open: the last picture stays up
    under it, the sound pauses, and real-time pacing restarts afterwards. */
 static void menu_loop(CPUState* cpu) {
     printf("window: video menu open\n");
     if (g_audio) SDL_PauseAudioStreamDevice(g_audio);
     all_idle();
+    bool typing = false;
     while (menu_is_open() && !menu_live() && !g_quit) {
         poll_events();
+        menu_tick();                   /* netplay hosting / joining going on */
+        if (menu_text_wanted() != typing) {
+            typing = !typing;
+            if (typing) SDL_StartTextInput(g_window);
+            else SDL_StopTextInput(g_window);
+        }
+        if (menu_take_restart(g_restart_args, sizeof g_restart_args)) {
+            /* netplay: both players ready (or leaving): this game closes and
+               main starts it again with the session's options */
+            present(cpu);
+            settings_save();
+            SDL_Delay(600);            /* ("player found" on screen a moment) */
+            g_restart = true;
+            g_quit = true;
+            printf("window: restarting the game%s%s\n", g_restart_args[0] ? " with " : " without netplay", g_restart_args);
+            break;
+        }
         apply_settings(menu_take_changes());
         present(cpu);
         SDL_Delay(15);
     }
+    if (typing) SDL_StopTextInput(g_window);
     if (menu_live()) {                 /* the colours page: the game runs on behind it (live_field) */
         apply_settings(menu_take_changes());
         if (g_audio) SDL_ResumeAudioStreamDevice(g_audio);
@@ -1663,6 +1877,14 @@ static void menu_loop(CPUState* cpu) {
    game waits, e.g. for the other netplay player; the events stay queued. */
 void window_keep_alive(void) {
     SDL_PumpEvents();
+    /* waiting a while for the other player: the picture again, with the
+       badge saying so (a few times a second) */
+    NetplayStatus st;
+    static Uint64 last;
+    if (g_cpu_ref && g_gpu && netplay_status(&st) && st.waiting_ms > 400 && SDL_GetTicks() - last > 200) {
+        last = SDL_GetTicks();
+        present(g_cpu_ref);
+    }
 }
 
 void window_field(CPUState* cpu) {
@@ -1681,7 +1903,20 @@ void window_field(CPUState* cpu) {
     gx_raster_set_side_fill(g_settings.screen_shape >= 3 && in_front_end() ? SIDE_FILL : 0u);
     gx_raster_set_match(lodfix_frame(cpu));
     uicolors_frame(cpu);
-    menu_set_shape_locked(!in_front_end());
+    /* (netplay: never, the screen shape changes the game for this player only) */
+    menu_set_shape_locked(!in_front_end() || netplay_active());
+    if (netplay_lost() && !g_restart) {
+        /* The other player left (or the connection failed): this game
+           restarts on its own, out of the session, after a notice. */
+        printf("window: the netplay session ended (the other player left or the connection was lost); restarting "
+               "without netplay\n");
+        menu_open_online_ended();
+        show_notice(cpu, 2500);
+        g_restart_args[0] = 0;
+        settings_save();
+        g_restart = true;
+        g_quit = true;
+    }
     {
         /* The game's Video Settings screen: its rows read and set the
            settings, applied here as the menu's are. */
@@ -1693,12 +1928,33 @@ void window_field(CPUState* cpu) {
         static const UisVideoRows k_recomp = {menu_recomp_row_count, menu_recomp_row_get, menu_recomp_row_set,
                                               menu_recomp_row_name, menu_recomp_row_help, menu_recomp_row_enabled,
                                               MENU_RECOMP_ROWS, "Recomp Settings", k_recomp_label};
-        uismenu_set_video_rows(&k_rows, &k_recomp);
+        static const UisVideoRows k_online = {menu_online_row_count, menu_online_row_get, menu_online_row_set,
+                                              menu_online_row_name, menu_online_row_help, menu_online_row_enabled,
+                                              MENU_ONLINE_ROWS, "Online", k_online_label};
+        uismenu_set_video_rows(&k_rows, &k_recomp, &k_online);
         if (!menu_is_open()) {
             MenuInfo mi = {g_gpu, g_gpu_scale, hires_has_folder()};
             menu_set_info(&mi);
         }
         uismenu_video_frame(cpu);
+        {
+            /* The game's Online screen: the row with the cursor, typing, and
+               the connection going on (both games restart once it's made). */
+            int page = -1, focus = uismenu_video_focus(&page);
+            menu_online_focus(page == 2 ? focus : -1);
+            bool typing = menu_online_typing();
+            if (typing != g_online_typing) {
+                g_online_typing = typing;
+                if (typing) SDL_StartTextInput(g_window);
+                else SDL_StopTextInput(g_window);
+            }
+            if (menu_online_tick(g_restart_args, sizeof g_restart_args)) {
+                settings_save();
+                g_restart = true;
+                g_quit = true;
+                printf("window: restarting the game with %s\n", g_restart_args);
+            }
+        }
         if (!menu_is_open()) {
             unsigned ch = menu_take_changes();
             if (ch) {
@@ -1713,6 +1969,13 @@ void window_field(CPUState* cpu) {
            show on it; the menu is drawn over it. */
         live = true;
         all_idle();
+        if (menu_take_restart(g_restart_args, sizeof g_restart_args)) {   /* the Online page: leave the session */
+            show_notice(cpu, 1500);    /* ("leaving the session") */
+            settings_save();
+            g_restart = true;
+            g_quit = true;
+            printf("window: restarting the game%s%s\n", g_restart_args[0] ? " with " : " without netplay", g_restart_args);
+        }
         apply_settings(menu_take_changes());
         present(cpu);
         pace_and_stats();
@@ -1731,6 +1994,17 @@ void window_field(CPUState* cpu) {
     if (g_video_req) {                 /* the game's Options list: Video Settings */
         g_video_req = false;
         open_menu();
+        menu_loop(cpu);
+        return;
+    }
+    if (g_ps2_req) {                   /* the main menu's Online, with the PS2 files */
+        g_ps2_req = false;
+        ps2_loop(cpu);
+        return;
+    }
+    if (g_online_req) {                /* the main menu's Online */
+        g_online_req = false;
+        menu_open_online();
         menu_loop(cpu);
         return;
     }
