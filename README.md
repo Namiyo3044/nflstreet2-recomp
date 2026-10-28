@@ -18,16 +18,7 @@ C:\nfls2\
   recomp\dolrecomp\generated\   DolRecomp output for your main.dol
   tools\dolrecomp\ DolRecomp checkout
   port\            this repo
-  ps2\             optional: .DAT files from your own PS2 copy (see below)
 ```
-
-### PS2 online menus (optional)
-
-The GameCube version has no online mode. If you copy these files from your own
-PS2 disc of the game into `C:\nfls2\ps2`, the main menu's **Online** shows the
-PS2 version's online menus, run by a small player for EA's menu format
-(`src/apt`): `LGENERAL.DAT`, `SGENERAL.DAT`, `FONLINE.DAT`, `FONTS.DAT` and every
-`SON*.DAT`. Without them, Online shows the port's own page.
 
 ## Build (Windows, clang-cl + Ninja)
 

@@ -505,20 +505,11 @@ static int uis_native_hook(CPUState* ctx) {
             if (a0 == a1 || (me == 0 ? a0 : a1)) window_online_request();
         }
 #endif
-        /* With the player's PS2 files: the PS2 version's online menus over
-           the game (apt/ps2online.c), the menu staying as it is. */
-        bool ps2 = false;
-#ifdef NFLS2_HAVE_WINDOW
-        if (!session && window_ps2_online_available()) {
-            ps2 = true;
-            window_ps2_online_request();
-        }
-#endif
-        bool stay = session || ps2;
+        bool stay = session;
         g_video_screen = !stay;
         g_video_back = stay ? 0 : 3;      /* (no screen opens then) */
         uismenu_set_video_page(2);
-        printf("uis: Online picked%s\n", session ? " (in a session: the port's page)" : ps2 ? ": the PS2 online menus" : ": the Online screen");
+        printf("uis: Online picked%s\n", session ? " (in a session: the port's page)" : ": the Online screen");
         mem_write32(ctx, ctx->gpr[8], stay ? 1u : 0u);   /* 1: the menu stays as it is */
         ctx->gpr[3] = 1;
         ctx->pc = ctx->lr;
@@ -1117,7 +1108,7 @@ static void usage(const char* argv0) {
             "         [--gpu (draw with the graphics card) [--res N (its internal resolution, N x 640x528)]]\n"
             "         [--settings FILE (saved video settings; switches override them)] [--software]\n"
             "         [--textures DIR (custom textures, Dolphin format)] [--dump-textures DIR]\n"
-            "         [--ps2 DIR (the PS2 version's .DAT files: Online shows its online menus)]\n"
+            "         [--ps2 DIR (the PS2 version's .DAT files; unused for now)]\n"
             "  <disc folder>  the folder containing sys\\main.dol and files\\ (e.g. C:\\nfls2\\disc)\n",
             argv0);
 }

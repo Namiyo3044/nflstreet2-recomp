@@ -1667,7 +1667,7 @@ static void ps2_log(const char* msg) {
 }
 
 /* The PS2 version's online menus: the game stands still (its sound paused)
-   while they run, 30 frames a second, drawn at up to 720 lines and
+   while they run at their own 60 frames a second, drawn at up to 720 lines and
    stretched over the window. The pad and keyboard drive EA's screens as the
    PS2 pad did: A = X (select), B = Triangle (back), X = Square (Circle, the
    EA Messenger, isn't sent: it's left out).
@@ -1754,8 +1754,9 @@ static void ps2_loop(CPUState* cpu) {
         }
         Uint64 now = SDL_GetTicksNS();
         int steps = 0;
-        while (now >= next && steps < 4) { ps2o_tick(); next += 33333333u; steps++; dirty = true; }
-        if (now >= next) next = now + 33333333u;   /* (far behind: no catching up) */
+        Uint64 frame_ns = (Uint64)(ps2o_frame_ms() * 1e6);
+        while (now >= next && steps < 4) { ps2o_tick(); next += frame_ns; steps++; dirty = true; }
+        if (now >= next) next = now + frame_ns;   /* (far behind: no catching up) */
         int ww = 0, wh = 0;
         SDL_GetWindowSizeInPixels(g_window, &ww, &wh);
         if (ww > 0 && wh > 0) {
@@ -1776,9 +1777,11 @@ static void ps2_loop(CPUState* cpu) {
             dirty = false;
             SDL_GL_SwapWindow(g_window);
         }
-        SDL_Delay(4);
+        SDL_Delay(1);
     }
-    if (draws) printf("ps2 online: closed (%d pictures at %dx%d, %.1f ms each)\n", draws, pw, ph, draw_ms / draws);
+    double secs = (SDL_GetTicksNS() - t0) / 1e9;
+    if (draws) printf("ps2 online: closed (%d pictures at %dx%d, %.1f ms each, %.0f a second)\n", draws, pw, ph, draw_ms / draws,
+                      secs > 0 ? draws / secs : 0);
     ps2o_close();
     free(px);
     if (to_page && !g_quit) {
@@ -1987,7 +1990,7 @@ void window_field(CPUState* cpu) {
                                               MENU_RECOMP_ROWS, "Recomp Settings", k_recomp_label};
         static const UisVideoRows k_online = {menu_online_row_count, menu_online_row_get, menu_online_row_set,
                                               menu_online_row_name, menu_online_row_help, menu_online_row_enabled,
-                                              MENU_ONLINE_ROWS, "Online", k_online_label};
+                                              MENU_ONLINE_ROWS, "Quick Game", k_online_label};
         uismenu_set_video_rows(&k_rows, &k_recomp, &k_online);
         if (!menu_is_open()) {
             MenuInfo mi = {g_gpu, g_gpu_scale, hires_has_folder()};

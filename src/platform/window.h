@@ -48,7 +48,8 @@ void window_trust_screen_shape(void);
 void window_keep_alive(void);
 /* The main menu's Online: opens the port's Online page (netplay). */
 void window_online_request(void);
-/* The PS2 version's online menus (apt/ps2online.h), from the player's PS2
+/* (Dormant for now: Online uses the game's own screens, which custom
+   textures reach.) The PS2 version's online menus (apt/ps2online.h), from the player's PS2
    files in `dir`: available once those are there (and the graphics card
    renderer is in use). The request shows them, the game standing still. */
 void window_set_ps2_dir(const char* dir);

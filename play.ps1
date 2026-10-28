@@ -9,7 +9,6 @@
 #   .\play.ps1 -Textures D:\pack (custom textures in Dolphin's format, .png or .dds; default C:\nfls2\textures, used if it exists)
 #   .\play.ps1 -NoTextures     (the game's own textures only)
 #   .\play.ps1 -Replace D:\dir (files there are read instead of the disc's, e.g. moviedat.dat; default C:\nfls2\replace, used if it exists)
-#   .\play.ps1 -Ps2 D:\dir     (the PS2 version's .DAT files, for its online menus; default C:\nfls2\ps2, used if it exists)
 #   .\play.ps1 -DumpAudio     (record the sound to C:\nfls2\dump\audio.wav)
 #   .\play.ps1 -UisLog        (log each kind of call the menu scripts make, "uis: call" lines)
 #   .\play.ps1 -UisTrace      (log every call the menu scripts make, in order, "uist:" lines)
@@ -50,7 +49,6 @@ param(
     [switch]$NoUiColors,
     [string]$Textures = "C:\nfls2\textures",
     [string]$Replace = "C:\nfls2\replace",
-    [string]$Ps2 = "C:\nfls2\ps2",
     [switch]$NoTextures,
     [switch]$DumpTextures,
     [switch]$DumpAudio,
@@ -137,7 +135,6 @@ if ($UisTrace) { $gameArgs += @("--uis-trace") }
 if ($LodLog) { $gameArgs += @("--lod-log") }
 if (-not $NoTextures -and (Test-Path $Textures)) { $gameArgs += @("--textures", $Textures) }
 if (Test-Path $Replace) { $gameArgs += @("--replace", $Replace) }
-if (Test-Path $Ps2) { $gameArgs += @("--ps2", $Ps2) }
 if ($DumpAudio) {
     New-Item -ItemType Directory -Force -Path "C:\nfls2\dump" | Out-Null
     $gameArgs += @("--dump-audio", "C:\nfls2\dump\audio.wav")
