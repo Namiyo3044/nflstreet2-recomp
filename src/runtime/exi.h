@@ -24,5 +24,7 @@ bool exi_interrupt_pending(void);
 void exi_tick(u64 now);
 u64 exi_next_event(void);
 void exi_report(void);
+/* Saves not yet in the memory card's file written out now. */
+void exi_flush(void);
 
 #endif

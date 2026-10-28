@@ -1,5 +1,7 @@
 #include "runtime/exi.h"
 #include "runtime/netsync.h"
+#include "runtime/prof.h"
+#include "gx/thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,12 +86,80 @@ static u32 card_address(const Card* c) {
 static bool g_card_readonly;
 void exi_set_memcard_readonly(bool on) { g_card_readonly = on; }
 
+/* Saves reach the card's file on a thread of their own, a moment later
+   (the changed range, a few times a second), so the game never waits on the
+   disk (writing a save in the middle of a match took up to 100 ms). */
+static gx_mutex g_card_mx, g_card_file_mx;
+static bool g_card_writer;
+static u32 g_dirty_lo[2], g_dirty_hi[2];   /* the range not yet written (hi 0: none) */
+
+static void card_write_now(int s) {
+    Card* c = &g_card[s];
+    gx_mutex_lock(&g_card_file_mx);
+    gx_mutex_lock(&g_card_mx);
+    u32 lo = g_dirty_lo[s], hi = g_dirty_hi[s];
+    g_dirty_hi[s] = 0;
+    u8* copy = hi > lo ? (u8*)malloc(hi - lo) : NULL;
+    if (copy) memcpy(copy, c->data + lo, hi - lo);
+    gx_mutex_unlock(&g_card_mx);
+    if (copy && c->file) {
+        int prev = prof_enter(PROF_CARD);
+        if (fseek(c->file, (long)lo, SEEK_SET) != 0 || fwrite(copy, 1, hi - lo, c->file) != hi - lo)
+            fprintf(stderr, "memory card: couldn't write %s\n", c->path);
+        fflush(c->file);
+        prof_leave(prev);
+    }
+    free(copy);
+    gx_mutex_unlock(&g_card_file_mx);
+}
+
+static void card_sleep_ms(int ms) {
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    nanosleep(&t, NULL);
+#endif
+}
+
+static void card_writer(void* arg) {
+    (void)arg;
+    for (;;) {
+        card_sleep_ms(250);
+        for (int s = 0; s < 2; s++) if (g_dirty_hi[s]) card_write_now(s);
+    }
+}
+
+/* Everything saved so far written out (at exit, before a restart). */
+void exi_flush(void) {
+    if (!g_card_writer) return;
+    for (int s = 0; s < 2; s++) card_write_now(s);
+}
+
 static void card_save(Card* c, u32 offset, u32 bytes) {
     if (!c->file || g_card_readonly)   /* read-only: saves stay in memory for this run */
         return;
-    if (fseek(c->file, (long)offset, SEEK_SET) != 0 || fwrite(c->data + offset, 1, bytes, c->file) != bytes)
-        fprintf(stderr, "memory card: couldn't write %s\n", c->path);
-    fflush(c->file);
+    int s = c == &g_card[1];
+    if (!g_card_writer) {
+        gx_mutex_init(&g_card_mx);
+        gx_mutex_init(&g_card_file_mx);
+        gx_thread t;
+        if (!gx_thread_create(&t, card_writer, NULL)) {
+            /* (no thread: written at once, as before) */
+            if (fseek(c->file, (long)offset, SEEK_SET) != 0 || fwrite(c->data + offset, 1, bytes, c->file) != bytes)
+                fprintf(stderr, "memory card: couldn't write %s\n", c->path);
+            fflush(c->file);
+            return;
+        }
+        g_card_writer = true;
+    }
+    gx_mutex_lock(&g_card_mx);
+    if (!g_dirty_hi[s]) { g_dirty_lo[s] = offset; g_dirty_hi[s] = offset + bytes; }
+    else {
+        if (offset < g_dirty_lo[s]) g_dirty_lo[s] = offset;
+        if (offset + bytes > g_dirty_hi[s]) g_dirty_hi[s] = offset + bytes;
+    }
+    gx_mutex_unlock(&g_card_mx);
 }
 
 bool exi_insert_memcard(int slot, const char* path) {
@@ -461,6 +531,7 @@ void exi_init(void) {
 }
 
 void exi_report(void) {
+    exi_flush();
     for (int s = 0; s < 2; s++) {
         const Card* c = &g_card[s];
         if (c->present)

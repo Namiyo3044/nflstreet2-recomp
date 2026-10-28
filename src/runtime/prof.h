@@ -2,6 +2,7 @@
 #define NFLS2_PROF_H
 
 #include "cpu/cpu.h"
+#include <stddef.h>
 
 /* Sampling profiler for the game thread. The game thread marks what it is
    doing with a plain store (prof_enter / prof_leave, almost free); a
@@ -18,6 +19,8 @@ enum {
     PROF_PRESENT,       /* showing the picture */
     PROF_SLEEP,         /* waiting for real time (pacing) */
     PROF_RENDER_WAIT,   /* waiting for the drawing threads */
+    PROF_FILES,         /* reading the disc's files */
+    PROF_CARD,          /* writing the memory card file */
     PROF_COUNT
 };
 
@@ -40,6 +43,12 @@ void prof_start(CPUState* cpu);
 unsigned prof_take(unsigned out[PROF_COUNT]);
 
 const char* prof_name(int cat);
+
+/* The last few seconds of samples, for a closer look at one moment: a mark
+   now, then (later) what the samples since that mark show: the shares of
+   the categories and the game functions seen most ("" if no samples). */
+unsigned prof_mark(void);
+void prof_since(unsigned mark, char* out, size_t cap);
 
 /* Whole run: time per category and the game functions that took the most. */
 void prof_report(void);

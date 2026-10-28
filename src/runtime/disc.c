@@ -1,8 +1,11 @@
 #include "disc.h"
+#include "runtime/prof.h"
+#include "gx/thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct {
     uint64_t offset;
@@ -102,6 +105,42 @@ static uint8_t* read_whole(const char* path, size_t* size) {
     fclose(f);
     *size = (size_t)n;
     return data;
+}
+
+/* Each of the disc's files read through once, slowly, on a thread of its
+   own soon after the start: the system keeps them in memory then, so the
+   game's reads during play (sounds, the crowd, path data: small reads all
+   over the files) don't each wait for the drive (up to 100 ms a frame). */
+static void warm_sleep_ms(int ms) {
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec t = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    nanosleep(&t, NULL);
+#endif
+}
+static void warm_files(void* arg) {
+    (void)arg;
+    warm_sleep_ms(3000);
+    enum { CHUNK = 1 << 20 };
+    char* buf = (char*)malloc(CHUNK);
+    if (!buf) return;
+    unsigned long long total = 0;
+    for (size_t i = 0; i < g_count; i++) {
+        bool seen = false;                 /* (a file can back several ranges) */
+        for (size_t j = 0; j < i && !seen; j++) seen = g_ranges[j].path == g_ranges[i].path;
+        if (seen) continue;
+        FILE* f = fopen(g_ranges[i].path, "rb");
+        if (!f) continue;
+        size_t n;
+        while ((n = fread(buf, 1, CHUNK, f)) > 0) {
+            total += n;
+            warm_sleep_ms(1);              /* (gently: the game's own reads come first) */
+        }
+        fclose(f);
+    }
+    free(buf);
+    printf("disc: %.0f MB of the disc's files read ahead\n", total / 1048576.0);
 }
 
 bool disc_open(const char* disc_dir) {
@@ -218,6 +257,8 @@ bool disc_open(const char* disc_dir) {
 
     qsort(g_ranges, g_count, sizeof(Range), cmp_range);
     printf("disc: %zu files mapped from %s\n", g_count, disc_dir);
+    gx_thread warm;
+    gx_thread_create(&warm, warm_files, NULL);
     return true;
 }
 
@@ -240,7 +281,15 @@ static FILE* open_cached(const char* path) {
     return g_handles[victim].f;
 }
 
+static bool disc_read_files(uint64_t offset, void* dst, size_t len);
 bool disc_read(uint64_t offset, void* dst, size_t len) {
+    int prev = prof_enter(PROF_FILES);
+    bool ok = disc_read_files(offset, dst, len);
+    prof_leave(prev);
+    return ok;
+}
+
+static bool disc_read_files(uint64_t offset, void* dst, size_t len) {
     uint8_t* out = (uint8_t*)dst;
     memset(out, 0, len);
     g_reads++;

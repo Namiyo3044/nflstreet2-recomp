@@ -2159,20 +2159,14 @@ static void submit(void) {
     /* Peeks this frame: a few pixels, the same ones as the frames before,
        make probes (read for the game at the end of each frame). */
     if (g_peeks_frame > 0) {
-        bool same = !g_frame_ea_over && g_nframe_ea == g_nprobe && g_peeks_frame <= 2u * PROBE_MAX;
-        for (u32 i = 0; same && i < g_nframe_ea; i++) {
-            bool found = false;
-            for (u32 j = 0; j < g_nprobe; j++) found |= g_probe_ea[j] == g_frame_ea[i];
-            same = found;
-        }
-        if (same) g_probe_streak++;
-        else if (!g_frame_ea_over && g_peeks_frame <= 2u * PROBE_MAX) {
-            /* a new set (only while no probe reads are in use) */
-            if (!g_probe_on) {
-                for (u32 i = 0; i < g_nframe_ea; i++) g_probe_ea[i] = g_frame_ea[i];
-                g_nprobe = g_nframe_ea;
-            }
-            g_probe_streak = 1;
+        /* A few pixels read again, frame after frame, make probes, even when
+           they move (a lens flare's depth test follows the sun as the camera
+           pans): the set follows this frame's pixels, and a read is answered
+           from the probe at (or nearest to) its pixel. */
+        if (!g_frame_ea_over && g_peeks_frame <= 2u * PROBE_MAX) {
+            g_probe_streak++;
+            for (u32 i = 0; i < g_nframe_ea; i++) g_probe_ea[i] = g_frame_ea[i];
+            g_nprobe = g_nframe_ea;
         } else g_probe_streak = 0;
     }
     g_peeks_frame = 0;
@@ -3738,7 +3732,18 @@ u32 gx_raster_peek(u32 ea) {
         }
     }
     int slot = -1;
-    for (u32 k = 0; g_probe_on && k < g_nprobe; k++) if (g_probe_ea[k] == ea) slot = (int)k;
+    {
+        /* the probe at this pixel, or the nearest one (of the same kind, colour or depth) */
+        u32 best = 0xFFFFFFFFu, px = (ea >> 2) & 0x3FFu, py = (ea >> 12) & 0x3FFu;
+        for (u32 k = 0; g_probe_on && k < g_nprobe; k++) {
+            u32 pe = g_probe_ea[k];
+            if ((pe ^ ea) & 0x00400000u) continue;
+            int dx = (int)((pe >> 2) & 0x3FFu) - (int)px, dy = (int)((pe >> 12) & 0x3FFu) - (int)py;
+            u32 d = (u32)(dx * dx + dy * dy);
+            if (d < best) { best = d; slot = (int)k; }
+        }
+        if (best > 48u * 48u) slot = -1;
+    }
     if (slot >= 0 && g_peeks_frame <= 2u * PROBE_MAX) {
         g_peek_probes++;
         u32 c = g_probe_value[slot];

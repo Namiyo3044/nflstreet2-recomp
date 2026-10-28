@@ -17,8 +17,12 @@ static bool g_started;
 
 static const char* const k_names[PROF_COUNT] = {
     "game code", "gpu commands", "vertices", "textures", "locked cache/vmem",
-    "audio mixing", "showing", "pacing sleep", "renderer wait",
+    "audio mixing", "showing", "pacing sleep", "renderer wait", "disc files", "memory card",
 };
+
+#define RING 4096                      /* about 4 s of samples */
+static struct { unsigned char cat; u32 pc; } g_ring[RING];
+static volatile unsigned g_ring_n;
 
 const char* prof_name(int cat) {
     return cat >= 0 && cat < PROF_COUNT ? k_names[cat] : "?";
@@ -41,6 +45,10 @@ static void sampler(void* arg) {
             continue;
         g_now[c]++;
         g_total[c]++;
+        unsigned r = g_ring_n;
+        g_ring[r % RING].cat = (unsigned char)c;
+        g_ring[r % RING].pc = g_cpu->pc;
+        g_ring_n = r + 1;
         if (c == PROF_GAME && g_pc_hist) {
             u32 slot = (g_cpu->pc - 0x80000000u) >> 2;
             if (slot < (24u << 20) / 4u)
@@ -57,6 +65,42 @@ void prof_start(CPUState* cpu) {
     g_pc_hist = (u32*)calloc((24u << 20) / 4u, sizeof(u32));
     gx_thread t;
     gx_thread_create(&t, sampler, NULL);
+}
+
+unsigned prof_mark(void) { return g_ring_n; }
+
+void prof_since(unsigned mark, char* out, size_t cap) {
+    out[0] = 0;
+    unsigned now = g_ring_n, n = now - mark;
+    if (!n || !g_started) return;
+    if (n > RING - 64) { n = RING - 64; mark = now - n; }
+    unsigned cats[PROF_COUNT] = {0};
+    u32 fn[64]; unsigned fc[64]; int nf = 0;
+    for (unsigned i = mark; i != now; i++) {
+        int c = g_ring[i % RING].cat;
+        if (c >= PROF_COUNT) continue;
+        cats[c]++;
+        if (c != PROF_GAME) continue;
+        u32 pc = g_ring[i % RING].pc, f = symbols_function_start(pc);
+        if (!f) f = pc;
+        int k = 0;
+        while (k < nf && fn[k] != f) k++;
+        if (k == nf) { if (nf == 64) continue; fn[nf] = f; fc[nf] = 0; nf++; }
+        fc[k]++;
+    }
+    size_t o = 0;
+    for (int c = 0; c < PROF_COUNT && o < cap; c++)
+        if (cats[c] * 10 >= n)
+            o += (size_t)snprintf(out + o, cap - o, "%s%s %u%%", o ? ", " : "", k_names[c], cats[c] * 100 / n);
+    for (int t = 0; t < 3 && o < cap; t++) {
+        int best = -1;
+        for (int k = 0; k < nf; k++) if (fc[k] && (best < 0 || fc[k] > fc[best])) best = k;
+        if (best < 0 || fc[best] * 20 < n) break;
+        o += (size_t)snprintf(out + o, cap - o, "%s%s %u%%", t ? ", " : "; game code in ", symbols_lookup(fn[best], NULL),
+                              fc[best] * 100 / n);
+        fc[best] = 0;
+    }
+    if (o >= cap) out[cap - 1] = 0;
 }
 
 unsigned prof_take(unsigned out[PROF_COUNT]) {
