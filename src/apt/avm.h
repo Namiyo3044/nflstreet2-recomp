@@ -77,6 +77,8 @@ typedef struct {
     AptFile* (*resolve_lib)(VM* vm, const char* name);    /* imports: "eaStd" etc. */
     void (*level_loaded)(VM* vm, const char* url, int level, Obj* clip);
     void (*fscommand)(VM* vm, const char* cmd, const char* arg);
+    /* before every script function runs (its name may be NULL): the host can change its arguments */
+    void (*on_call)(VM* vm, Obj* fn, Val self, int argc, Val* argv);
     void* user;
 } VMHost;
 

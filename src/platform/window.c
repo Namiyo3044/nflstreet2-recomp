@@ -1669,7 +1669,8 @@ static void ps2_log(const char* msg) {
 /* The PS2 version's online menus: the game stands still (its sound paused)
    while they run, 30 frames a second, drawn at up to 720 lines and
    stretched over the window. The pad and keyboard drive EA's screens as the
-   PS2 pad did: A = X (select), B = Triangle (back), Y = Circle, X = Square.
+   PS2 pad did: A = X (select), B = Triangle (back), X = Square (Circle, the
+   EA Messenger, isn't sent: it's left out).
    Leaving online mode on them (or Quick Game, which goes on to the port's
    own host / join page for now) closes them; so do Esc and F1, at once. */
 static int ps2_key_button(SDL_Keycode k) {
@@ -1680,7 +1681,6 @@ static int ps2_key_button(SDL_Keycode k) {
     case SDLK_RIGHT: return PS2O_RIGHT;
     case SDLK_X: case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_SPACE: return PS2O_X;
     case SDLK_Z: case SDLK_BACKSPACE: return PS2O_TRIANGLE;
-    case SDLK_S: return PS2O_CIRCLE;
     case SDLK_C: return PS2O_SQUARE;
     case SDLK_Q: return PS2O_L1;
     case SDLK_W: return PS2O_R1;
@@ -1695,7 +1695,6 @@ static int ps2_pad_button(int b) {
     case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return PS2O_RIGHT;
     case SDL_GAMEPAD_BUTTON_SOUTH: return PS2O_X;
     case SDL_GAMEPAD_BUTTON_EAST: case SDL_GAMEPAD_BUTTON_BACK: return PS2O_TRIANGLE;
-    case SDL_GAMEPAD_BUTTON_NORTH: return PS2O_CIRCLE;
     case SDL_GAMEPAD_BUTTON_WEST: return PS2O_SQUARE;
     case SDL_GAMEPAD_BUTTON_START: return PS2O_START;
     case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return PS2O_L1;

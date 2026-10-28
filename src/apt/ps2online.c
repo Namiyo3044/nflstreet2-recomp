@@ -248,6 +248,53 @@ const char* ps2o_missing_file(const char* dir) {
     }
     return NULL;
 }
+/* What the port leaves out of EA's screens (there are no EA servers to make
+   them work): of the online main menu only Quick Game stays (its list: one
+   row per item, a row of nothing but its "invalid" marker leaves it out);
+   the EA Messenger hint goes from the button bars. */
+static void on_call(VM* vm, Obj* fn, Val self, int argc, Val* argv) {
+    Str* name = fn->fn->name;
+    if (!name) return;
+    if (!strcmp(name->s, "InitMenu") && argc >= 1 && argv[0].t == V_OBJ && argv[0].o->kind == OK_ARRAY) {
+        ArrExt* rows = argv[0].o->arr;
+        if (rows->n < 1 || rows->items[0].t != V_OBJ || rows->items[0].o->kind != OK_ARRAY) return;
+        ArrExt* first = rows->items[0].o->arr;
+        if (first->n < 1) return;
+        Val invalid = first->items[first->n - 1];
+        if (invalid.t != V_STR || !strstr(invalid.s->s, "INVALID")) return;
+        for (int r = 1; r < rows->n; r++) {
+            if (rows->items[r].t != V_OBJ || rows->items[r].o->kind != OK_ARRAY) continue;
+            ArrExt* row = rows->items[r].o->arr;
+            for (int i = 0; i < row->n; i++) row->items[i] = invalid;
+        }
+        /* and the second row's bar (a shape of the menu's below its first row) */
+        if (self.t == V_OBJ && self.o->kind == OK_CLIP)
+            for (int i = 0; i < self.o->d->nkids; i++) {
+                Obj* k = self.o->d->kids[i].o;
+                if (k->kind == OK_SHAPE && k->d->m[5] > 20) k->d->visible = false;
+            }
+        vm_logf(vm, "online main menu: only %s kept", first->items[0].t == V_STR ? first->items[0].s->s : "the first item");
+    } else if (!strcmp(name->s, "SetHelp") && argc >= 1 && argv[0].t == V_OBJ) {
+        for (int k = 0; k < 8; k++) {
+            char key[16]; snprintf(key, sizeof key, "_oBtn%d", k);
+            Val b = obj_get(vm, argv[0].o, key);
+            if (b.t != V_OBJ) continue;
+            Val d = obj_get(vm, b.o, "sDesc");
+            if (d.t == V_STR && strstr(d.s->s, "Messenger")) {
+                obj_set(vm, b.o, "sDesc", v_str(vm, ""));
+                obj_set(vm, b.o, "sBtn1", v_str(vm, ""));
+                obj_set(vm, b.o, "sBtn2", v_str(vm, ""));
+            }
+        }
+    }
+}
+
+/* the foreground's EA Messenger button (top left) */
+static void hide_messenger(void) {
+    Obj* c = g.vm->levels[12] ? vm_resolve_path(g.vm, "Circle", g.vm->levels[12]) : NULL;
+    if (c && c->kind == OK_CLIP) c->d->visible = false;
+}
+
 bool ps2o_files_present(const char* dir) { return ps2o_missing_file(dir) == NULL; }
 
 bool ps2o_open(const char* dir, void (*log)(const char* msg)) {
@@ -269,6 +316,7 @@ bool ps2o_open(const char* dir, void (*log)(const char* msg)) {
     VMHost host;
     memset(&host, 0, sizeof host);
     host.resolve_movie = resolve_movie;
+    host.on_call = on_call;
     VM* vm = g.vm = vm_new(&host, true);
     vm->log = log;
     vm->nlibs = 5; vm->lib_names = g.lib_names; vm->libs = g.libs;
@@ -297,6 +345,7 @@ bool ps2o_open(const char* dir, void (*log)(const char* msg)) {
         vm_tick(vm, 1000.0 / 30);
         if (i == 2) go_online(vm);
     }
+    hide_messenger();
     vm_gc(vm);                         /* (the online flow has put up its main menu by now) */
     return true;
 }
@@ -309,6 +358,7 @@ void ps2o_tick(void) {
     if (g.vm->trace) g.vm->logs = 0;
     vm_tick(g.vm, 1000.0 / 30);
     g.vm->trace = false;
+    hide_messenger();
     if (++g.ticks % 30 == 0) vm_gc(g.vm);
 }
 

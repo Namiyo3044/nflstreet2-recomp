@@ -959,6 +959,7 @@ static Val call_fn(VM* vm, Obj* fn, Val self, int argc, Val* argv) {
     if (f->native) return f->native(vm, self, argc, argv, f->data);
     if (!f->file) return v_undef();
     if (vm->depth > 120) { vm_logf(vm, "call depth exceeded"); return v_undef(); }
+    if (vm->host.on_call) vm->host.on_call(vm, fn, self, argc, argv);
     if (vm->trace) vm_logf(vm, "%*scall %s this=%s", vm->depth, "", f->name ? f->name->s : "?", describe(vm, self));
     Ctx c;
     memset(&c, 0, sizeof c);
