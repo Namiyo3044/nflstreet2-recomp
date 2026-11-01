@@ -716,7 +716,6 @@ static bool g_tick_ok;                 /* this run is the ticker */
 static CmdList* g_tick_list;
 static CmdList* g_wl;                  /* the list (and first vertex) of the draw being widened */
 static u32 g_wb;
-static u32 g_ovl_frame;                /* the frame the play screen count is for */
 static int g_card_cur, g_card_prev;    /* play-card-sized panels this / last frame */
 static int g_bar_cur, g_bar_prev;      /* plain bars below the panel row, wholly on one side, this / last frame */
 static int g_cbar_cur, g_cbar_prev;    /* and across the middle (the pause menu's rows) */
@@ -750,7 +749,6 @@ static void hudlog_piece(const char* what, u32 n, u32 mtx, bool textured, float 
                                           the popups and the Audible menu's top choice, at 0.57, below) */
 static float g_band_cur = 9.0f, g_band_prev = 9.0f;   /* the stadium banner's lowest edge this / last frame */
 #define HUD_CARDS 2                    /* that many: a play screen is up (Convert has two cards) */
-static u32 g_banner_frame;
 #define HUD_SIDE_LOW 0.50f             /* below it, this far to one side (style point popups) */
 #define HUD_POPUP_LOW 0.30f            /* and no lower than this (players' names are) */
 static volatile int g_hud_match;       /* a match is on (set from the game thread) */
@@ -818,6 +816,225 @@ static void crop_at_sides(SVtx* v, u32 n, float frame) {
             lerp_vtx(&c[i], &c[best], (edge - ui) / (uj - ui), &v[q + (u32)i]);
         }
     }
+}
+
+/* A piece crossing a side of the 16:9 picture (a bar meant to reach the
+   edge): its ends past the side go to the screen's edge. Textured: only
+   long thin bars (the main menu's logo bar is a tinted plain texture), not
+   text or pictures sliding in from the side. */
+static void edge_tail(SVtx* v, u32 n, bool textured, float frame, float mn, float mx) {
+    if ((mn >= -1.0f && mx <= 1.0f) || mx < -1.0f || mn > 1.0f) return;
+    if (textured) {
+        float y0 = 1e9f, y1 = -1e9f, x0 = 1e9f, x1 = -1e9f;
+        for (u32 i = 0; i < n; i++) {
+            if (v[i].y < y0) y0 = v[i].y;
+            if (v[i].y > y1) y1 = v[i].y;
+            if (v[i].x < x0) x0 = v[i].x;
+            if (v[i].x > x1) x1 = v[i].x;
+        }
+        if (mx - mn < 0.4f || (x1 - x0) < 4.0f * (y1 - y0)) return;
+    }
+    for (u32 i = 0; i < n; i++) {
+        float u = v[i].clip[0] / (v[i].clip[3] * frame);
+        if (u < -1.0f || u > 1.0f) {
+            v[i].clip[0] = u < 0.0f ? -v[i].clip[3] : v[i].clip[3];
+            project(&v[i]);
+        }
+    }
+}
+
+/* The match HUD along the top (team 1 on the left, team 2 on the right):
+   its panels move out towards the sides, to the edges of a 21:9 area (the
+   screen's edges at 21:9; at 32:9 they'd be too far out to read at a
+   glance); bars that ran off the side still reach the screen's edge. Below
+   the panels the style point popups go with their side. What moves is
+   decided by where the piece's object sits (its matrix's origin), not by
+   the piece itself: every letter of a word shares it (words stay whole), it
+   doesn't shift as a piece grows or fades, and a message centred on the
+   screen sits in the middle. Only in a match (menus are left alone).
+
+   Each piece is recorded as it is drawn and decided at the end of the frame
+   (hud_flush), when the frame's menus, play cards and boxes are all known. */
+typedef struct {
+    CmdList* l; u32 base, n;
+    float ou, oy, mn, mx, ylo, yhi, avg_a, ou0, oy0, frame;
+    bool textured, ticker;
+} HudRec;
+#define HUD_RECS 4096
+static HudRec g_hud[HUD_RECS];
+static int g_nhud;
+static int g_modal_at = -1;            /* the first screen box's piece this frame (-1: none) */
+
+static void hud_record(SVtx* v, u32 n, bool textured, float alpha, float mn, float mx, float frame) {
+    float ou = v[0].org[0] / frame, oy = v[0].org[1];
+    for (u32 i = 1; i < n; i++)
+        if (v[i].mtx != v[0].mtx) { ou = (mn + mx) * 0.5f; break; }   /* mixed: by the piece itself */
+    float ylo = 1e9f, yhi = -1e9f;
+    for (u32 i = 0; i < n; i++) {
+        float ny = v[i].clip[1] / v[i].clip[3];
+        ylo = fminf(ylo, ny); yhi = fmaxf(yhi, ny);
+    }
+    /* Drawn with the camera's own matrix, or placed from somewhere far off
+       (the music popup's disc is placed from the top of the screen): by the
+       piece itself. */
+    if ((fabsf(ou) < 0.02f && fabsf(oy) < 0.02f) || oy > yhi + 0.3f || oy < ylo - 0.3f) {
+        ou = (mn + mx) * 0.5f;
+        oy = ylo;
+    }
+    float avg_a = alpha / (float)n;    /* (pieces drawn see-through at 0: hidden menus the game keeps drawing) */
+    /* A play card: a big plain (untextured) panel, anywhere across the
+       screen. (The HUD's big messages, "1st Down", are textures with room
+       around the letters, as big; the cards' backgrounds are plain.) */
+    if (!textured && avg_a > 0.05f && v[0].mtx == 0 && n == 4 && mx - mn > 0.2f && mx - mn < 1.2f && yhi - ylo > 0.35f &&
+        yhi - ylo < 1.4f && g_card_cur < 1000)
+        g_card_cur++;
+    /* A menu's bar: a plain panel of some width below the panel row (the
+       popups are text only; the music ticker's box is left out). */
+    if (!textured && avg_a > 0.05f && v[0].mtx == 0 && n == 4 && oy < HUD_PANELS && mx - mn > 0.3f && mx - mn < 1.2f &&
+        g_tick_seq != g_tick_seq_now && g_bar_cur < 1000 && g_cbar_cur < 1000) {
+        if (mx < 0.0f || mn > 0.0f) g_bar_cur++;   /* the Audible menu's boxes, each to one side */
+        else g_cbar_cur++;                        /* a menu in the middle (pause) */
+    }
+    /* A big box over the middle (the end-of-match stats, the pause menu's
+       pages such as Options, Lineups and Controller Layout, a "Feat
+       Complete!" popup): a screen laid over the match, made for 16:9 as a
+       whole (its title, the score and logos above its columns, the frame's
+       side pieces). It is drawn after the match's HUD, so what comes after
+       its box belongs to it and stays where the game puts it; the HUD
+       panels drawn before keep their places at the sides. (Even unseen:
+       the box fades in as the screen opens, and on the screen's first
+       frame it is drawn see-through while its title bar already shows;
+       the pause menu's box is kept drawn see-through under its pages.
+       Nothing that big is drawn see-through during play.) */
+    if (g_modal_at < 0 && !textured && n >= 4 && mx - mn >= 0.45f && mx - mn <= 1.8f &&
+        yhi - ylo >= 0.8f && mn >= -1.1f && mx <= 1.1f)
+        g_modal_at = g_nhud;
+    if (g_nhud >= HUD_RECS) return;
+    HudRec* r = &g_hud[g_nhud++];
+    r->l = g_wl; r->base = g_wb; r->n = n;
+    r->ou = ou; r->oy = oy; r->mn = mn; r->mx = mx; r->ylo = ylo; r->yhi = yhi; r->avg_a = avg_a;
+    r->ou0 = v[0].org[0] / frame; r->oy0 = v[0].org[1]; r->frame = frame; r->textured = textured;
+    r->ticker = g_tick_seq == g_tick_seq_now;
+}
+
+/* The pieces sharing piece k's origin (the letters of one word): is that
+   origin well inside them (centred text, such as a player's name)? */
+static bool hud_centred_text(int k) {
+    const HudRec* r = &g_hud[k];
+    float lo = 1e9f, hi = -1e9f;
+    int count = 0;
+    for (int j = 0; j < g_nhud; j++) {
+        const HudRec* q = &g_hud[j];
+        if (q->ou0 != r->ou0 || q->oy0 != r->oy0 || !q->textured) continue;
+        lo = fminf(lo, q->mn); hi = fmaxf(hi, q->mx);
+        count++;
+    }
+    /* (some of the menu's own words are centred too, but sit higher: its
+       lowest row's words start at their origin) */
+    return count >= 2 && r->ou0 > lo + 0.005f && r->ou0 < hi - 0.005f && r->oy0 < 0.22f;
+}
+
+static void hud_flush(void) {
+    int target = g_target_shape;
+    bool menu_cards = g_card_cur >= HUD_CARDS || g_card_prev >= HUD_CARDS || g_cbar_cur >= HUD_BARS ||
+                      g_cbar_prev >= HUD_BARS;
+    bool menu_bars = g_bar_cur >= HUD_BARS || g_bar_prev >= HUD_BARS;
+    g_banner_cur = 0; g_band_cur = 9.0f;
+    for (int k = 0; k < g_nhud; k++) {
+        HudRec* r = &g_hud[k];
+        SVtx* v = &r->l->verts[r->base];
+        u32 n = r->n;
+        float ou = r->ou, oy = r->oy, mn = r->mn, mx = r->mx, ylo = r->ylo, frame = r->frame;
+        bool textured = r->textured;
+        /* Up among the panels: anything placed to one side. Below them only
+           what is placed well out to the side (the style point popups): the
+           big messages in the middle (some drawn a letter-object at a time,
+           "Conversion Failed") and the game's logo are placed nearer the
+           middle, and the pre-match panels further down. */
+        float side = oy >= HUD_PANELS ? HUD_SIDE : HUD_SIDE_LOW;
+        /* The popups are text, wholly on one side: a plain shape down there
+           (the big messages' banner, sliding in from a side) or anything
+           across the middle stays where the game puts it. */
+        if (oy < HUD_PANELS && (!textured || (mn < 0.0f && mx > 0.0f))) side = 1e9f;
+        /* The popups stack down from 0.57 (0.55, 0.45, ...); a player's name,
+           placed by the player and lower down, goes with the player. */
+        if (oy < HUD_POPUP_LOW) side = 1e9f;
+        bool modal = g_modal_at >= 0 && k >= g_modal_at;
+        bool menu_side = false;            /* moved with its side as a menu piece (below) */
+        if (oy < HUD_MENU_TOP && menu_cards) {
+            side = 1e9f;                   /* play screens stay in the middle */
+        } else if (oy < HUD_MENU_TOP && menu_bars) {
+            /* The Audible menu (bars, no cards): what lies wholly on one side
+               in the upper half goes out with that side, under its team's
+               panel; the rest (the turbo bar, the player's name) stays. */
+            /* (Not a player's name: its letters are centred on the name's
+               own origin, above the player, lower than the menu's words.
+               Judged letter by letter, a name in the middle was pulled
+               apart and one to a side carried off its player.) */
+            if (hud_centred_text(k)) {
+                side = 1e9f;
+            } else if (ylo > -0.1f && (mx < 0.0f || mn > 0.0f)) {
+                ou = mx < 0.0f ? -1.0f : 1.0f;
+                side = HUD_SIDE;
+                menu_side = true;
+            } else {
+                side = 1e9f;
+            }
+        }
+        /* A long bar in that row placed nearer the middle but lying mostly
+           to one side (a stadium's name banner before the match): with its
+           side, so the name stays inside it. (The stadium banner runs along
+           the very top, above the down marker: its bars' lower edges are
+           0.82 and up.) */
+        if (!menu_side && ylo >= HUD_PANELS && ou >= -side && ou <= side) {
+            if (ylo >= 0.8f && mn < -0.6f && mx < 0.5f) ou = -1.0f, g_banner_cur = -1, g_band_cur = fminf(g_band_cur, ylo);
+            else if (ylo >= 0.8f && mx > 0.6f && mn > -0.5f) ou = 1.0f, g_banner_cur = 1, g_band_cur = fminf(g_band_cur, ylo);
+            else if (g_banner_cur || g_banner_prev) {
+                /* the rest of the banner (its faint big name, a letter at a
+                   time, placed from the middle): at the banner's height, not
+                   the down marker centred lower between the panels */
+                float bs = (float)(g_banner_cur ? g_banner_cur : g_banner_prev);
+                if (ylo >= fminf(g_band_cur, g_band_prev) - 0.05f) ou = bs;
+            }
+        }
+        /* A small picture in the panel row placed nearer the middle but
+           lying to one side (the "2" beside a team's Gamebreaker bar):
+           part of that side's panel, so it goes with it. It pulses (its
+           lower edge dips to 0.74), and with the panels opened out it is
+           bigger and nearer the middle (its edge almost at the centre);
+           while they open it zooms in from twice that, over the centre.
+           Its side goes by its middle and its origin, both to that side.
+           The down marker between the panels spans the middle and stays;
+           its letters are placed from the middle. */
+        float mid = (mn + mx) * 0.5f;
+        if (!menu_side && side < 100.0f && textured && ylo >= 0.5f && mx - mn < 0.6f && fabsf(mid) >= 0.1f &&
+            fabsf(ou) >= 0.1f && fabsf(ou) <= side && (ou < 0.0f) == (mid < 0.0f))
+            ou = mid < 0.0f ? -1.0f : 1.0f;
+        if (modal) side = 1e9f;
+        bool move = oy >= HUD_LOW && (ou < -side || ou > side);
+        hudlog_piece(move ? "MOVED" : modal ? "screen" : "kept", n, (u32)v[0].mtx, textured, r->avg_a, mn, mx, ylo, r->yhi,
+                     r->ou0, r->oy0, ou, oy, side);
+        if (move) {
+            float rr = fminf(ultrawide_aspect(target), 21.0f / 9.0f) / (16.0f / 9.0f);
+            float shift = (ou < 0.0f ? -1.0f : 1.0f) * (rr - 1.0f), edge = 1.0f / frame;
+            bool across = mn < 1.0f && mx > -1.0f;   /* partly on the 16:9 picture */
+            for (u32 i = 0; i < n; i++) {
+                float u = v[i].clip[0] / (v[i].clip[3] * frame);
+                float nu = across && u < -1.0f ? -edge : across && u > 1.0f ? edge : u + shift;   /* off the side: to the edge */
+                v[i].clip[0] = nu * v[i].clip[3] * frame;
+                project(&v[i]);
+            }
+            continue;
+        }
+        edge_tail(v, n, textured, frame, mn, mx);
+    }
+    g_nhud = 0;
+    g_modal_at = -1;
+    g_card_prev = g_card_cur; g_card_cur = 0;
+    g_bar_prev = g_bar_cur; g_bar_cur = 0;
+    g_cbar_prev = g_cbar_cur; g_cbar_cur = 0;
+    g_banner_prev = g_banner_cur;
+    g_band_prev = g_band_cur;
 }
 
 static const RenderState* g_wstate;    /* the state of the draw being widened */
@@ -994,122 +1211,13 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
         }
         return;
     }
-    /* The match HUD along the top (team 1 on the left, team 2 on the right):
-       its panels move out towards the sides, to the edges of a 21:9 area
-       (the screen's edges at 21:9; at 32:9 they'd be too far out to read
-       at a glance); bars that ran off the side still reach the screen's
-       edge. Below the panels the style point popups go with their side.
-       What moves is decided by where the piece's object sits (its
-       matrix's origin), not by the piece itself: every letter of a word
-       shares it (words stay whole), it doesn't shift as a piece grows or
-       fades, and a message centred on the screen sits in the middle. Only
-       in a match (menus are left alone). */
-    if (g_setup.persp && !ztest && g_hud_match) {
-        float ou = v[0].org[0] / frame, oy = v[0].org[1];
-        for (u32 i = 1; i < n; i++)
-            if (v[i].mtx != v[0].mtx) { ou = (mn + mx) * 0.5f; break; }   /* mixed: by the piece itself */
-        float ylo = 1e9f, yhi = -1e9f;
-        for (u32 i = 0; i < n; i++) {
-            float ny = v[i].clip[1] / v[i].clip[3];
-            ylo = fminf(ylo, ny); yhi = fmaxf(yhi, ny);
-        }
-        /* Drawn with the camera's own matrix, or placed from somewhere far
-           off (the music popup's disc is placed from the top of the screen):
-           by the piece itself. */
-        if ((fabsf(ou) < 0.02f && fabsf(oy) < 0.02f) || oy > yhi + 0.3f || oy < ylo - 0.3f) {
-            ou = (mn + mx) * 0.5f;
-            oy = ylo;
-        }
-        /* Up among the panels: anything placed to one side. Below them only
-           what is placed well out to the side (the style point popups):
-           the big messages in the middle (some drawn a letter-object at a
-           time, "Conversion Failed") and the game's logo are placed nearer
-           the middle, and the pre-match panels further down. */
-        float side = oy >= HUD_PANELS ? HUD_SIDE : HUD_SIDE_LOW;
-        /* The popups are text, wholly on one side: a plain shape down there
-           (the big messages' banner, sliding in from a side) or anything
-           across the middle stays where the game puts it. */
-        if (oy < HUD_PANELS && (!textured || (mn < 0.0f && mx > 0.0f))) side = 1e9f;
-        /* The popups stack down from 0.57 (0.55, 0.45, ...); a player's name,
-           placed by the player and lower down, goes with the player. */
-        if (oy < HUD_POPUP_LOW) side = 1e9f;
-        /* The play-calling screen fills the lower half with play cards and
-           button bars on both sides; its cards reach up into the popups'
-           space, so while it is up only the panel row moves. Counted over
-           this frame and the last. */
-        if (g_frames != g_ovl_frame) {
-            g_card_prev = g_card_cur; g_card_cur = 0;
-            g_bar_prev = g_bar_cur; g_bar_cur = 0;
-            g_cbar_prev = g_cbar_cur; g_cbar_cur = 0;
-            g_ovl_frame = g_frames;
-        }
-        /* A play card: a big plain (untextured) panel, anywhere across the
-           screen. (The HUD's big messages, "1st Down", are textures with
-           room around the letters, as big; the cards' backgrounds are
-           plain.) */
-        float avg_a = alpha / (float)n;   /* (pieces drawn see-through at 0: hidden menus the game keeps drawing) */
-        if (!textured && avg_a > 0.05f && v[0].mtx == 0 && n == 4 && mx - mn > 0.2f && mx - mn < 1.2f && yhi - ylo > 0.35f && yhi - ylo < 1.4f &&
-            g_card_cur < 1000)
-            g_card_cur++;
-        /* A menu's bar: a plain panel of some width below the panel row (the
-           popups are text only; the music ticker's box is left out). */
-        if (!textured && avg_a > 0.05f && v[0].mtx == 0 && n == 4 && oy < HUD_PANELS && mx - mn > 0.3f && mx - mn < 1.2f &&
-            g_tick_seq != seq && g_bar_cur < 1000 && g_cbar_cur < 1000) {
-            if (mx < 0.0f || mn > 0.0f) g_bar_cur++;   /* the Audible menu's boxes, each to one side */
-            else g_cbar_cur++;                        /* a menu in the middle (pause) */
-        }
-        bool menu_cards = g_card_cur >= HUD_CARDS || g_card_prev >= HUD_CARDS || g_cbar_cur >= HUD_BARS ||
-                          g_cbar_prev >= HUD_BARS;
-        bool menu_bars = g_bar_cur >= HUD_BARS || g_bar_prev >= HUD_BARS;
-        bool menu_side = false;            /* moved with its side as a menu piece (below) */
-        if (oy < HUD_MENU_TOP && menu_cards) {
-            side = 1e9f;                   /* play screens stay in the middle */
-        } else if (oy < HUD_MENU_TOP && menu_bars) {
-            /* The Audible menu (bars, no cards): what lies wholly on one side
-               in the upper half goes out with that side, under its team's
-               panel; the rest (the turbo bar, the player's name) stays. */
-            if (ylo > -0.1f && (mx < 0.0f || mn > 0.0f)) {
-                ou = mx < 0.0f ? -1.0f : 1.0f;
-                side = HUD_SIDE;
-                menu_side = true;
-            } else {
-                side = 1e9f;
-            }
-        }
-        /* A long bar in that row placed nearer the middle but lying mostly
-           to one side (a stadium's name banner before the match): with
-           its side, so the name stays inside it. */
-        if (g_frames != g_banner_frame) {   /* a new frame */
-            g_banner_prev = g_banner_cur; g_banner_cur = 0; g_banner_frame = g_frames;
-            g_band_prev = g_band_cur; g_band_cur = 9.0f;
-        }
-        /* (the stadium banner runs along the very top, above the down
-           marker: its bars' lower edges are 0.82 and up) */
-        if (!menu_side && ylo >= HUD_PANELS && ou >= -side && ou <= side) {
-            if (ylo >= 0.8f && mn < -0.6f && mx < 0.5f) ou = -1.0f, g_banner_cur = -1, g_band_cur = fminf(g_band_cur, ylo);
-            else if (ylo >= 0.8f && mx > 0.6f && mn > -0.5f) ou = 1.0f, g_banner_cur = 1, g_band_cur = fminf(g_band_cur, ylo);
-            else if (g_banner_cur || g_banner_prev) {
-                /* the rest of the banner (its faint big name, a letter at a
-                   time, placed from the middle): at the banner's height, not
-                   the down marker centred lower between the panels */
-                float bs = (float)(g_banner_cur ? g_banner_cur : g_banner_prev);
-                if (ylo >= fminf(g_band_cur, g_band_prev) - 0.05f) ou = bs;
-            }
-        }
-        hudlog_piece(oy >= HUD_LOW && (ou < -side || ou > side) ? "MOVED" : "kept", n, (u32)v[0].mtx, textured,
-                     alpha / (float)n, mn, mx, ylo, yhi, v[0].org[0] / frame, v[0].org[1], ou, oy, side);
-        if (oy >= HUD_LOW && (ou < -side || ou > side)) {
-            float r = fminf(ultrawide_aspect(target), 21.0f / 9.0f) / (16.0f / 9.0f);
-            float shift = (ou < 0.0f ? -1.0f : 1.0f) * (r - 1.0f), edge = 1.0f / frame;
-            bool across = mn < 1.0f && mx > -1.0f;   /* partly on the 16:9 picture */
-            for (u32 i = 0; i < n; i++) {
-                float u = v[i].clip[0] / (v[i].clip[3] * frame);
-                float nu = across && u < -1.0f ? -edge : across && u > 1.0f ? edge : u + shift;   /* off the side: to the edge */
-                v[i].clip[0] = nu * v[i].clip[3] * frame;
-                project(&v[i]);
-            }
-            return;
-        }
+    /* The match HUD along the top: recorded, and moved (or not) once the
+       whole frame has been seen (hud_flush), so that what the frame holds
+       (a menu, play cards, a screen laid over the match) is known from its
+       first frame, whatever order its pieces come in. */
+    if (g_setup.persp && !ztest && g_hud_match && g_wl) {
+        hud_record(v, n, textured, alpha, mn, mx, frame);
+        return;
     }
     if ((mn >= -1.0f && mx <= 1.0f) || mx < -1.0f || mn > 1.0f) return;
     /* Menus: a piece crossing the side of the 16:9 picture as it slides in
@@ -1120,25 +1228,7 @@ static void widen_fullscreen_2d(SVtx* v, u32 n, bool textured, bool ztest, bool 
         crop_at_sides(v, n, frame);
         return;
     }
-    if (textured) {
-        /* Textured: only long thin bars (the main menu's logo bar is a tinted
-           plain texture), not text or pictures sliding in from the side. */
-        float y0 = 1e9f, y1 = -1e9f, x0 = 1e9f, x1 = -1e9f;
-        for (u32 i = 0; i < n; i++) {
-            if (v[i].y < y0) y0 = v[i].y;
-            if (v[i].y > y1) y1 = v[i].y;
-            if (v[i].x < x0) x0 = v[i].x;
-            if (v[i].x > x1) x1 = v[i].x;
-        }
-        if (mx - mn < 0.4f || (x1 - x0) < 4.0f * (y1 - y0)) return;
-    }
-    for (u32 i = 0; i < n; i++) {
-        float u = v[i].clip[0] / (v[i].clip[3] * frame);
-        if (u < -1.0f || u > 1.0f) {
-            v[i].clip[0] = u < 0.0f ? -v[i].clip[3] : v[i].clip[3];
-            project(&v[i]);
-        }
-    }
+    edge_tail(v, n, textured, frame, mn, mx);
 }
 
 /* A point between two vertices (t from a to b), interpolated in clip space. */
@@ -2154,6 +2244,7 @@ static void wait_idle(void) {
 /* Ends the recorded frame: hands its list to the workers (or draws it here
    when there are none) and starts recording into the other list. */
 static void submit(void) {
+    if (!g_defer) hud_flush();         /* (the deferred lists' HUD is done as they're expanded) */
     gx_state_serial++;                 /* the next draw starts a new list: take a fresh snapshot */
     /* Peeks this frame: one at the same pixel as before makes a probe. */
     /* Peeks this frame: a few pixels, the same ones as the frames before,
@@ -2979,6 +3070,7 @@ static const CmdList* expand_list(const CmdList* l) {
         }
     }
     rain_flush(e);
+    hud_flush();                       /* the frame's HUD, now that all of it is known */
     return e;
 }
 
