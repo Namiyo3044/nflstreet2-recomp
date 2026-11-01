@@ -3,6 +3,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
+#include "runtime/netplay.h"
 
 /* The port's video settings menu, drawn over the game (F1 or the
  * controller's Back / View button). It edits g_settings; the window applies
@@ -26,6 +28,20 @@ void menu_open(const MenuInfo* info);
    menu_take_quit() is true once after YES. */
 void menu_open_quit(void);
 bool menu_take_quit(void);
+/* Opens on the Online page (the main menu's Online): host or join netplay. */
+void menu_open_online(void);
+/* The other player left: a notice (shown while this game restarts). */
+void menu_open_online_ended(void);
+/* Each pass of the window's menu loop (hosting / joining going on). */
+void menu_tick(void);
+/* Text being typed (the Online page's address): the window turns text input
+   on while this is true and sends what's typed / Backspace. */
+bool menu_text_wanted(void);
+void menu_text(const char* typed);
+void menu_text_back(void);
+/* Once both netplay players are ready (or one leaves): the options for the
+   game to restart with ("" = no netplay). True once. */
+bool menu_take_restart(char* args, size_t cap);
 bool menu_is_open(void);
 /* The menu colours page is open: the game keeps running behind it (its
    input held idle) so picked colours show as they change. */
@@ -59,6 +75,28 @@ void menu_bind(int code);
    Setting one counts as a change (menu_take_changes). */
 #define MENU_GAME_ROWS 5
 #define MENU_RECOMP_ROWS 6
+/* The game's own Online screen (the main menu's Online): Host a Game, Join a
+   Game, Input Delay, This PC's Address. */
+#define MENU_ONLINE_ROWS 4
+extern const char* const k_online_label[MENU_ONLINE_ROWS];
+int menu_online_row_count(int row);
+int menu_online_row_get(int row);
+void menu_online_row_set(int row, int value);
+const char* menu_online_row_name(int row, int value);
+const char* menu_online_row_help(int row);
+bool menu_online_row_enabled(int row);
+/* The row with the cursor (-1: the screen isn't open), A pressed on a row. */
+void menu_online_focus(int row);
+void menu_online_press(int row);
+/* The address is being typed (Join a Game has the cursor): text, backspace
+   (all: clear it). */
+bool menu_online_typing(void);
+void menu_online_text(const char* typed);
+void menu_online_text_back(bool all);
+/* Every video field: true once the game should restart into the session. */
+bool menu_online_tick(char* args, size_t cap);
+/* The netplay session badge (a picture like menu_draw's, NULL when nothing is to be shown). */
+const uint32_t* menu_hud(int w, int h, bool* dirty, const NetplayStatus* st, bool in_menus);
 extern const char* const k_recomp_label[MENU_RECOMP_ROWS];
 /* What the menus show about the session (the GPU, textures), kept up to date
    for the game's own settings screens too. */

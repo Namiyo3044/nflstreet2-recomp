@@ -1570,10 +1570,8 @@ int main(int argc, char** argv) {
     printf("backtrace (innermost first):\n");
     print_backtrace(&cpu, cpu.gpr[1], cpu.lr, "  ");
     print_threads(&cpu);
-    if (g_debug) {
-        print_profile();
-        prof_report();
-    }
+    if (g_debug) print_profile();
+    prof_report();                     /* (where the game thread's time went: cheap, always) */
     interp_report();
     exi_report();
     if (g_debug) {

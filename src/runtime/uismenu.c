@@ -342,6 +342,9 @@ static const char k_opt_list[] = "|Game Settings|Jukebox|Audio Settings|Save/Loa
 static const char k_opt_list_gc[] = "|Game Settings|Jukebox|Audio/Visual|Save/Load|Cheats and Codes";
 #define VIDEO_AT 2                     /* their places: after Jukebox (Video, then Recomp), above Audio Settings */
 
+static u32 g_audio_case;               /* the Options list's Audio Settings action (opens screen 149) */
+static int g_online_pos = -1;          /* Online's place in the Game Modes list (its case number) */
+
 static bool add_video(u32 h, u32 code_hi) {
     u32 vars = rd(h + 0xC);
     u32 v_list = find_var(vars, k_opt_list), v_gc = find_var(vars, k_opt_list_gc);
@@ -403,6 +406,71 @@ static bool add_video(u32 h, u32 code_hi) {
     emit_jump(at[2]);
     u32 at7[7] = {at[0], at[1], ac, ar, au, at[3], at[4]};
     put_jump(aat, emit_chain_n(at7, 7, ad));
+    g_audio_case = at[2];
+    return true;
+}
+
+/* Online (Game Modes list): its action asks for screen 0x12C (not in the
+   GameCube game) and then starts the online front end, which isn't there
+   either (the menu waits for ever). Its case in the list's switch (a chain
+   like the Options list's) is pointed at code telling the port "Online",
+   then on into the Options list's Audio Settings action: the Audio Settings
+   screen opens, in video mode with the Online rows. */
+static bool add_online(u32 h, u32 code_hi) {
+    if (!g_audio_case || !code_room(64)) return false;
+    /* Where it asks for screen 0x12C: "push 0x38; push 0x12C". */
+    u32 x = 0;
+    for (u32 a = h; a + 10 < code_hi && !x; a++)
+        if (rb(a) == 0x10 && rd(a + 1) == 0x38 && rb(a + 5) == 0x10 && rd(a + 6) == 0x12Cu) x = a;
+    if (!x) {
+        u32 y = 0;
+        for (u32 o = 0x00800000u; o + 16 < RS && !y; o++)
+            if (R[o] == 0x10 && rd(G + o + 1) == 0x38 && R[o + 5] == 0x10 && rd(G + o + 6) == 0x12Cu) y = G + o;
+        printf("uis: main menu: Online's screen request not in its script (script at %08X, found at %08X); Online opens the "
+               "port's page instead\n", h, y);
+        return false;
+    }
+    /* The case it's in: the nearest place at or before it that a switch
+       entry ("dup; push k; ==; push rel; jump-if") jumps to. */
+    u32 entry = 0, c = 0;
+    for (u32 back = 0; back < 0x60 && !entry; back++) {
+        u32 t = x - back;
+        for (u32 a = h; a + 13 < code_hi; a++) {
+            if (rb(a) != 0x41 || rb(a + 1) != 0x10 || rb(a + 6) != 0x36 || rb(a + 7) != 0x10 || rb(a + 12) != 0x3E) continue;
+            if (a + 13 + rd(a + 8) == t) { entry = a; c = t; break; }
+        }
+    }
+    if (!entry) {
+        printf("uis: main menu: Online's case not found (request at script +%X); Online opens the port's page instead\n", x - h);
+        return false;
+    }
+    /* The switch's default (after its last entry). */
+    u32 e = entry;
+    while (rb(e + 13) == 0x41 && rb(e + 14) == 0x10 && rd(e + 15) == rd(e + 2) + 1 && rb(e + 19) == 0x36 &&
+           rb(e + 20) == 0x10 && rb(e + 25) == 0x3E)
+        e += 13;
+    if (rb(e + 13) != 0x10 || rb(e + 18) != 0x40) {
+        printf("uis: main menu: Online's switch isn't as expected; Online opens the port's page instead\n");
+        return false;
+    }
+    u32 dflt = e + 19 + rd(e + 14);
+    /* The port answers 0: on to Audio Settings' way in (the Online screen);
+       1 (in a netplay session: the port's own page instead): nothing more,
+       the input back on (as the entries' "not available" paths) and on as
+       the switch's default. */
+    u32 stub = g_code;
+    emit8(0x41); emit_push(UIS_FN_ONLINE); emit_push(0); emit8(0x0B);
+    emit_push(0); emit8(0x36);
+    u32 skip = g_code;
+    emit_push(0); emit8(0x3F);
+    emit_jump(g_audio_case);
+    wr(skip + 1, g_code - (skip + 6));
+    emit8(0x41); emit_push(0xFFFFFFF5u); emit8(0x1A); emit8(0x43); emit32(0x0001F87Eu); emit8(0x42); emit8(0x42);
+    emit_jump(dflt);
+    wr(entry + 8, stub - (entry + 13));
+    g_online_pos = (int)rd(entry + 2);
+    printf("uis: main menu: Online opens the Online screen (case %u at script +%X, request %u bytes in)\n", rd(entry + 2),
+           c - h, x - c);
     return true;
 }
 
@@ -619,6 +687,8 @@ void uismenu_add_quit(CPUState* cpu) {
     }
     /* Options: a Video Settings entry above Audio Settings. */
     bool video = add_video(h, code_hi);
+    g_online_pos = -1;
+    if (video) add_online(h, code_hi);
     /* Neighbours, set after the script's own set-up of the six. */
     {
         u32 c = g_code;
@@ -681,16 +751,27 @@ void uismenu_add_quit(CPUState* cpu) {
                     u32 j1 = g_code;
                     emit_push(0); emit8(0x40);
                     wr(not1 + 1, g_code - (not1 + 6));
-                    emit_push(2); emit8(0x36);
+                    emit8(0x41); emit_push(2); emit8(0x36);
                     u32 not2 = g_code;
                     emit_push(0); emit8(0x3F);
-                    emit_push(3);
+                    emit8(0x42); emit_push(3);
                     u32 j2 = g_code;
                     emit_push(0); emit8(0x40);
                     wr(not2 + 1, g_code - (not2 + 6));
+                    /* 3: Online (it borrows Audio Settings' way in): its
+                       place in the Game Modes list (the port has made the
+                       page Game Modes, main.c) */
+                    emit_push(3); emit8(0x36);
+                    u32 not3 = g_code;
+                    emit_push(0); emit8(0x3F);
+                    emit_push(g_online_pos >= 0 ? (u32)g_online_pos : 2u);
+                    u32 j3 = g_code;
+                    emit_push(0); emit8(0x40);
+                    wr(not3 + 1, g_code - (not3 + 6));
                     emit_push(4);
                     wr(j1 + 1, g_code - (j1 + 6));
                     wr(j2 + 1, g_code - (j2 + 6));
+                    wr(j3 + 1, g_code - (j3 + 6));
                 } else {
                     emit_push(old_pos + 2);
                 }
@@ -888,7 +969,7 @@ static u32 g_vval_var[VROWS], g_vval_buf[VROWS];
 static bool g_vstarted;                /* its rows have been given their values */
 static int g_vlast[VROWS];
 static const UisVideoRows* g_vcb;      /* the open screen's rows */
-static const UisVideoRows* g_vpages[2]; /* Video Settings, Recomp Settings */
+static const UisVideoRows* g_vpages[3]; /* Video Settings, Recomp Settings, Online */
 static int g_vpage;                    /* which the next one is */
 static int g_vn = VROWS;               /* the open screen's row count */
 static u32 g_vrow_text[VROWS];         /* their value text records */
@@ -1116,13 +1197,21 @@ static int video_rows(u32 h) {
     return g_vn;
 }
 
-void uismenu_set_video_rows(const UisVideoRows* video, const UisVideoRows* recomp) {
+void uismenu_set_video_rows(const UisVideoRows* video, const UisVideoRows* recomp, const UisVideoRows* online) {
     g_vpages[0] = video;
     g_vpages[1] = recomp;
+    g_vpages[2] = online;
     if (!g_vh) g_vcb = g_vpages[g_vpage];
 }
 
-void uismenu_set_video_page(int page) { g_vpage = page ? 1 : 0; }
+void uismenu_set_video_page(int page) { g_vpage = page < 0 || page > 2 ? 0 : page; }
+
+static int g_vfocus = -1;              /* the row with the cursor, last field */
+
+int uismenu_video_focus(int* page) {
+    if (page) *page = g_vh && g_vcb ? (g_vcb == g_vpages[2] ? 2 : g_vcb == g_vpages[1] ? 1 : 0) : -1;
+    return g_vh && g_vstarted ? g_vfocus : -1;
+}
 
 static int g_ven[VROWS];               /* each row usable (1), greyed out (0), not set yet (-1) */
 
@@ -1256,6 +1345,7 @@ void uismenu_video_frame(CPUState* cpu) {
         set_text(g_vrow_text[r], g_vval_var[r], g_vcb->name(r, v), 100);
         if (rd(row + 0x84) == 1) focus = r;
     }
+    g_vfocus = focus;
     if (focus >= 0 && g_vhelp) set_text(g_vhelp, g_vhelp_var, g_vcb->help(focus), 200);
 }
 

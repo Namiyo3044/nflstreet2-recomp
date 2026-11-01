@@ -1,3 +1,4 @@
+#include "runtime/netplay.h"
 #include "platform/menu.h"
 #include "platform/settings.h"
 #include "runtime/uicolors.h"
@@ -20,6 +21,7 @@ static bool g_open;
 static int g_sel;
 static unsigned g_changes;
 static bool g_dirty = true;
+static int g_px_owner;                 /* the picture holds: 0 the menu, 1 the netplay badge */
 static MenuInfo g_info;
 /* The controls page: rows are the GameCube inputs, then "reset" and "back";
    column 0 is the keyboard, 1 the controller. */
@@ -59,6 +61,17 @@ static int g_krow, g_kch;
 /* The quit page: 0 = YES, 1 = NO. */
 static bool g_quit_page, g_quit_yes;
 static int g_qsel;
+/* The Online page (the main menu's Online): host or join a netplay session.
+   Hosting and joining go on while the menu is open (menu_tick); once both
+   players are connected and their settings match, both games restart into
+   the session (menu_take_restart). */
+enum { OP_MAIN, OP_JOIN, OP_HOSTING, OP_CONNECTING, OP_FAILED, OP_READY, OP_SESSION, OP_ENDED };
+static bool g_online;
+static int g_opage, g_osel;
+static char g_oaddr[64];
+static char g_restart[160];
+static bool g_restart_pending;
+#define NET_PORT 7120
 
 void menu_set_players_text(const char* text) {
     if (strcmp(g_players, text) != 0) {
@@ -103,6 +116,7 @@ void menu_open(const MenuInfo* info) {
     g_info = *info;
     g_open = true;
     g_quit_page = false;
+    g_online = false;
     g_sel = g_shape_locked ? MI_DISPLAY : 0;
     g_controls = false;
     g_colors_page = false;
@@ -112,11 +126,354 @@ void menu_open(const MenuInfo* info) {
 
 void menu_open_quit(void) {
     g_open = true;
+    g_online = false;
     g_quit_page = true;
     g_qsel = 1;                        /* NO to start with */
     g_controls = false;
     g_colors_page = false;
     g_capture = 0;
+    g_dirty = true;
+}
+
+void menu_open_online(void) {
+    g_open = true;
+    g_online = true;
+    g_quit_page = false;
+    g_controls = false;
+    g_colors_page = false;
+    g_capture = 0;
+    g_opage = netplay_active() ? OP_SESSION : OP_MAIN;
+    g_osel = 0;
+    if (g_settings.net_delay < 1) g_settings.net_delay = 3;
+    snprintf(g_oaddr, sizeof g_oaddr, "%s", g_settings.net_address);
+    g_dirty = true;
+}
+
+/* The session ended from the other side: a notice while this game restarts. */
+void menu_open_online_ended(void) {
+    menu_open_online();
+    g_opage = OP_ENDED;
+}
+
+bool menu_text_wanted(void) { return g_open && g_online && g_opage == OP_JOIN; }
+
+void menu_text(const char* t) {
+    if (!menu_text_wanted()) return;
+    size_t n = strlen(g_oaddr);
+    for (; *t && n + 1 < sizeof g_oaddr; t++) {
+        char c = *t;
+        if ((c >= '0' && c <= '9') || c == '.' || c == ':' || c == '-' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+            g_oaddr[n++] = c;
+    }
+    g_oaddr[n] = 0;
+    g_dirty = true;
+}
+
+void menu_text_back(void) {
+    size_t n = strlen(g_oaddr);
+    if (n) g_oaddr[n - 1] = 0;
+    g_dirty = true;
+}
+
+static void online_restart(const char* args) {
+    snprintf(g_restart, sizeof g_restart, "%s", args);
+    g_restart_pending = true;
+}
+
+bool menu_take_restart(char* args, size_t cap) {
+    if (!g_restart_pending) return false;
+    g_restart_pending = false;
+    snprintf(args, cap, "%s", g_restart);
+    return true;
+}
+
+/* ------------------------------------- the game's own Online screen --- */
+/* The main menu's Online opens the Audio Settings screen in video mode with
+   these rows (like Recomp Settings): Host a Game and Join a Game switch
+   with left / right (or A), the address is typed on the keyboard while Join
+   a Game has the cursor, and the help line says how it's going. */
+enum { OR_HOST, OR_JOIN, OR_DELAY, OR_ADDR };
+const char* const k_online_label[MENU_ONLINE_ROWS] = {"Host a Game", "Join a Game", "Input Delay", "This PC's Address"};
+enum { OS_IDLE, OS_HOSTING, OS_JOINING, OS_FAILED, OS_READY };
+static int g_ostate;
+static int g_ofocus = -1;              /* the row with the cursor (-1: screen not open) */
+static int g_oready_fields;            /* READY: fields shown before the restart */
+static char g_oaddrs[160];             /* this PC's addresses ("a   b") */
+static int g_onaddr;
+static char g_ovalue[96];
+static bool g_ohosted;                 /* READY: this side hosted */
+static int g_oguard;                   /* fields after a start / stop when another is ignored (A may also
+                                          step the row's value in the game: one press, one switch) */
+
+static void online_addresses(void) {
+    static bool done;
+    if (done) return;
+    done = true;
+    g_onaddr = netplay_local_addresses(g_oaddrs, sizeof g_oaddrs);
+}
+
+static void online_cancel(void) {
+    if (g_ostate == OS_HOSTING || g_ostate == OS_JOINING || g_ostate == OS_FAILED) netplay_lobby_cancel();
+    g_ostate = OS_IDLE;
+}
+
+static void online_host(bool on) {
+    if (g_ostate == OS_READY) return;
+    if (!on) { if (g_ostate == OS_HOSTING) online_cancel(); return; }
+    online_cancel();
+    g_ostate = netplay_lobby_host(NET_PORT, g_settings.net_delay) ? OS_HOSTING : OS_FAILED;
+    printf("online: hosting %s\n", g_ostate == OS_HOSTING ? "(waiting for a player)" : "failed");
+}
+
+static void online_join(bool on) {
+    if (g_ostate == OS_READY) return;
+    if (!on) { if (g_ostate == OS_JOINING) online_cancel(); return; }
+    if (!g_settings.net_address[0]) return;   /* nothing typed yet */
+    online_cancel();
+    g_changes |= 1u << MI_COUNT;       /* (the address is saved) */
+    g_ostate = netplay_lobby_join(g_settings.net_address, g_settings.net_delay) ? OS_JOINING : OS_FAILED;
+    printf("online: joining %s %s\n", g_settings.net_address, g_ostate == OS_JOINING ? "" : "failed");
+}
+
+int menu_online_row_count(int row) {
+    switch (row) {
+    case OR_DELAY: return 12;
+    case OR_ADDR: return g_onaddr > 1 ? g_onaddr : 1;
+    default: return 2;
+    }
+}
+
+int menu_online_row_get(int row) {
+    switch (row) {
+    case OR_HOST: return g_ostate == OS_HOSTING || (g_ostate == OS_READY && g_ohosted) ? 1 : 0;
+    case OR_JOIN: return g_ostate == OS_JOINING || (g_ostate == OS_READY && !g_ohosted) ? 1 : 0;
+    case OR_DELAY: return (g_settings.net_delay < 1 ? 3 : g_settings.net_delay > 12 ? 12 : g_settings.net_delay) - 1;
+    default: return 0;
+    }
+}
+
+void menu_online_row_set(int row, int v) {
+    switch (row) {
+    case OR_HOST: if (!g_oguard) { g_oguard = 12; online_host(v != 0); } break;
+    case OR_JOIN: if (!g_oguard) { g_oguard = 12; online_join(v != 0); } break;
+    case OR_DELAY:
+        g_settings.net_delay = v < 0 ? 1 : v > 11 ? 12 : v + 1;
+        g_changes |= 1u << MI_COUNT;
+        break;
+    default: break;
+    }
+}
+
+const char* menu_online_row_name(int row, int v) {
+    switch (row) {
+    case OR_HOST: return g_ostate == OS_READY && v ? "Player Found!" : v ? "Searching..." : "Press A";
+    case OR_JOIN:
+        if (v) snprintf(g_ovalue, sizeof g_ovalue, "%s", g_ostate == OS_READY ? "Player Found!" : "Connecting...");
+        else if (g_settings.net_address[0])
+            snprintf(g_ovalue, sizeof g_ovalue, "%s%s", g_settings.net_address, g_ofocus == OR_JOIN ? "_" : "");
+        else snprintf(g_ovalue, sizeof g_ovalue, "%s", g_ofocus == OR_JOIN ? "Type It_" : "No Address");
+        return g_ovalue;
+    case OR_DELAY: {
+        static char d[32];
+        snprintf(d, sizeof d, "%d (%d ms)", v + 1, ((v + 1) * 1001 + 30) / 60);
+        return d;
+    }
+    default: {
+        online_addresses();
+        if (!g_onaddr) return "Not Found";
+        static char one[40];
+        const char* p = g_oaddrs;
+        for (int i = 0; i < v && p; i++) { p = strstr(p, "   "); if (p) p += 3; }
+        if (!p) p = g_oaddrs;
+        size_t n = strcspn(p, " ");
+        if (n >= sizeof one) n = sizeof one - 1;
+        memcpy(one, p, n);
+        one[n] = 0;
+        return one;
+    }
+    }
+}
+
+const char* menu_online_row_help(int row) {
+    static char msg[200];
+    if (g_ostate == OS_READY) return "Player found! Both games are restarting. Please wait...";
+    if (g_ostate == OS_FAILED) {
+        const char* m = NULL;
+        int d;
+        netplay_lobby_poll(&m, &d);
+        snprintf(msg, sizeof msg, "%s", m && m[0] ? m : "Something went wrong.");
+        return msg;
+    }
+    if (g_ostate == OS_HOSTING) return "Searching for a game... (waiting for a player to join)";
+    if (g_ostate == OS_JOINING) return "Connecting... Please wait.";
+    switch (row) {
+    case OR_HOST: return "Host a match for a player on another PC to join.";
+    case OR_JOIN: return "Type the host's address, then press Enter or A.";
+    case OR_DELAY: return "Higher hides more lag. The host's delay is used.";
+    default: return g_onaddr > 1 ? "Give one to the player joining (left / right: more)."
+                                 : "Give this to the player joining you.";
+    }
+}
+
+bool menu_online_row_enabled(int row) {
+    if (g_ostate == OS_READY) return row == OR_HOST || row == OR_JOIN ? true : false;
+    if (row == OR_HOST) return g_ostate != OS_JOINING;
+    if (row == OR_JOIN) return g_ostate != OS_HOSTING;
+    if (row == OR_DELAY) return g_ostate == OS_IDLE || g_ostate == OS_FAILED;
+    return true;
+}
+
+void menu_online_focus(int row) {
+    if (row != g_ofocus && row >= 0 && g_ostate == OS_FAILED) online_cancel();   /* moved on from the message */
+    if (row < 0 && g_ofocus >= 0 && g_ostate != OS_READY) online_cancel();      /* screen left: stop */
+    g_ofocus = row;
+}
+
+void menu_online_press(int row) {
+    if (g_ostate == OS_READY || g_oguard) return;
+    if (row == OR_HOST || row == OR_JOIN || g_ostate == OS_FAILED) g_oguard = 12;
+    if (g_ostate == OS_FAILED) { online_cancel(); return; }
+    if (row == OR_HOST) online_host(g_ostate != OS_HOSTING);
+    else if (row == OR_JOIN) online_join(g_ostate != OS_JOINING);
+}
+
+bool menu_online_typing(void) {
+    return g_ofocus == OR_JOIN && (g_ostate == OS_IDLE || g_ostate == OS_FAILED) && !g_open;
+}
+
+void menu_online_text(const char* t) {
+    if (!menu_online_typing()) return;
+    if (g_ostate == OS_FAILED) online_cancel();
+    char* a = g_settings.net_address;
+    size_t n = strlen(a), cap = sizeof g_settings.net_address;
+    for (; *t && n + 1 < cap; t++) {
+        char c = *t;
+        if ((c >= '0' && c <= '9') || c == '.' || c == ':' || c == '-' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+            a[n++] = c;
+    }
+    a[n] = 0;
+    g_changes |= 1u << MI_COUNT;
+}
+
+void menu_online_text_back(bool all) {
+    if (!menu_online_typing()) return;
+    if (g_ostate == OS_FAILED) online_cancel();
+    size_t n = strlen(g_settings.net_address);
+    if (all) g_settings.net_address[0] = 0;
+    else if (n) g_settings.net_address[n - 1] = 0;
+    g_changes |= 1u << MI_COUNT;
+}
+
+/* Every video field: the connection going on. True once the game should
+   restart into the session (args: its options). */
+bool menu_online_tick(char* args, size_t cap) {
+    if (g_oguard > 0) g_oguard--;
+    if (g_ostate == OS_READY) {
+        if (g_oready_fields > 0 && --g_oready_fields == 0) {
+            snprintf(args, cap, "%s", g_restart);
+            return true;
+        }
+        return false;
+    }
+    if (g_ostate != OS_HOSTING && g_ostate != OS_JOINING) return false;
+    const char* msg;
+    int delay;
+    int st = netplay_lobby_poll(&msg, &delay);
+    if (st == NETPLAY_LOBBY_FAILED) {
+        printf("online: %s\n", msg ? msg : "failed");
+        g_ostate = OS_FAILED;
+    } else if (st == NETPLAY_LOBBY_READY) {
+        if (g_ostate == OS_HOSTING) snprintf(g_restart, sizeof g_restart, "--net-host %d --net-delay %d", NET_PORT, delay);
+        else snprintf(g_restart, sizeof g_restart, "--net-join %s --net-delay %d", g_settings.net_address, delay);
+        printf("online: player found, restarting with %s\n", g_restart);
+        g_ohosted = g_ostate == OS_HOSTING;
+        g_ostate = OS_READY;
+        g_oready_fields = 45;          /* "player found" on screen a moment */
+    }
+    return false;
+}
+
+/* Each pass of the menu loop: hosting / joining going on. */
+void menu_tick(void) {
+    if (!g_open || !g_online || (g_opage != OP_HOSTING && g_opage != OP_CONNECTING)) return;
+    const char* msg;
+    int delay;
+    int st = netplay_lobby_poll(&msg, &delay);
+    if (st == NETPLAY_LOBBY_FAILED) {
+        g_opage = OP_FAILED;
+        g_dirty = true;
+    } else if (st == NETPLAY_LOBBY_READY) {
+        char a[160];
+        if (g_opage == OP_HOSTING) snprintf(a, sizeof a, "--net-host %d --net-delay %d", NET_PORT, delay);
+        else snprintf(a, sizeof a, "--net-join %s --net-delay %d", g_oaddr, delay);
+        g_opage = OP_READY;
+        g_dirty = true;
+        online_restart(a);
+    }
+}
+
+static const char k_addr_chars[] = "0123456789.";
+
+static void online_action(int a) {
+    switch (g_opage) {
+    case OP_MAIN:
+        if (a == MENU_UP) g_osel = (g_osel + 3) % 4;
+        else if (a == MENU_DOWN) g_osel = (g_osel + 1) % 4;
+        else if ((a == MENU_LEFT || a == MENU_RIGHT) && g_osel == 2) {
+            int d = g_settings.net_delay + (a == MENU_LEFT ? -1 : 1);
+            g_settings.net_delay = d < 1 ? 1 : d > 12 ? 12 : d;
+            g_changes |= 1u << MI_COUNT;
+        } else if (a == MENU_OK) {
+            if (g_osel == 0) {
+                if (netplay_lobby_host(NET_PORT, g_settings.net_delay)) g_opage = OP_HOSTING;
+                else g_opage = OP_FAILED;
+            } else if (g_osel == 1) {
+                g_opage = OP_JOIN;
+            } else if (g_osel == 3) {
+                g_open = false;
+            }
+        } else if (a == MENU_BACK) {
+            g_open = false;
+        }
+        break;
+    case OP_JOIN: {
+        size_t n = strlen(g_oaddr);
+        if (a == MENU_OK && n) {
+            snprintf(g_settings.net_address, sizeof g_settings.net_address, "%s", g_oaddr);
+            g_changes |= 1u << MI_COUNT;
+            if (netplay_lobby_join(g_oaddr, g_settings.net_delay)) g_opage = OP_CONNECTING;
+            else g_opage = OP_FAILED;
+        } else if (a == MENU_BACK) {
+            g_opage = OP_MAIN;
+        } else if (a == MENU_UP || a == MENU_DOWN) {   /* controller: step the last character */
+            if (!n) { g_oaddr[0] = '0'; g_oaddr[1] = 0; n = 1; }
+            const char* c = strchr(k_addr_chars, g_oaddr[n - 1]);
+            int i = c ? (int)(c - k_addr_chars) : 0, m = (int)strlen(k_addr_chars);
+            i = (i + (a == MENU_UP ? 1 : m - 1)) % m;
+            g_oaddr[n - 1] = k_addr_chars[i];
+        } else if (a == MENU_RIGHT && n + 1 < sizeof g_oaddr) {
+            g_oaddr[n] = '0';
+            g_oaddr[n + 1] = 0;
+        } else if (a == MENU_LEFT && n) {
+            g_oaddr[n - 1] = 0;
+        }
+        break;
+    }
+    case OP_HOSTING:
+    case OP_CONNECTING:
+        if (a == MENU_BACK) { netplay_lobby_cancel(); g_opage = OP_MAIN; }
+        break;
+    case OP_FAILED:
+        if (a == MENU_OK || a == MENU_BACK) { netplay_lobby_cancel(); g_opage = OP_MAIN; }
+        break;
+    case OP_READY:
+        break;
+    case OP_SESSION:
+        if (a == MENU_UP || a == MENU_DOWN) g_osel ^= 1;
+        else if (a == MENU_OK && g_osel == 0) { online_restart(""); g_opage = OP_READY; }
+        else if (a == MENU_OK || a == MENU_BACK) g_open = false;
+        break;
+    }
     g_dirty = true;
 }
 
@@ -127,7 +484,9 @@ bool menu_take_quit(void) {
 }
 
 bool menu_is_open(void) { return g_open; }
-bool menu_live(void) { return g_open && g_colors_page; }
+/* The colours page, and the Online page in a netplay session (the other
+   player's game can't wait for this one): the game runs on behind it. */
+bool menu_live(void) { return g_open && (g_colors_page || (g_online && netplay_active())); }
 
 unsigned menu_take_changes(void) {
     unsigned c = g_changes;
@@ -249,7 +608,14 @@ int menu_recomp_row_get(int row) {
     }
 }
 
+/* Netplay: settings that change the game stay as they are (the other
+   player's game has the same; changing one here would part them). */
+static bool net_locked(int row) {
+    return netplay_active() && row == RR_RAIN;   /* (the intros only matter at start-up) */
+}
+
 void menu_recomp_row_set(int row, int v) {
+    if (net_locked(row)) return;
     switch (row) {
     case RR_RAIN:
         g_settings.ps2_rain = k_rain_row[v < 0 ? 0 : v > 2 ? 2 : v];
@@ -279,6 +645,7 @@ void menu_recomp_row_set(int row, int v) {
 }
 
 bool menu_recomp_row_enabled(int row) {
+    if (net_locked(row)) return false;
     if (row == RR_TEXTURES) return g_info.textures_found && g_settings.renderer == 0;
     if (row == RR_SPECULAR) return g_settings.renderer == 0;
     return true;
@@ -393,6 +760,10 @@ static void colors_action(int a) {
 
 void menu_action(int a) {
     if (!g_open) return;
+    if (g_online) {
+        online_action(a);
+        return;
+    }
     if (g_quit_page) {
         switch (a) {
         case MENU_UP: case MENU_DOWN: case MENU_LEFT: case MENU_RIGHT: g_qsel ^= 1; break;
@@ -647,6 +1018,7 @@ static bool needs_restart(int i) {
 
 static void draw_controls(int w, int h, float u);
 static void draw_colors(int w, int h, float u);
+static void draw_online(int w, int h, float u);
 
 #define COL_ORANGE 0xFF7A00u
 #define COL_YELLOW 0xFFD21Fu
@@ -668,6 +1040,7 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
         g_dirty = true;
         if (!g_px) { g_w = g_h = 0; *dirty = false; return NULL; }
     }
+    if (g_px_owner != 0) { g_px_owner = 0; g_dirty = true; }
     *dirty = g_dirty;
     if (!g_dirty) return g_px;
     g_dirty = false;
@@ -681,6 +1054,10 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
         return g_px;
     }
     fill_rect(0, 0, w, h, 0, 150);                     /* the game, dimmed */
+    if (g_online) {
+        draw_online(w, h, u);
+        return g_px;
+    }
     if (g_quit_page) {
         int pw = U(760), ph = U(330);
         int px0 = (w - pw) / 2, py0 = (h - ph) / 2;
@@ -911,5 +1288,186 @@ static void draw_colors(int w, int h, float u) {
     const char* help = g_kedit ? "UP / DOWN: RED, GREEN OR BLUE     LEFT / RIGHT: CHANGE     A OR B: DONE"
                                : "LEFT / RIGHT: COLOUR     A / ENTER: FINE-TUNE     B / ESC: BACK";
     text(help, (float)(px0 + pw / 2), py0 + ph + U(40), U(22), COL_WHITE, 255, 2);
+#undef U
+}
+
+/* --------------------------------------------------------- Online page --- */
+/* In the PS2 version's online colours: navy and teal on a dark panel. */
+#define COL_NAVY 0x0A1E5Au
+#define COL_TEAL 0x1C9AB4u
+#define COL_TEAL_LIGHT 0x8FE3F0u
+
+/* ------------------------------------------------- netplay session badge --- */
+/* A small badge in the corner during a session: which player this is and how
+   the connection is (four bars from the round trip). In the menus it's always
+   there; in a match only when something needs saying: waiting for the other
+   player, a weak connection, or the games out of sync. */
+static u32 g_hud_key = 0xFFFFFFFFu;
+
+const uint32_t* menu_hud(int w, int h, bool* dirty, const NetplayStatus* st, bool in_menus) {
+    int bars = st->ping_ms < 0 ? 0 : st->ping_ms < 60 ? 4 : st->ping_ms < 120 ? 3 : st->ping_ms < 200 ? 2 : 1;
+    bool waiting = st->waiting_ms > 400;
+    bool show = in_menus || waiting || st->out_of_sync || (bars > 0 && bars <= 1);
+    u32 key = (u32)show | (u32)bars << 1 | (u32)waiting << 4 | (u32)st->out_of_sync << 5 | (u32)st->player << 6 |
+              (u32)in_menus << 8 | (u32)(st->recent_wait) << 9;
+    if (!g_font_ok) {
+        g_font_ok = stbtt_InitFont(&g_font, k_font_anton, stbtt_GetFontOffsetForIndex(k_font_anton, 0)) != 0;
+    }
+    if (w != g_w || h != g_h || !g_px) {
+        free(g_px);
+        g_px = (u32*)malloc((size_t)w * (size_t)h * 4);
+        g_w = w; g_h = h; key ^= 0x80000000u;
+        if (!g_px) { g_w = g_h = 0; *dirty = false; return NULL; }
+    }
+    if (g_px_owner != 1) { g_px_owner = 1; g_hud_key = ~key; }
+    *dirty = key != g_hud_key;
+    if (!*dirty) return show ? g_px : NULL;
+    g_hud_key = key;
+    memset(g_px, 0, (size_t)w * (size_t)h * 4);
+    if (!show) { *dirty = true; return NULL; }
+    float u = (float)h / 1080.0f;
+#define U(v) ((int)((v) * u + 0.5f))
+    int x0 = U(28), y0 = U(26), bw = U(waiting || st->out_of_sync ? 470 : 250), bh = U(58);
+    fill_rect(x0, y0, x0 + bw, y0 + bh, COL_PANEL, 200);
+    fill_rect(x0, y0 + bh - U(4), x0 + bw, y0 + bh, st->out_of_sync ? 0xD02020u : COL_TEAL, 255);
+    char line[64];
+    snprintf(line, sizeof line, "P%d", st->player);
+    text(line, (float)(x0 + U(14)), y0 + U(44), U(40), COL_WHITE, 255, 0);
+    text(st->player == 1 ? "HOST" : "JOINED", (float)(x0 + U(62)), y0 + U(40), U(26), COL_GREY, 255, 0);
+    /* connection: four bars */
+    int gx = x0 + U(160);
+    for (int i = 0; i < 4; i++) {
+        int bx = gx + i * U(18), top = y0 + U(42) - U(8) * (i + 1);
+        u32 c = i < bars ? (bars >= 3 ? COL_TEAL_LIGHT : bars == 2 ? COL_YELLOW : COL_ORANGE) : COL_DIM;
+        fill_rect(bx, top, bx + U(12), y0 + U(44), c, 255);
+    }
+    if (st->out_of_sync)
+        text("OUT OF SYNC", (float)(x0 + U(250)), y0 + U(42), U(32), 0xFF5050u, 255, 0);
+    else if (waiting)
+        text("WAITING FOR OPPONENT...", (float)(x0 + U(250)), y0 + U(42), U(26), COL_YELLOW, 255, 0);
+#undef U
+    return g_px;
+}
+
+
+static void draw_online(int w, int h, float u) {
+#define U(v) ((int)((v) * u + 0.5f))
+    int pw = U(1040), ph = U(700);
+    int px0 = (w - pw) / 2, py0 = (h - ph) / 2;
+    fill_rect(px0, py0, px0 + pw, py0 + ph, COL_PANEL, 236);
+    fill_rect(px0, py0 + ph - U(6), px0 + pw, py0 + ph, COL_TEAL, 255);
+    int by0 = py0 - U(36), by1 = py0 + U(78);
+    fill_slant(px0 - U(24), by0, px0 + U(330), by1, U(28), COL_NAVY, 255);
+    fill_slant(px0 + U(340), by0 + U(18), px0 + U(372), by1, U(26), COL_TEAL, 255);
+    text("ONLINE", (float)(px0 + U(28)), by1 - U(24), U(78), COL_WHITE, 255, 0);
+    int lx = px0 + U(60), cx = w / 2, ty = py0 + U(170);
+    const char* hint = "";
+    char line[256];
+    switch (g_opage) {
+    case OP_MAIN: {
+        static const char* const k_rows[4] = {"HOST A GAME", "JOIN A GAME", "INPUT DELAY", "BACK"};
+        static const char* const k_help[4] = {
+            "Wait for another player to join you. You will be player 1, and your memory card is used.",
+            "Join a game another player is hosting, by their address. You will be player 2.",
+            "How many video fields ahead each controller is sent, to hide the connection's delay. 3 suits a home network; "
+            "over the internet, about your ping in milliseconds divided by 16, plus 1. The host's is used.",
+            "Back to the main menu."};
+        int row_h = U(74), ry = py0 + U(120);
+        for (int i = 0; i < 4; i++) {
+            int y0 = ry + i * row_h + (i == 3 ? U(16) : 0);
+            bool sel = i == g_osel;
+            if (sel) {
+                fill_rect(px0 + U(24), y0, px0 + pw - U(24), y0 + row_h - U(8), COL_TEAL, 52);
+                fill_rect(px0 + U(24), y0, px0 + U(34), y0 + row_h - U(8), COL_TEAL, 255);
+            }
+            text(k_rows[i], (float)lx, y0 + U(52), U(42), sel ? COL_TEAL_LIGHT : COL_GREY, 255, 0);
+            if (i == 2) {
+                snprintf(line, sizeof line, "%d FIELDS (%d MS)", g_settings.net_delay, (g_settings.net_delay * 1001 + 30) / 60);
+                int vx = px0 + pw - U(70), vw = (int)text_width(line, U(40));
+                text(line, (float)vx, y0 + U(52), U(40), sel ? COL_WHITE : 0xE6E6E6u, 255, 1);
+                if (sel) {
+                    arrow(vx - vw - U(26), y0 + U(37), U(10), -1, COL_TEAL_LIGHT, 255);
+                    arrow(vx + U(22), y0 + U(37), U(10), 1, COL_TEAL_LIGHT, 255);
+                }
+            }
+        }
+        int hy = ry + 4 * row_h + U(56);
+        fill_rect(px0 + U(60), hy - U(10), px0 + pw - U(60), hy - U(8), COL_DIM, 255);
+        text_wrapped(k_help[g_osel], (float)lx, hy + U(36), (float)(pw - U(120)), U(28), U(36), COL_GREY, 255);
+        hint = "UP / DOWN: CHOOSE     LEFT / RIGHT: CHANGE     A / ENTER: SELECT     B / ESC: BACK";
+        break;
+    }
+    case OP_JOIN: {
+        text("THE HOST'S ADDRESS", (float)lx, ty - U(20), U(34), COL_GREY, 255, 0);
+        int fy0 = ty, fy1 = ty + U(86);
+        fill_rect(lx, fy0, px0 + pw - U(60), fy1, 0x000000u, 200);
+        fill_rect(lx, fy1 - U(5), px0 + pw - U(60), fy1, COL_TEAL, 255);
+        snprintf(line, sizeof line, "%s_", g_oaddr);
+        text(line, (float)(lx + U(20)), fy1 - U(24), U(54), COL_WHITE, 255, 0);
+        text_wrapped("Type it on the keyboard (for example 192.168.1.23) or paste it with CTRL+V. With a controller: "
+                     "UP / DOWN changes the last character, RIGHT adds one, LEFT removes one. Add :PORT if the host "
+                     "uses another port than 7120.",
+                     (float)lx, fy1 + U(70), (float)(pw - U(120)), U(28), U(36), COL_GREY, 255);
+        hint = "TYPE OR CTRL+V: ADDRESS     ENTER: CONNECT     ESC: BACK";
+        break;
+    }
+    case OP_HOSTING: {
+        text("WAITING FOR A PLAYER TO JOIN...", (float)cx, ty, U(48), COL_TEAL_LIGHT, 255, 2);
+        char addrs[200];
+        int n = netplay_local_addresses(addrs, sizeof addrs);
+        text("GIVE THE OTHER PLAYER THIS PC'S ADDRESS:", (float)cx, ty + U(90), U(32), COL_GREY, 255, 2);
+        text(n ? addrs : "(NOT FOUND: SEE IPCONFIG)", (float)cx, ty + U(160), U(54), COL_WHITE, 255, 2);
+        text_wrapped("On the same home network that's all. Over the internet: use a virtual network both of you join "
+                     "(such as Tailscale) and its address, or forward TCP port 7120 on your router and give your "
+                     "public address. Windows may ask to allow the game through its firewall.",
+                     (float)lx, ty + U(240), (float)(pw - U(120)), U(28), U(36), COL_GREY, 255);
+        hint = "B / ESC: STOP HOSTING";
+        break;
+    }
+    case OP_CONNECTING:
+        snprintf(line, sizeof line, "CONNECTING TO %s...", g_oaddr);
+        text(line, (float)cx, ty + U(60), U(46), COL_TEAL_LIGHT, 255, 2);
+        hint = "B / ESC: CANCEL";
+        break;
+    case OP_FAILED: {
+        const char* msg;
+        int d;
+        netplay_lobby_poll(&msg, &d);
+        text("COULDN'T START THE SESSION", (float)cx, ty, U(46), COL_ORANGE, 255, 2);
+        text_wrapped(msg && msg[0] ? msg : "SOMETHING WENT WRONG.", (float)lx, ty + U(80), (float)(pw - U(120)), U(32),
+                     U(42), COL_WHITE, 255);
+        hint = "A / B: BACK";
+        break;
+    }
+    case OP_READY:
+        text(netplay_active() ? "LEAVING THE SESSION..." : "PLAYER FOUND!", (float)cx, ty + U(40), U(58), COL_TEAL_LIGHT, 255, 2);
+        text(netplay_active() ? "RESTARTING THE GAME ON ITS OWN" : "BOTH GAMES ARE RESTARTING INTO THE SESSION",
+             (float)cx, ty + U(120), U(34), COL_GREY, 255, 2);
+        break;
+    case OP_ENDED:
+        text("CONNECTION LOST", (float)cx, ty + U(40), U(58), COL_TEAL_LIGHT, 255, 2);
+        text("The connection to your opponent has been lost.", (float)cx, ty + U(120), U(34), COL_GREY, 255, 2);
+        text("Restarting the game...", (float)cx, ty + U(170), U(34), COL_GREY, 255, 2);
+        break;
+    case OP_SESSION: {
+        text("YOU'RE IN AN ONLINE SESSION", (float)cx, ty - U(10), U(46), COL_TEAL_LIGHT, 255, 2);
+        static const char* const k_rows[2] = {"LEAVE THE SESSION", "BACK"};
+        int row_h = U(74), ry = ty + U(60);
+        for (int i = 0; i < 2; i++) {
+            int y0 = ry + i * row_h;
+            bool sel = i == g_osel;
+            if (sel) {
+                fill_rect(px0 + U(24), y0, px0 + pw - U(24), y0 + row_h - U(8), COL_TEAL, 52);
+                fill_rect(px0 + U(24), y0, px0 + U(34), y0 + row_h - U(8), COL_TEAL, 255);
+            }
+            text(k_rows[i], (float)lx, y0 + U(52), U(42), sel ? COL_TEAL_LIGHT : COL_GREY, 255, 0);
+        }
+        text_wrapped("Leaving ends the session: both games restart on their own.",
+                     (float)lx, ry + 2 * row_h + U(50), (float)(pw - U(120)), U(28), U(36), COL_GREY, 255);
+        hint = "UP / DOWN: CHOOSE     A / ENTER: SELECT     B / ESC: BACK";
+        break;
+    }
+    }
+    if (hint[0]) text(hint, (float)(w / 2), py0 + ph + U(50), U(26), COL_GREY, 230, 2);
 #undef U
 }

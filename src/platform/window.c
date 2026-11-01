@@ -1502,13 +1502,18 @@ static Uint64 g_hitch_last;           /* 0: start measuring afresh (after the me
 
 static void log_hitch(Uint64 now) {
     static Uint64 last_present;
+    static unsigned mark;              /* the profiler's samples since the last field */
     Uint64 took = g_hitch_last ? now - g_hitch_last : 0;
     Uint64 shown = g_present_ns >= last_present ? g_present_ns - last_present : g_present_ns;
     g_hitch_last = now;
     last_present = g_present_ns;
-    if (took > 50000000ull && !turbo() && g_field > 120)
-        printf("hitch: %5.1f s game time, one field took %3.0f ms (showing the picture %2.0f ms)\n",
-               interrupts_game_seconds(), (double)took * 1e-6, (double)shown * 1e-6);
+    if (took > 50000000ull && !turbo() && g_field > 120) {
+        char where[256];
+        prof_since(mark, where, sizeof where);
+        printf("hitch: %5.1f s game time, one field took %3.0f ms (showing the picture %2.0f ms)%s%s\n",
+               interrupts_game_seconds(), (double)took * 1e-6, (double)shown * 1e-6, where[0] ? " | " : "", where);
+    }
+    mark = prof_mark();
 }
 
 static void pace_and_stats(void) {
@@ -1546,6 +1551,10 @@ static void pace_and_stats(void) {
         gx_raster_take_perf(&wait, &draw_avg, &draw_max, &tris);
         unsigned samples[PROF_COUNT];
         unsigned total = prof_take(samples);
+        static unsigned sec_mark;
+        char busiest[256];
+        prof_since(sec_mark, busiest, sizeof busiest);
+        sec_mark = prof_mark();
         if (speed < 95.0) {
             double slept = (double)g_slept_ns * 1e-9, shown = (double)g_present_ns * 1e-9;
             double game = secs - slept - shown - wait;
@@ -1560,6 +1569,8 @@ static void pace_and_stats(void) {
                         printf(" %s %u%%", prof_name(c), samples[c] * 100u / total);
                 printf("\n");
             }
+            const char* fns = strstr(busiest, "game code in ");
+            if (fns) printf("perf:   busiest: %s\n", fns);
         }
         if (g_audio_sec_underruns || g_audio_sec_dropped)
             printf("audio: %5.1f s game time, %u buffers this second, ran dry %u times, dropped %u, lowest queue %.1f ms\n",

@@ -18,6 +18,7 @@
 #define UIS_FN_VIDEO_BACK 0x7A54u   /* 1 once when back from Video Settings */
 #define UIS_FN_FLICKER_DONE 0x7A55u /* after the quit dialog: the text flicker finished */
 #define UIS_FN_RECOMP 0x7A56u       /* ... and to open the port's Recomp Settings (Options list) */
+#define UIS_FN_ONLINE 0x7A57u       /* ... and the Online screen (Game Modes list's Online) */
 
 /* The main menu's text-flicker pieces shown again in full (a dialog opened
    while one was flickering stopped it part way, leaving text hidden). */
@@ -48,11 +49,13 @@ typedef struct {
     const char* title;
     const char* const* labels;         /* each row's label */
 } UisVideoRows;
-/* The two screens made from Audio Settings: Video Settings (page 0) and
-   Recomp Settings (page 1). */
-void uismenu_set_video_rows(const UisVideoRows* video, const UisVideoRows* recomp);
+/* The screens made from Audio Settings: Video Settings (page 0), Recomp
+   Settings (page 1) and Online (page 2, the main menu's Online). */
+void uismenu_set_video_rows(const UisVideoRows* video, const UisVideoRows* recomp, const UisVideoRows* online);
 /* Which of them the next Audio Settings screen in video mode is. */
 void uismenu_set_video_page(int page);
+/* The open one's row with the cursor (-1: none open) and its page. */
+int uismenu_video_focus(int* page);
 
 /* Video Settings is open (the Audio Settings screen in video mode). */
 bool uismenu_video_active(CPUState* cpu);

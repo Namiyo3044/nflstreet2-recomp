@@ -8,6 +8,7 @@
    for the other's for this field. */
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "runtime/pad.h"
 
 struct CPUState;
@@ -34,9 +35,41 @@ void netplay_field(struct CPUState* cpu, unsigned long long field);
    (ports 1-2; false: not a netplay port). */
 bool netplay_pad(int port, PadLive* out);
 bool netplay_connected(int port, bool* out);
+/* This side's controller port in the session (0 host, 1 joiner; -1: none). */
+int netplay_local_port(void);
+/* How the session is going, for the on-screen badge. */
+typedef struct {
+    int player;                        /* 1 host, 2 joiner */
+    int ping_ms;                       /* round trip (-1: not measured yet) */
+    int waiting_ms;                    /* waiting for the other player's input right now, for so long */
+    bool recent_wait;                  /* had to wait in the last moment (a hitch) */
+    bool out_of_sync, lost;
+    int delay;                         /* input delay in fields */
+} NetplayStatus;
+bool netplay_status(NetplayStatus* st);
 
 /* Called now and then while waiting for the other player (keeps the window
    answering the system). */
 void netplay_set_idle(void (*fn)(void));
+
+/* The Online menu (the game runs on meanwhile). Poll each frame: the state,
+   a message for the player (why it failed), and the agreed input delay once
+   READY, when both games restart into the session. */
+enum { NETPLAY_LOBBY_IDLE, NETPLAY_LOBBY_WAITING, NETPLAY_LOBBY_CONNECTING, NETPLAY_LOBBY_READY, NETPLAY_LOBBY_FAILED };
+bool netplay_lobby_host(int port, int delay);
+bool netplay_lobby_join(const char* address, int delay);
+int netplay_lobby_poll(const char** message, int* delay);
+void netplay_lobby_cancel(void);
+/* The settings fingerprint, worked out when needed (the settings can change). */
+void netplay_set_fingerprint(const char* (*fn)(void));
+/* This PC's network addresses, for the host to give out. Returns how many. */
+int netplay_local_addresses(char* out, size_t cap);
+
+/* The connection went (the other player left or the network failed). */
+bool netplay_lost(void);
+/* Tells the other player this game is leaving and closes the connections
+   (before the game ends or restarts: a restarted game would otherwise keep
+   them open, and the other player's game would wait on it). */
+void netplay_close(void);
 
 void netplay_report(void);

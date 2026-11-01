@@ -40,6 +40,7 @@ static struct {
     Loaded files[96]; int nfiles;
     const char* lib_names[5]; AptFile* libs[5];
     int ticks;
+    double frame_ms;                   /* the movies' frame time (60 a second) */
     char flow[48];                     /* the last flow the screens asked to change to (once) */
     void (*log)(const char* msg);
     /* the message being sent (Msg.Start .. Msg.End) */
@@ -341,8 +342,10 @@ bool ps2o_open(const char* dir, void (*log)(const char* msg)) {
         holder->d->playing = false;
     }
     g.open = true;
-    for (int i = 0; i < 40; i++) {
-        vm_tick(vm, 1000.0 / 30);
+    /* the movies' own frame rate: 16 ms (written whole) is 60 a second */
+    g.frame_ms = shell->movie->ms >= 16 && shell->movie->ms <= 17 ? 1000.0 / 60 : shell->movie->ms > 0 ? shell->movie->ms : 1000.0 / 60;
+    for (int i = 0; i < 80; i++) {
+        vm_tick(vm, g.frame_ms);
         if (i == 2) go_online(vm);
     }
     hide_messenger();
@@ -351,15 +354,16 @@ bool ps2o_open(const char* dir, void (*log)(const char* msg)) {
 }
 
 bool ps2o_is_open(void) { return g.open; }
+double ps2o_frame_ms(void) { return g.open && g.frame_ms > 0 ? g.frame_ms : 1000.0 / 60; }
 
 void ps2o_tick(void) {
     if (!g.open) return;
     g.vm->trace = getenv("APT_TRACE_TICK") != NULL;
     if (g.vm->trace) g.vm->logs = 0;
-    vm_tick(g.vm, 1000.0 / 30);
+    vm_tick(g.vm, g.frame_ms);
     g.vm->trace = false;
     hide_messenger();
-    if (++g.ticks % 30 == 0) vm_gc(g.vm);
+    if (++g.ticks % 60 == 0) vm_gc(g.vm);
 }
 
 void ps2o_draw(uint32_t* px, int w, int h) {

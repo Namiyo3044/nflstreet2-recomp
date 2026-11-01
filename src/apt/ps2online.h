@@ -15,7 +15,8 @@ const char* ps2o_missing_file(const char* dir);
    missing or broken. */
 bool ps2o_open(const char* dir, void (*log)(const char* msg));
 bool ps2o_is_open(void);
-/* one frame of the menus (30 per second) */
+/* one frame of the menus (every ps2o_frame_ms: the movies' own rate, 60 a second) */
+double ps2o_frame_ms(void);
 void ps2o_tick(void);
 /* the picture for a w x h window (0xAARRGGBB, premultiplied) */
 void ps2o_draw(uint32_t* px, int w, int h);

@@ -36,6 +36,8 @@ typedef struct {
     int screen_filters;                /* 1: the game's colour filters over the picture in matches, 0: off */
     int skip_intros;                   /* 1: boot straight to the title screen (intro movies fast-forwarded) */
     int specular;                      /* highlights on lit models (graphics card only): 0 off (as on GameCube), 1 subtle, 2 accurate (PS2) */
+    int net_delay;                     /* netplay: input delay in video fields (Online menu) */
+    char net_address[64];              /* netplay: the last address joined */
 } Settings;
 
 extern Settings g_settings;
