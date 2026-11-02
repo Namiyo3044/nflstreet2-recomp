@@ -11,6 +11,8 @@ void exi_init(void);
 /* Read-only: what the game saves isn't written back to the card file (for
    repeatable runs). */
 void exi_set_memcard_readonly(bool on);
+/* Transfers as slow as real hardware (normally 8 times faster). */
+void exi_set_memcard_real_speed(bool on);
 bool exi_insert_memcard(int slot, const char* path);
 /* A card from memory (netplay: the host's), never written to a file. */
 bool exi_insert_memcard_data(int slot, const u8* data, u32 size, const char* name);

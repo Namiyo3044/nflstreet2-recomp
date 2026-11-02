@@ -1098,7 +1098,7 @@ static void usage(const char* argv0) {
             "         [--window (play in a window at real-time speed)] [--scale N (window size, default 2)]\n"
             "         [--skip-thx (window: skip the THX intro movie)]\n"
             "         [--replace DIR (files there are read instead of the disc's, e.g. DIR/moviedat.dat)]\n"
-            "         [--memcard FILE (memory card image in slot A; created if missing)] [--memcard-readonly]\n"
+            "         [--memcard FILE (memory card image in slot A; created if missing)] [--memcard-readonly] [--card-real-speed]\n"
             "         [--record-input FILE | --play-input FILE (controller answers, for repeatable runs)]\n"
             "         [--sync-log FILE [--sync-every FIELDS] (hashes of game memory, to compare runs)] [--rtc SECONDS]\n"
             "         [--net-host [PORT] | --net-join ADDRESS[:PORT] (netplay; port 7120)] [--net-delay FIELDS]\n"
@@ -1221,6 +1221,8 @@ int main(int argc, char** argv) {
             memcard_path = argv[++i];
         } else if (strcmp(argv[i], "--memcard-readonly") == 0) {
             exi_set_memcard_readonly(true);
+        } else if (strcmp(argv[i], "--card-real-speed") == 0) {
+            exi_set_memcard_real_speed(true);
         } else if (strcmp(argv[i], "--rtc") == 0 && i + 1 < argc) {
             netsync_set_rtc((u32)strtoul(argv[++i], NULL, 10));
         } else if (strcmp(argv[i], "--record-input") == 0 && i + 1 < argc) {

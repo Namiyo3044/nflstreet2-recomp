@@ -43,12 +43,25 @@ typedef struct {
    write, then records what to do once it completes. If the operation is
    already complete in between and the game's other thread checks on it,
    the follow-up is lost, and a save stops partway (or a load misses part of
-   the file). So the card takes about as long as real hardware does. */
+   the file). So each step takes a moment. Real hardware moves the bytes at
+   512 KB/s reading and 128 KB/s writing (a save of the game's size took
+   about three seconds behind its prompt); here the transfers are 8 times
+   that, each still taking at least as long as programming a page, which
+   is long enough (--card-real-speed: as real hardware). */
 #define TIMEBASE_HZ        40500000ull
 #define CARD_READ_RATE     (512u * 1024u)       /* bytes per second */
 #define CARD_WRITE_RATE    (128u * 1024u)
+#define CARD_FAST          8u
 #define CARD_PROGRAM_TICKS (TIMEBASE_HZ / 10000u) /* 0.1 ms per page */
 #define CARD_ERASE_TICKS   (TIMEBASE_HZ / 1000u)  /* 1 ms per sector */
+
+static bool g_card_real_speed;
+void exi_set_memcard_real_speed(bool on) { g_card_real_speed = on; }
+
+/* A run of card work (the transfers of one check, load or save), logged
+   when the card has been quiet for half a second: how long the card itself
+   kept the game waiting. */
+static u64 g_burst_start, g_burst_last, g_burst_read, g_burst_written;
 
 static u64 g_now;          /* the timebase, as of the last EXI access or poll */
 
@@ -413,7 +426,13 @@ static void start_transfer(CPUState* cpu, u32 ch) {
             /* The bytes move now; the transfer reports done later. */
             card_dma(&g_card[ch], cpu, mar, len, rw == 0);
             u64 rate = rw == 0 ? CARD_READ_RATE : CARD_WRITE_RATE;
-            c->tc_due = cpu->timebase + (u64)len * TIMEBASE_HZ / rate + 1u;
+            if (!g_card_real_speed) rate *= CARD_FAST;
+            u64 t = (u64)len * TIMEBASE_HZ / rate + 1u;
+            if (!g_card_real_speed && t < CARD_PROGRAM_TICKS) t = CARD_PROGRAM_TICKS;
+            c->tc_due = cpu->timebase + t;
+            if (!g_burst_start) g_burst_start = cpu->timebase;
+            g_burst_last = c->tc_due;
+            if (rw == 0) g_burst_read += len; else g_burst_written += len;
             return;
         } else if (mar < cpu->ram_size && len <= cpu->ram_size - mar) {
             for (u32 i = 0; i < len; i++) {
@@ -442,6 +461,13 @@ static void finish_dma(Channel* c) {
 
 void exi_tick(u64 now) {
     g_now = now;
+    if (g_burst_start && now > g_burst_last + TIMEBASE_HZ / 2u) {
+        printf("memory card: busy %.2f s (%llu KB read, %llu KB written)\n",
+               (double)(g_burst_last - g_burst_start) / (double)TIMEBASE_HZ,
+               (unsigned long long)(g_burst_read / 1024u), (unsigned long long)(g_burst_written / 1024u));
+        g_burst_start = 0;
+        g_burst_read = g_burst_written = 0;
+    }
     for (u32 ch = 0; ch < 3; ch++) {
         Channel* c = &g_ch[ch];
         if (c->tc_due && now >= c->tc_due)
