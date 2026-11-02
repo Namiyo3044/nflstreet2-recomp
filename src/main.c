@@ -770,7 +770,42 @@ static bool lod_area_hook(CPUState* ctx) {
     return true;
 }
 
+/* --watch ADDR[:WORDS] (debug): reports changes to a few words of game
+   memory, noticed at the next call through the dispatcher, with the
+   function being entered, a backtrace and the calls just before. */
+static u32 g_watch_addr, g_watch_n;
+static double g_watch_from;            /* (@SECONDS: only changes from then on are reported) */
+static u32 g_watch_old[16];
+static int g_watch_reports;
+static void watch_check(CPUState* ctx, u32 address) {
+    static bool primed;
+    if (!primed) {
+        primed = true;
+        for (u32 i = 0; i < g_watch_n; i++) g_watch_old[i] = mem_read32(ctx, g_watch_addr + 4 * i);
+        return;
+    }
+    for (u32 i = 0; i < g_watch_n; i++) {
+        u32 a = g_watch_addr + 4 * i, v = mem_read32(ctx, a);
+        if (v == g_watch_old[i]) continue;
+        if (g_watch_reports < 400 && interrupts_game_seconds() >= g_watch_from) {
+            g_watch_reports++;
+            u32 off = 0;
+            const char* fn = g_have_symbols ? symbols_lookup(address, &off) : NULL;
+            printf("watch: %7.2f s  0x%08X: %08X -> %08X, entering 0x%08X (%s)\n", interrupts_game_seconds(), a,
+                   g_watch_old[i], v, address, fn ? fn : "?");
+            printf("watch:   r3 %08X r4 %08X r5 %08X r29 %08X r30 %08X r31 %08X\n", ctx->gpr[3], ctx->gpr[4], ctx->gpr[5],
+                   ctx->gpr[29], ctx->gpr[30], ctx->gpr[31]);
+            printf("watch:   calls before (oldest first):");
+            for (int k = 12; k >= 1; k--) printf(" %08X", g_trace[(g_trace_pos - (u32)k) % TRACE_LEN]);
+            printf("\n");
+            print_backtrace(ctx, ctx->gpr[1], ctx->lr, "watch:     ");
+        }
+        g_watch_old[i] = v;
+    }
+}
+
 int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
+    if (g_watch_n) watch_check(ctx, address);
     if (address == UIS_NATIVE_DISPATCH && uis_native_hook(ctx)) return 1;
     if (address == LOD_AREA_FN && false && lod_area_hook(ctx)) return 1;   /* not reached for calls inside the engine; see lodfix.c */
     if (g_lod_log) lod_log(ctx, address);
@@ -1252,6 +1287,12 @@ int main(int argc, char** argv) {
             play_input = argv[++i];
         } else if (strcmp(argv[i], "--sync-log") == 0 && i + 1 < argc) {
             sync_log = argv[++i];
+        } else if (strcmp(argv[i], "--watch") == 0 && i + 1 < argc) {
+            char* end = NULL;
+            g_watch_addr = (u32)strtoul(argv[++i], &end, 16) & ~3u;
+            g_watch_n = end && *end == ':' ? (u32)strtoul(end + 1, &end, 10) : 1;
+            if (end && *end == '@') g_watch_from = strtod(end + 1, NULL);
+            if (g_watch_n > 16) g_watch_n = 16;
         } else if (strcmp(argv[i], "--online") == 0) {
             g_online_menu = true;
         } else if (strcmp(argv[i], "--net-host") == 0) {

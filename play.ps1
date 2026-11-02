@@ -12,6 +12,7 @@
 #   .\play.ps1 -DumpAudio     (record the sound to C:\nfls2\dump\audio.wav)
 #   .\play.ps1 -UisLog        (log each kind of call the menu scripts make, "uis: call" lines)
 #   .\play.ps1 -UisTrace      (log every call the menu scripts make, in order, "uist:" lines)
+#   .\play.ps1 -Watch 80A7BCE0:6@20  (debug: log changes to those words of game memory from 20 s of game time on, with who made them, "watch:" lines)
 #   .\play.ps1 -DumpTextures   (save every texture the game uses to C:\nfls2\dump\textures, with Dolphin's names)
 #   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
 #   .\play.ps1 -NoUiColors    (the game's own menu shape colours; ignores ui-colors.txt)
@@ -55,6 +56,7 @@ param(
     [switch]$DumpAudio,
     [switch]$UisLog,
     [switch]$UisTrace,
+    [string]$Watch = "",
     [switch]$LodLog,
     [switch]$CardTrace,
     [switch]$Record,
@@ -134,6 +136,7 @@ if ($Debug) { $gameArgs += @("--debug") }
 if ($CardTrace) { $gameArgs += @("--cardtrace") }
 if ($UisLog) { $gameArgs += @("--uis-log") }
 if ($UisTrace) { $gameArgs += @("--uis-trace") }
+if ($Watch -ne "") { $gameArgs += @("--watch", $Watch) }
 if ($LodLog) { $gameArgs += @("--lod-log") }
 if (-not $NoTextures -and (Test-Path $Textures)) { $gameArgs += @("--textures", $Textures) }
 if (Test-Path $Replace) { $gameArgs += @("--replace", $Replace) }

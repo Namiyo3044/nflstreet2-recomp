@@ -95,6 +95,8 @@ enum { NOBJ = 0x75, NVAR = 0x1BB, NFUNC = 0x12, OPT = 14, GRP = 9, NEWIDX = NOBJ
 #define P_TEXT (P_BASE + 0x4000u)        /* Options list texts with Video Settings */
 #define P_TEXT_END (P_BASE + 0x4400u)
 #define P_DIALOG (P_BASE + 0x4300u)      /* the quit dialog's texts (inside P_TEXT's room, past what it uses) */
+#define P_XDRAW (P_BASE + 0x4800u)       /* drawing records the copy uses from outside its group (its icons) */
+#define P_XDRAW_END (P_BASE + 0x5000u)
 
 typedef struct { u32 lo, hi, nlo; } Region;
 static Region g_rg[4];
@@ -227,6 +229,45 @@ static void quad_rect(u32 q, int x0, int y0, int x1, int y1) {
 }
 
 static int s16_at(u32 a) { return (int16_t)(R[a - G] << 8 | R[a - G + 1]); }
+
+/* Pictures (button icons, bars' textures) are shared and counted: a drawing
+   record that shows one takes it when its screen sets it up and gives it
+   back when the screen is taken down, and the last one back frees it. The
+   port's copies of objects are made after set-up, so their records never
+   took theirs, yet give them back with the rest: one short each time, and a
+   picture still in use on the next screen (the A icon on Select Controller's
+   footer, after Create User ID) was freed. Each copied record takes its
+   picture here, as set-up would have. The game's picture manager: the
+   second of the list at r13 - 0x6368; per set (0x24 bytes) a slot list
+   (+0x20, count +0x1E), each slot a use count (u16) and the picture. */
+#define SDA_BASE 0x803F22A0u
+static int acquire_images(u32 lo, u32 hi) {
+    u32 mgr = SDA_BASE - 0x6368u + 4u;
+    if (!in_ram(mgr, 4) || !in_ram(rd(mgr), 0x10)) return 0;
+    mgr = rd(mgr);
+    u32 sets = rd(mgr + 0xC);
+    int n = 0;
+    for (u32 a = lo; a + 0x10 <= hi;) {
+        u32 w0 = rd(a), size = (w0 >> 28) == 4 ? 0x60u : 0x40u;
+        if ((w0 >> 16) & 2u) {
+            int idx = s16_at(a + 4), set = s16_at(a + 6);
+            if (set >= 0 && set < 16 && idx >= 0 && in_ram(sets + (u32)set * 0x24u, 0x24)) {
+                u32 st = sets + (u32)set * 0x24u, slots = rd(st + 0x20);
+                int count = s16_at(st + 0x1E);
+                if (idx < count && in_ram(slots + (u32)idx * 8u, 8)) {
+                    u32 sl = slots + (u32)idx * 8u;
+                    if (rd(sl + 4)) {        /* (loaded: the original's record holds it) */
+                        u32 c = (u32)(R[sl - G] << 8 | R[sl - G + 1]) + 1u;
+                        R[sl - G] = (u8)(c >> 8); R[sl - G + 1] = (u8)c;
+                        n++;
+                    }
+                }
+            }
+        }
+        a += size;
+    }
+    return n;
+}
 
 static bool add_bar(u32 h, u32 tab) {
     u32 n1 = rd(tab + 4), p1 = rd(tab + 8);
@@ -566,6 +607,39 @@ void uismenu_add_quit(CPUState* cpu) {
     for (int i = 0; i < 4; i++)
         for (u32 a = g_rg[i].nlo; a + 4 <= g_rg[i].nlo + (g_rg[i].hi - g_rg[i].lo); a += 4)
             wr(a, reloc(rd(a), i != 2));
+    /* Drawing records it uses from outside the copied group (its button
+       icons, records showing a picture): its own copies too. Shared, the
+       main menu's teardown gave each back twice (once for each object
+       using it), leaving the A and B icons one short; the footer's A icon
+       was then freed on the next screen after Create User ID or Enter
+       Code. */
+    int xrec = 0;
+    {
+        u32 xmap_old[24], xmap_new[24], xd = P_XDRAW;
+        int nx = 0;
+        for (int i = 0; i < 2; i++)    /* the instances and property lists hold their records' offsets */
+            for (u32 a = g_rg[i].nlo; a + 4 <= g_rg[i].nlo + (g_rg[i].hi - g_rg[i].lo); a += 4) {
+                u32 w = rd(a), rec = h + w;
+                if (w < 0xA00u || w >= 0x10000u || !in_ram(rec, 0x60)) continue;
+                bool inside = false;
+                for (int k = 0; k < 4; k++) inside |= rec >= g_rg[k].lo && rec < g_rg[k].hi;
+                u32 w0 = rd(rec);
+                if (inside || (w0 >> 28) != 4 || !((w0 >> 16) & 2u) || s16_at(rec + 4) < 0 || s16_at(rec + 6) < 0 ||
+                    s16_at(rec + 6) >= 16)
+                    continue;
+                int k = 0;
+                while (k < nx && xmap_old[k] != w) k++;
+                if (k == nx) {
+                    if (nx == 24 || xd + 0x60 > P_XDRAW_END) continue;
+                    memcpy(R + (xd - G), R + (rec - G), 0x60);
+                    acquire_images(xd, xd + 0x60);
+                    xmap_old[nx] = w; xmap_new[nx] = xd - h; nx++;
+                    xd += 0x60;
+                }
+                wr(a, xmap_new[k]);
+            }
+        xrec = nx;
+    }
     /* Its label and text: new variables. */
     u32 v_label = P_VARS, v_text1 = P_VARS + 12, v_text2 = P_VARS + 24;
     put_var(v_label, P_VARS + 0x40, 9, "Quit Game", 16);
@@ -823,8 +897,9 @@ void uismenu_add_quit(CPUState* cpu) {
     /* 5. In use: the table with the copy. */
     wr(h, NOBJ + GRP);
     wr(h + 4, P_OBJTAB);
-    printf("uis: main menu: Quit Game button added%s%s (%d page looks, %u bytes of script)\n",
-           bar ? " with its bar" : "", video ? ", Options: Video Settings" : "", looks, g_code - P_CODE);
+    int pics = acquire_images(P_DRAW, P_DRAW + (DRAW_HI - DRAW_LO)) + xrec;
+    printf("uis: main menu: Quit Game button added%s%s (%d page looks, %u bytes of script, %d pictures taken)\n",
+           bar ? " with its bar" : "", video ? ", Options: Video Settings" : "", looks, g_code - P_CODE, pics);
 }
 
 /* ------------------------------------------ title screen: no licence --- */
@@ -1069,6 +1144,8 @@ static int video_rows(u32 h) {
                 wr(a, vr_reloc(w, h, !is_draw));
             }
         }
+        for (int i = 0; i < nreg; i++)   /* its pictures, taken (acquire_images) */
+            if (g_vr[i].lo == draw_lo) acquire_images(g_vr[i].nlo, g_vr[i].nlo + (g_vr[i].hi - g_vr[i].lo));
         /* The focus-link offsets are small (below what vr_reloc takes as an
            offset): moved here, field by field. */
         for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
@@ -1562,6 +1639,8 @@ static bool sl_build(u32 h) {
                 if (a >= g_vr[i].lo && a < g_vr[i].hi) { wr(cinst + x, a - g_vr[i].lo + g_vr[i].nlo - h); break; }
         }
     }
+    for (int i = 0; i < nreg; i++)       /* its pictures, taken (acquire_images) */
+        if (g_vr[i].lo == draw_lo) acquire_images(g_vr[i].nlo, g_vr[i].nlo + (g_vr[i].hi - g_vr[i].lo));
     for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
         u32 src = tab + o * 20, dst = SL_OBJTAB + (base + o - VR_FIRST) * 20;
         wr(dst, vr_reloc(rd(src), h, false));
