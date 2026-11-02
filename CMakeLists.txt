@@ -113,7 +113,7 @@ add_executable(nfls2
     src/runtime/symbols.c)
 target_link_libraries(nfls2 PRIVATE nfls2_game)
 if(NFLS2_WINDOW)
-    target_sources(nfls2 PRIVATE src/platform/window.c src/platform/menu.c src/platform/movie.c
+    target_sources(nfls2 PRIVATE src/platform/window.c src/platform/menu.c src/platform/movie.c src/platform/discord.c
         src/apt/terf.c src/apt/aptfile.c src/apt/avm.c src/apt/aptdraw.c src/apt/ps2online.c)
     target_compile_definitions(nfls2 PRIVATE NFLS2_HAVE_WINDOW)
     if(TARGET SDL3::SDL3-static)

@@ -74,7 +74,7 @@ void menu_bind(int code);
    Window Size, Renderer and Internal Resolution, values numbered from 0.
    Setting one counts as a change (menu_take_changes). */
 #define MENU_GAME_ROWS 5
-#define MENU_RECOMP_ROWS 6
+#define MENU_RECOMP_ROWS 7
 /* The game's own Online screen (the main menu's Online): Host a Game, Join a
    Game, Input Delay, This PC's Address. */
 #define MENU_ONLINE_ROWS 4

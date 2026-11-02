@@ -6,6 +6,7 @@
 #include "runtime/interrupts.h"
 #include "runtime/mmio.h"
 #include "runtime/pad.h"
+#include "platform/discord.h"
 #include "platform/settings.h"
 #include "platform/menu.h"
 #include "gx/hires.h"
@@ -33,6 +34,7 @@ static SDL_Texture* g_texture;
 /* Controllers, in the order they were connected: controller N plays as
    player N (the keyboard joins whichever player the settings say). A
    controller unplugged leaves its slot empty, so the others keep theirs. */
+#define DISCORD_APP_ID "1566925276686852116"   /* the port's Discord application (Rich Presence) */
 static SDL_Gamepad* g_pads[PAD_PORTS];
 /* A player whose controller was unplugged shows as unplugged in the game
    (its "controller disconnected" screen), even if the keyboard also plays as
@@ -466,6 +468,8 @@ bool window_open(int height) {
         SDL_SetWindowFullscreen(g_window, true);
     }
     g_base_ns = g_stat_ns = SDL_GetTicksNS();
+    discord_enable(!g_settings.no_discord);
+    discord_start(DISCORD_APP_ID);
     return true;
 }
 
@@ -480,6 +484,7 @@ void window_close(void) {
         fclose(g_wav);
         g_wav = NULL;
     }
+    discord_stop();
     mmio_set_audio_sink(NULL);
     if (g_audio) SDL_DestroyAudioStream(g_audio);
     g_audio = NULL;
@@ -1093,7 +1098,8 @@ static void poll_events(void) {
                 else save_screenshot();
             } else if (e.key.key == SDLK_F12 && !e.key.repeat) {
                 if (g_gpu) {
-                    printf("window: the draw log (F12) only works with the software renderer\n");
+                    gx_raster_hud_log();
+                    printf("window: logging two seconds of the match HUD to hudlog.txt (the full draw log needs the software renderer)\n");
                 } else {
                     gx_raster_draw_log(interrupts_game_seconds(), 2);
                     printf("window: logging the next two frames to drawlog.txt and drawlog-short.txt\n");
@@ -1260,6 +1266,18 @@ static void read_input(void) {
         was_a = a;
     }
     for (int i = 0; i < PAD_PORTS; i++) pad_set_live(i, &st[i]);
+    /* Rumble: while the game has a port's motor on, its controller rumbles
+       (renewed every field for a moment longer, so it stops by itself if the
+       game stops running); off as soon as the game switches it off. */
+    {
+        static bool was_on[PAD_PORTS];
+        for (int i = 0; i < PAD_PORTS; i++) {
+            bool on = pad_rumble(i) && !g_settings.no_rumble;   /* (rumble=0 in the settings file: never) */
+            if (g_pads[i] && (on || was_on[i]))
+                SDL_RumbleGamepad(g_pads[i], on ? 0xC000 : 0, on ? 0x8000 : 0, on ? 100 : 0);
+            was_on[i] = on;
+        }
+    }
 }
 
 /* ------------------------------------------------------------ output --- */
@@ -1974,7 +1992,11 @@ void window_field(CPUState* cpu) {
     /* Ultrawide menus: a dark grey at the sides the 16:9 backgrounds don't
        reach (matches fill the whole picture themselves). */
     gx_raster_set_side_fill(g_settings.screen_shape >= 3 && in_front_end() ? SIDE_FILL : 0u);
-    gx_raster_set_match(lodfix_frame(cpu));
+    bool in_match = lodfix_frame(cpu);
+    gx_raster_set_match(in_match);
+    /* Discord: in a match or in the menus (starting up while the intro
+       movies are skipped). */
+    discord_set(g_hidden ? "Starting up" : in_match ? "In a match" : "In the menus", "");
     uicolors_frame(cpu);
     /* (netplay: never, the screen shape changes the game for this player only) */
     menu_set_shape_locked(!in_front_end() || netplay_active());

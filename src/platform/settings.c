@@ -48,6 +48,8 @@ bool settings_load(const char* path) {
         else if (strcmp(key, "screen_filters") == 0) s->screen_filters = atoi(val) != 0;
         else if (strcmp(key, "skip_intros") == 0) s->skip_intros = atoi(val) != 0;
         else if (strcmp(key, "specular") == 0) { int v = atoi(val); s->specular = v < 0 ? 0 : v > 2 ? 2 : v; }
+        else if (strcmp(key, "discord") == 0) s->no_discord = atoi(val) == 0;
+        else if (strcmp(key, "rumble") == 0) s->no_rumble = atoi(val) == 0;
         else if (strcmp(key, "net_delay") == 0) s->net_delay = clampi(atoi(val), 1, 12);
         else if (strcmp(key, "net_address") == 0) snprintf(s->net_address, sizeof(s->net_address), "%s", val);
         else if (strncmp(key, "key_", 4) == 0 || strncmp(key, "pad_", 4) == 0) {
@@ -84,6 +86,8 @@ void settings_save(void) {
     fprintf(f, "screen_filters=%d\n", s->screen_filters);
     fprintf(f, "skip_intros=%d\n", s->skip_intros);
     fprintf(f, "specular=%d\n", s->specular);
+    fprintf(f, "rumble=%d\n", !s->no_rumble);
+    fprintf(f, "discord=%d\n", !s->no_discord);
     fprintf(f, "net_delay=%d\n", s->net_delay);
     if (s->net_address[0]) fprintf(f, "net_address=%s\n", s->net_address);
     fprintf(f, "# Controls (set from the menu): key_ = keyboard key code, pad_ = controller button / stick code,\n"

@@ -38,6 +38,8 @@ typedef struct {
     int specular;                      /* highlights on lit models (graphics card only): 0 off (as on GameCube), 1 subtle, 2 accurate (PS2) */
     int net_delay;                     /* netplay: input delay in video fields (Online menu) */
     char net_address[64];              /* netplay: the last address joined */
+    int no_rumble;                     /* 1: controllers never rumble (rumble=0 in the file) */
+    int no_discord;                    /* 1: no Discord status (Recomp Settings; discord=0 in the file) */
 } Settings;
 
 extern Settings g_settings;
