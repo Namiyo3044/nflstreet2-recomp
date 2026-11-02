@@ -859,7 +859,12 @@ typedef struct {
     CmdList* l; u32 base, n;
     float ou, oy, mn, mx, ylo, yhi, avg_a, ou0, oy0, frame;
     bool textured, ticker;
+    u8 counted;                        /* HUD_CNT_*: what it counted towards as it was recorded */
 } HudRec;
+#define HUD_CNT_CARD 1
+#define HUD_CNT_BAR 2
+#define HUD_CNT_CBAR 4
+#define HUD_CNT_MODAL 8                /* (could be a screen's box) */
 #define HUD_RECS 4096
 static HudRec g_hud[HUD_RECS];
 static int g_nhud;
@@ -882,18 +887,19 @@ static void hud_record(SVtx* v, u32 n, bool textured, float alpha, float mn, flo
         oy = ylo;
     }
     float avg_a = alpha / (float)n;    /* (pieces drawn see-through at 0: hidden menus the game keeps drawing) */
+    u8 counted = 0;
     /* A play card: a big plain (untextured) panel, anywhere across the
        screen. (The HUD's big messages, "1st Down", are textures with room
        around the letters, as big; the cards' backgrounds are plain.) */
     if (!textured && avg_a > 0.05f && v[0].mtx == 0 && n == 4 && mx - mn > 0.2f && mx - mn < 1.2f && yhi - ylo > 0.35f &&
         yhi - ylo < 1.4f && g_card_cur < 1000)
-        g_card_cur++;
+        g_card_cur++, counted |= HUD_CNT_CARD;
     /* A menu's bar: a plain panel of some width below the panel row (the
        popups are text only; the music ticker's box is left out). */
     if (!textured && avg_a > 0.05f && v[0].mtx == 0 && n == 4 && oy < HUD_PANELS && mx - mn > 0.3f && mx - mn < 1.2f &&
         g_tick_seq != g_tick_seq_now && g_bar_cur < 1000 && g_cbar_cur < 1000) {
-        if (mx < 0.0f || mn > 0.0f) g_bar_cur++;   /* the Audible menu's boxes, each to one side */
-        else g_cbar_cur++;                        /* a menu in the middle (pause) */
+        if (mx < 0.0f || mn > 0.0f) g_bar_cur++, counted |= HUD_CNT_BAR;   /* the Audible menu's boxes, each to one side */
+        else g_cbar_cur++, counted |= HUD_CNT_CBAR;                       /* a menu in the middle (pause) */
     }
     /* A big box over the middle (the end-of-match stats, the pause menu's
        pages such as Options, Lineups and Controller Layout, a "Feat
@@ -906,15 +912,17 @@ static void hud_record(SVtx* v, u32 n, bool textured, float alpha, float mn, flo
        frame it is drawn see-through while its title bar already shows;
        the pause menu's box is kept drawn see-through under its pages.
        Nothing that big is drawn see-through during play.) */
-    if (g_modal_at < 0 && !textured && n >= 4 && mx - mn >= 0.45f && mx - mn <= 1.8f &&
-        yhi - ylo >= 0.8f && mn >= -1.1f && mx <= 1.1f)
-        g_modal_at = g_nhud;
+    if (!textured && n >= 4 && mx - mn >= 0.45f && mx - mn <= 1.8f && yhi - ylo >= 0.8f && mn >= -1.1f && mx <= 1.1f) {
+        if (g_modal_at < 0) g_modal_at = g_nhud;
+        counted |= HUD_CNT_MODAL;
+    }
     if (g_nhud >= HUD_RECS) return;
     HudRec* r = &g_hud[g_nhud++];
     r->l = g_wl; r->base = g_wb; r->n = n;
     r->ou = ou; r->oy = oy; r->mn = mn; r->mx = mx; r->ylo = ylo; r->yhi = yhi; r->avg_a = avg_a;
     r->ou0 = v[0].org[0] / frame; r->oy0 = v[0].org[1]; r->frame = frame; r->textured = textured;
     r->ticker = g_tick_seq == g_tick_seq_now;
+    r->counted = counted;
 }
 
 /* The pieces sharing piece k's origin (the letters of one word): is that
@@ -940,12 +948,81 @@ static void hud_flush(void) {
                       g_cbar_prev >= HUD_BARS;
     bool menu_bars = g_bar_cur >= HUD_BARS || g_bar_prev >= HUD_BARS;
     g_banner_cur = 0; g_band_cur = 9.0f;
+    /* The big wipes over the match (a taunt's or celebration's, the
+       Gamebreaker's): shards sweeping across, each an object of several
+       pieces (a striped picture wider than the whole 16:9 picture and taller
+       than half the screen, its glows and edges), with the team logos and
+       the words on them. Made to cover the 16:9 picture, they left the sides
+       open: the shards are stretched across the wider screen, and what is
+       drawn on them while they are drawn (logos, words) goes along with its
+       place stretched, keeping its size. A shard's pieces don't count as play
+       cards, menu bars or a screen's box. */
+#define WIPE_KEYS 8
+    float wipe_u[WIPE_KEYS], wipe_y[WIPE_KEYS];
+    int nwipe = 0, wipe_lo = -1, wipe_hi = -1;
+    for (int k = 0; k < g_nhud; k++) {
+        const HudRec* r = &g_hud[k];
+        if (!r->textured || r->mx - r->mn < 2.1f || r->yhi - r->ylo < 1.5f || nwipe >= WIPE_KEYS) continue;
+        bool seen = false;
+        for (int j = 0; j < nwipe; j++) seen |= wipe_u[j] == r->ou0 && wipe_y[j] == r->oy0;
+        if (!seen) { wipe_u[nwipe] = r->ou0; wipe_y[nwipe] = r->oy0; nwipe++; }
+    }
+    if (nwipe) {
+        int modal_at = -1;
+        for (int k = 0; k < g_nhud; k++) {
+            HudRec* r = &g_hud[k];
+            bool shard = false;
+            for (int j = 0; j < nwipe; j++) shard |= wipe_u[j] == r->ou0 && wipe_y[j] == r->oy0;
+            if (shard) {
+                if (wipe_lo < 0) wipe_lo = k;
+                wipe_hi = k;
+                if (r->counted & HUD_CNT_CARD) g_card_cur--;
+                if (r->counted & HUD_CNT_BAR) g_bar_cur--;
+                if (r->counted & HUD_CNT_CBAR) g_cbar_cur--;
+                r->counted = 0x80;     /* (a shard) */
+            } else if ((r->counted & HUD_CNT_MODAL) && modal_at < 0) {
+                modal_at = k;
+            }
+        }
+        g_modal_at = modal_at;
+        /* the last shard's logo is drawn just after its pieces */
+        while (wipe_hi + 1 < g_nhud && g_hud[wipe_hi + 1].textured &&
+               g_hud[wipe_hi + 1].yhi - g_hud[wipe_hi + 1].ylo >= 0.5f) {
+            wipe_hi++;
+            if (g_modal_at == wipe_hi) g_modal_at = -1;
+        }
+    }
+    menu_cards = g_card_cur >= HUD_CARDS || g_card_prev >= HUD_CARDS || g_cbar_cur >= HUD_BARS || g_cbar_prev >= HUD_BARS;
+    menu_bars = g_bar_cur >= HUD_BARS || g_bar_prev >= HUD_BARS;
     for (int k = 0; k < g_nhud; k++) {
         HudRec* r = &g_hud[k];
         SVtx* v = &r->l->verts[r->base];
         u32 n = r->n;
         float ou = r->ou, oy = r->oy, mn = r->mn, mx = r->mx, ylo = r->ylo, frame = r->frame;
         bool textured = r->textured;
+        if (k >= wipe_lo && k <= wipe_hi && wipe_lo >= 0) {
+            bool shard = r->counted == 0x80;
+            /* (what is on a shard goes by where its object lies now, the
+               word or logo as a whole: a logo slides out with its shard by
+               its own pieces, its origin left behind) */
+            float glo = 1e9f, ghi = -1e9f;
+            if (!shard)
+                for (int j = wipe_lo; j <= wipe_hi; j++) {
+                    const HudRec* q = &g_hud[j];
+                    if (q->counted == 0x80 || q->ou0 != r->ou0 || q->oy0 != r->oy0) continue;
+                    glo = fminf(glo, q->mn); ghi = fmaxf(ghi, q->mx);
+                }
+            float st = 1.0f / frame, shift = shard ? 0.0f : (glo + ghi) * 0.5f * (st - 1.0f);
+            hudlog_piece(shard ? "wipe" : "on-wipe", n, (u32)v[0].mtx, textured, r->avg_a, mn, mx, ylo, r->yhi,
+                         r->ou0, r->oy0, shard ? r->ou0 * st : r->ou0 + shift, oy, 1e9f);
+            for (u32 i = 0; i < n; i++) {
+                float u = v[i].clip[0] / (v[i].clip[3] * frame);
+                float nu = shard ? u * st : u + shift;
+                v[i].clip[0] = nu * v[i].clip[3] * frame;
+                project(&v[i]);
+            }
+            continue;
+        }
         /* Up among the panels: anything placed to one side. Below them only
            what is placed well out to the side (the style point popups): the
            big messages in the middle (some drawn a letter-object at a time,
