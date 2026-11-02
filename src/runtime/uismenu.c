@@ -715,9 +715,20 @@ void uismenu_add_quit(CPUState* cpu) {
                     if (rd(list + k * 8 + 4) == OPT) add = NEWIDX;
                 }
             if (!add || out + (n + 1) * 8 > P_CODE) continue;
-            memcpy(R + (out - G), R + (list - G), n * 8);
-            wr(out + n * 8, 0xFFFFFFFFu);
-            wr(out + n * 8 + 4, add);
+            /* It is also the drawing order: the copy goes before the first
+               of the six groups (5; they go 5, 14 (Options), 23, ... 9
+               apart), so the page each one opens is drawn over it. At the
+               end, its label, dimmed while a page is open, showed over
+               Inside Street's and Options' lists, which open over its row. */
+            u32 o = out;
+            bool put = false;
+            for (u32 k = 0; k < n; k++) {
+                if (!put && rd(list + k * 8) == 0xFFFFFFFFu && rd(list + k * 8 + 4) == OPT - GRP) {
+                    wr(o, 0xFFFFFFFFu); wr(o + 4, add); o += 8; put = true;
+                }
+                wr(o, rd(list + k * 8)); wr(o + 4, rd(list + k * 8 + 4)); o += 8;
+            }
+            if (!put) { wr(o, 0xFFFFFFFFu); wr(o + 4, add); }
             wr(desc + 4, n + 1);
             wr(desc + 8, out);
             out += (n + 1) * 8;
