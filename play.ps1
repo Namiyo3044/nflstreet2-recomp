@@ -21,6 +21,7 @@
 #   .\play.ps1 -Record         (netplay groundwork: record every controller input to C:\nfls2\netsync\input.rec, with
 #                               a sync log of game memory; the memory card isn't written to)
 #   .\play.ps1 -Replay         (play that recording back, write a second sync log and compare the two)
+#   .\play.ps1 -Online         (show the main menu's Online, hidden for now: host or join a game from there)
 #   .\play.ps1 -NetHost        (netplay: wait for another player to join; you are player 1. -NetPort N, default 7120)
 #   .\play.ps1 -Join 1.2.3.4   (netplay: join a host at that address; you are player 2. Log in play-join.txt)
 #                               -NetDelay N: fields of input delay (default 3; more for a distant connection).
@@ -58,6 +59,7 @@ param(
     [switch]$CardTrace,
     [switch]$Record,
     [switch]$Replay,
+    [switch]$Online,
     [switch]$NetHost,
     [string]$Join = "",
     [int]$NetPort = 7120,
@@ -163,6 +165,7 @@ $logFile = if ($second) { "play-2.txt" } else { "play.txt" }
 if ($second -and -not $NoMemCard) {
     $gameArgs += @("--memcard-readonly")   # (the first copy has the card file; this one doesn't save to it)
 }
+if ($Online) { $gameArgs += @("--online") }
 if ($NetHost) {
     $gameArgs += @("--net-host", $NetPort, "--net-delay", $NetDelay)
     Write-Host "Netplay: waiting for the other player on port $NetPort..."

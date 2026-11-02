@@ -361,14 +361,18 @@ static bool g_uis_trace;              /* --uis-trace: every call, in order */
      they are picked: Online and Madden NFL 2005 lead to features it doesn't
      have; Previews to the trailer screen.
    Each edit: the script bytes around the compared number (byte 11). */
-typedef struct { const u8 sig[26]; u8 len; u8 off, on; bool screen_shape; const char* what; } UisEdit;
+/* The main menu's Online (netplay): hidden for now, as it needs an address
+   typed in and the host's port opened; --online (play.ps1 -Online) shows it,
+   and a session (--net-host / --net-join) has it, to leave by. */
+static bool g_online_menu;
+typedef struct { const u8 sig[26]; u8 len; u8 off, on; bool screen_shape; const char* what; bool online; } UisEdit;
 static const UisEdit k_uis_edits[] = {
     {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x1C,0x3F,0x41,0x10,0,0,0x01,0x65,0x6F}, 26, 1, 2, false,
      "Options list: Audio Settings"},
     {{0x55,0,0,0,0xA0,0xFF,0xFA,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x26,0x3F,0x41,0x10,0,0,0x01,0x81,0x6F}, 26, 1, 2, false,
      "Options help: Adjust audio settings."},
     {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x02,0x36,0x41,0x10,0,0,0x01,0x36,0x10,0,0,0,0,0x0B}, 25, 2, 0x7F, false,
-     "main menu: Online"},
+     "main menu: Online", true},
     {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x02,0x36,0x10,0,0,0,0x1C,0x3F,0x41,0x10,0,0,0x01,0x67,0x6F}, 26, 2, 0x7F, false,
      "Credits list: Previews, Madden NFL 2005"},
     {{0x55,0,0,0,0xA0,0xFF,0xF7,0x10,0,0,0,0x02,0x36,0x10,0,0,0,0x68,0x3F}, 19, 2, 0x7F, false,
@@ -398,6 +402,7 @@ static void uis_main_menu_edits(CPUState* ctx) {
         const UisEdit* e = &k_uis_edits[i];
         if (!at[i]) continue;
         u8 want = (!e->screen_shape || g_settings.screen_shape != 0) ? e->on : e->off;
+        if (e->online && !g_online_menu) want = e->off;   /* Online: hidden for now (--online, or in a session) */
         if (ram[at[i] + 11] != want) {
             ram[at[i] + 11] = want;
             printf("uis: %s %s\n", e->what, want == e->on ? "on" : "off");
@@ -438,6 +443,7 @@ static void uis_credits_list(CPUState* ctx) {
 }
 
 static bool g_video_screen;            /* the Options list asked for Video Settings */
+static u32 g_sl_group = ~0u, g_sl_screen = ~0u;   /* the Save/Load screen's numbers (once seen) */
 static int g_video_back;               /* ... and the cursor goes back to it (1 Video, 2 Recomp Settings) */
 
 static int uis_native_hook(CPUState* ctx) {
@@ -622,9 +628,16 @@ static int uis_native_hook(CPUState* ctx) {
         ctx->pc = ctx->lr;
         return 1;
     }
+    if (ctx->gpr[3] == 0x80000001u && group == 5 && screen != 5 && screen != 3) {
+        /* An OPTIONS screen's own function 1, which Save/Load's start-up
+           calls: if it is Save/Load, its Delete User ID row goes in. */
+        if (uismenu_saveload_screen(ctx)) { g_sl_group = group; g_sl_screen = screen; }
+        return 0;
+    }
     if (ctx->gpr[3] != UIS_FN_PLATFORM)
         return 0;
     if (!(group == 5 && screen == 5)) uismenu_video_closed();   /* another screen loading */
+    if (group != g_sl_group || screen != g_sl_screen) uismenu_saveload_closed();
     if (group == 0) { uis_main_menu_edits(ctx); uis_credits_list(ctx); uismenu_add_quit(ctx); }
     if (group == 0 && (screen == 2 || screen == 3)) {   /* the title screen */
         uismenu_hide_licence(ctx);
@@ -823,15 +836,19 @@ int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
             if (g_movie_count < 0) movie_read_directory();
             g_movie_opens++;
             /* Skipping them all: hidden, with START tapped to skip the EA and
-               NFL Street 2 movies; THX (which can't be skipped) fast-forwarded. */
+               NFL Street 2 movies; THX (which can't be skipped) fast-forwarded,
+               and the rest too, up to the title screen (the memory card check
+               and loading in between are waits of the game's own; the taps go
+               by game time). */
             if (g_skip_all_intros) {
                 window_set_hidden(true);
+                window_set_turbo(true);
                 pad_set_skip_taps(g_movie_opens != 2);
                 if (g_movie_opens == 2) g_skip_intros = true;
             }
             if (g_skip_intros && g_movie_opens == 2) window_set_turbo(true);
             if (g_movie_opens == 3) {
-                if (g_skip_intros) window_set_turbo(false);
+                if (g_skip_intros && !g_skip_all_intros) window_set_turbo(false);
                 g_skip_intros = false;
                 window_trust_screen_shape();   /* past the boot screens: the game's own setting applies now */
             }
@@ -1101,7 +1118,7 @@ static void usage(const char* argv0) {
             "         [--memcard FILE (memory card image in slot A; created if missing)] [--memcard-readonly]\n"
             "         [--record-input FILE | --play-input FILE (controller answers, for repeatable runs)]\n"
             "         [--sync-log FILE [--sync-every FIELDS] (hashes of game memory, to compare runs)] [--rtc SECONDS]\n"
-            "         [--net-host [PORT] | --net-join ADDRESS[:PORT] (netplay; port 7120)] [--net-delay FIELDS]\n"
+            "         [--online (the main menu's Online, hidden for now)] [--net-host [PORT] | --net-join ADDRESS[:PORT] (netplay; port 7120)] [--net-delay FIELDS]\n"
             "         [--text FILE (game text replacements, default text-replacements.txt) | --no-text]\n"
             "         [--ui-colors FILE (menu shape colours, default ui-colors.txt) | --no-ui-colors]\n"
             "         [--aspect auto|4:3|16:9 (screen shape; auto follows the game's widescreen option)]\n"
@@ -1229,11 +1246,15 @@ int main(int argc, char** argv) {
             play_input = argv[++i];
         } else if (strcmp(argv[i], "--sync-log") == 0 && i + 1 < argc) {
             sync_log = argv[++i];
+        } else if (strcmp(argv[i], "--online") == 0) {
+            g_online_menu = true;
         } else if (strcmp(argv[i], "--net-host") == 0) {
             net_host = true;
+            g_online_menu = true;          /* (its Online entry leaves the session) */
             if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') net_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--net-join") == 0 && i + 1 < argc) {
             net_join = argv[++i];
+            g_online_menu = true;
         } else if (strcmp(argv[i], "--net-delay") == 0 && i + 1 < argc) {
             net_delay = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--sync-every") == 0 && i + 1 < argc) {
