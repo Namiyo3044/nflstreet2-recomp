@@ -748,7 +748,8 @@ bool menu_recomp_row_enabled(int row) {
 const char* menu_recomp_row_name(int row, int v) {
     switch (row) {
     case RR_RAIN: return v == 2 ? "PS2/Xbox" : v == 1 ? "GameCube" : "Off";
-    case RR_FILTERS: case RR_INTROS: return v ? "On" : "Off";
+    case RR_FILTERS: return v ? "On" : "Off (Unstable)";
+    case RR_INTROS: return v ? "On" : "Off";
     case RR_SPECULAR: return v == 2 ? "Accurate" : v == 1 ? "Subtle" : "Off";
     case RR_TEXTURES: return !g_info.textures_found ? "None Found" : v ? "On" : "Off";
     default: return v ? "By Position" : "By Label";
@@ -758,7 +759,7 @@ const char* menu_recomp_row_name(int row, int v) {
 const char* menu_recomp_row_help(int row) {
     switch (row) {
     case RR_RAIN: return "PS2/Xbox: more rain, with streaks and splashes.";
-    case RR_FILTERS: return "The colour tint over the picture in matches.";
+    case RR_FILTERS: return "Colour tint in matches. Off is unstable: it may flash.";
     case RR_TEXTURES: return "Use the replacement textures folder.";
     case RR_INTROS: return "Hides and skips the intro videos. Applies next start.";
     case RR_SPECULAR: return "Shiny highlights on players. Accurate: as on PS2.";

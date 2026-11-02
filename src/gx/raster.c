@@ -1156,6 +1156,14 @@ int g_specular;                        /* highlights on lit models: 0 off, 1 sub
 #define FILTER_STEADY 20               /* frames unchanged before an overlay counts as a filter */
 #define FILTER_MAX 8
 static struct { u32 key; u32 frame; int steady; } g_filter[FILTER_MAX];
+/* The filters seen this match, by colour and picture alone (not strength):
+   when one changes strength for a moment (an effect over the match), or
+   stops being drawn for a while and comes back, it is the same filter and
+   stays hidden straight away instead of showing until it holds still again.
+   (Not black ones: the fades are black, getting stronger or weaker.) */
+#define FILTER_KNOWN 8
+#define FILTER_FORGET 3600             /* frames unseen before one is forgotten */
+static struct { u32 look; u32 frame; } g_filter_known[FILTER_KNOWN];
 
 static bool filter_skip(SVtx* v, u32 n, bool capture) {
     if (g_screen_filters || !g_hud_match || g_setup.persp || capture || n < 3) return false;
@@ -1169,8 +1177,18 @@ static bool filter_skip(SVtx* v, u32 n, bool capture) {
     a /= (float)n;
     if (mn > -0.97f || mx < 0.97f || ylo > -0.95f || yhi < 0.95f || a > 0.9f) return false;
     const Stage* st0 = g_wstate && g_wstate->stages ? &g_wstate->st[0] : NULL;
-    u32 key = (st0 && st0->tex_on ? st0->tex_addr : 0u) ^ ((u32)(v[0].col[0][0] * 255.0f) << 24) ^
-              ((u32)(v[0].col[0][1] * 255.0f) << 16) ^ ((u32)(v[0].col[0][2] * 255.0f) << 8) ^ (u32)(a * 255.0f);
+    u32 look = (st0 && st0->tex_on ? st0->tex_addr : 0u) ^ ((u32)(v[0].col[0][0] * 255.0f) << 24) ^
+               ((u32)(v[0].col[0][1] * 255.0f) << 16) ^ ((u32)(v[0].col[0][2] * 255.0f) << 8);
+    u32 key = look ^ (u32)(a * 255.0f);
+    bool dark = st0 && st0->tex_on ? false : v[0].col[0][0] + v[0].col[0][1] + v[0].col[0][2] < 0.06f;
+    bool known = false;
+    if (!dark)
+        for (int k = 0; k < FILTER_KNOWN; k++)
+            if (g_filter_known[k].frame && g_filter_known[k].look == look && g_frames - g_filter_known[k].frame <= FILTER_FORGET) {
+                g_filter_known[k].frame = g_frames;
+                known = true;
+                break;
+            }
     int slot = -1, old = 0;
     for (int k = 0; k < FILTER_MAX; k++) {
         if (g_filter[k].key == key && g_frames - g_filter[k].frame <= 2u) { slot = k; break; }
@@ -1178,7 +1196,14 @@ static bool filter_skip(SVtx* v, u32 n, bool capture) {
     }
     if (slot < 0) { slot = old; g_filter[slot].key = key; g_filter[slot].steady = 0; g_filter[slot].frame = g_frames; }
     if (g_filter[slot].frame != g_frames) { g_filter[slot].frame = g_frames; g_filter[slot].steady++; }
-    if (g_filter[slot].steady < FILTER_STEADY) return false;
+    if (!known && g_filter[slot].steady < FILTER_STEADY) return false;
+    if (!known && !dark) {             /* a new filter: remembered */
+        int old2 = 0;
+        for (int k = 1; k < FILTER_KNOWN; k++)
+            if (g_filter_known[k].frame < g_filter_known[old2].frame) old2 = k;
+        g_filter_known[old2].look = look;
+        g_filter_known[old2].frame = g_frames ? g_frames : 1u;
+    }
     for (u32 i = 0; i < n; i++) {      /* out of sight */
         v[i].clip[0] = 4.0f * v[i].clip[3];
         project(&v[i]);
@@ -2467,6 +2492,10 @@ static FILE* g_dlog;
 static FILE* g_dlog_short;             /* one line per draw */
 static u32 g_dlog_draws;
 static u32 g_dlog_cullall;            /* draws dropped as "cull all" this logged frame */
+
+/* The HUD log alone (works with either renderer: the HUD is placed here
+   for both). */
+void gx_raster_hud_log(void) { g_hudlog_frames = 120; }
 
 void gx_raster_draw_log(double at_seconds, int frames) {
     g_dlog_at = at_seconds;
