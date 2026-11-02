@@ -149,5 +149,9 @@ typedef struct {
 
 /* Writes an EFB-to-TV-buffer copy into RAM (YUYV) from g_color. */
 void raster_xfb_write(const CopyCmd* cp, int y0, int y1);
+/* The graphics card renderer, as it copies a finished frame out and clears
+   it: the frame-buffer probes are read then (the game's depth tests, such as
+   the sun's glare behind buildings, need the frame before the clear). */
+void raster_probes_before_clear(void);
 
 #endif

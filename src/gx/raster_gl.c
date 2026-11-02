@@ -995,8 +995,10 @@ void glr_run_list(const CmdList* l) {
             xfb_gpu_copy(cp);
             G(glBindFramebuffer)(GL_FRAMEBUFFER, g_fbo);
         }
-        if (cp->clear)
+        if (cp->clear) {
+            if (cp->to_xfb) raster_probes_before_clear();
             clear_efb(cp);
+        }
         cur = 0xFFFFFFFFu;              /* scissor, masks and bindings may have changed */
     }
 }

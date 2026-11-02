@@ -2060,7 +2060,21 @@ static u32 g_frame_ea[PROBE_MAX], g_nframe_ea;         /* the ones read this fra
 static u32 g_probe_streak, g_peeks_frame;
 static bool g_frame_ea_over;                           /* more than PROBE_MAX different ones this frame */
 static volatile u32 g_probe_value[PROBE_MAX];
-static volatile bool g_probe_on;        /* the GPU thread reads the probe pixels after each list */
+static volatile bool g_probe_on;        /* the GPU thread reads the probe pixels each list */
+static bool g_probe_pending;            /* (GPU thread) this list's probes not read yet */
+
+/* Read as the frame is finished, before the copy out clears it: read after
+   the list, the depth was always the cleared depth (everything far away),
+   so the sun's glare showed through buildings. */
+void raster_probes_before_clear(void) {
+    if (!g_probe_pending) return;
+    g_probe_pending = false;
+    for (u32 k = 0; k < g_nprobe; k++) {
+        u32 ea = g_probe_ea[k], v = 0;
+        glr_read_point((ea >> 2) & 0x3FFu, (ea >> 12) & 0x3FFu, (ea & 0x00400000u) != 0, &v);
+        g_probe_value[k] = v;
+    }
+}
 #define PROBE_STREAK 3u
 
 static Cmd* list_push(CmdList* l) {
@@ -2301,13 +2315,9 @@ static void worker_main(void* arg) {
             else if (job == JOB_TEXCOPY)
                 glr_tex_copy(g_job_copy);
             else {
+                g_probe_pending = g_probe_on && !l->skipped;   /* (a frame not drawn: the last values stand) */
                 glr_run_list(g_defer ? expand_list(l) : l);
-                if (g_probe_on && !l->skipped)   /* (a frame not drawn: the last values stand) */
-                    for (u32 k = 0; k < g_nprobe; k++) {
-                        u32 ea = g_probe_ea[k], v = 0;
-                        glr_read_point((ea >> 2) & 0x3FFu, (ea >> 12) & 0x3FFu, (ea & 0x00400000u) != 0, &v);
-                        g_probe_value[k] = v;
-                    }
+                raster_probes_before_clear();   /* (no clearing copy in the list: read at its end) */
             }
         } else {
             int y0, y1;
