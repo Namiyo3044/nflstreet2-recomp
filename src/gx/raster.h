@@ -129,4 +129,9 @@ void gx_raster_report(void);
    window thread). */
 void gx_raster_present_pixels(const u32* px, u32 w, u32 h, int win_w, int win_h, float aspect);
 
+/* Fast-forward: the next frame isn't drawn (it won't be shown); frames
+   drawn so far. */
+void gx_raster_set_skip_next(bool on);
+u32 gx_raster_drawn_frames(void);
+
 #endif

@@ -188,7 +188,7 @@ bool menu_take_restart(char* args, size_t cap) {
 }
 
 /* --------------------------------------------- Delete User ID row --- */
-/* Recomp Settings' last row: the User IDs on the card in slot A, picked with
+/* Save/Load's Delete User ID row (uismenu.c): the User IDs on the card in slot A, picked with
    left / right; A asks again (the value and the help line say so), and A
    once more deletes that User ID's file. The game then restarts at once, so
    its card library (which keeps the old directory in memory) writes nothing
@@ -246,8 +246,19 @@ static const char* card_help(void) {
     return "Pick a User ID with left / right, then press A to delete it.";
 }
 
+int menu_card_row_count(int row) { (void)row; return card_count(); }
+int menu_card_row_get(int row) { (void)row; return card_get(); }
+void menu_card_row_set(int row, int v) { (void)row; card_set(v); }
+const char* menu_card_row_name(int row, int v) { (void)row; return card_value(v); }
+const char* menu_card_row_help(int row) { (void)row; return card_help(); }
+bool menu_card_row_enabled(int row) { (void)row; return card_enabled(); }
+
 void menu_card_focus(bool on) {
-    if (!on) g_card_armed = false;
+    /* The cursor gone from the row for a moment (a few fields, not a blip
+       while it animates): the question is dropped. */
+    static int away;
+    away = on ? 0 : away + 1;
+    if (away >= 6) g_card_armed = false;
 }
 
 void menu_card_press(void) {
@@ -669,15 +680,12 @@ const char* menu_game_row_help(int row) {
 
 /* The game's Recomp Settings screen (Options): the port's own additions. */
 extern int g_rain_style, g_screen_filters, g_specular;
-enum { RR_RAIN, RR_FILTERS, RR_TEXTURES, RR_SPECULAR, RR_LABELS, RR_INTROS, RR_DELETE };
+enum { RR_RAIN, RR_FILTERS, RR_TEXTURES, RR_SPECULAR, RR_LABELS, RR_INTROS };
 const char* const k_recomp_label[MENU_RECOMP_ROWS] = {"The Alley Rain", "Screen Filters", "Custom Textures",
                                                       "Specular Highlights", "Nintendo Buttons",
-                                                      "Skip Intro Videos", "Delete User ID"};
+                                                      "Skip Intro Videos"};
 
-int menu_recomp_row_count(int row) {
-    if (row == RR_DELETE) return card_count();
-    return row == RR_SPECULAR || row == RR_RAIN ? 3 : 2;
-}
+int menu_recomp_row_count(int row) { return row == RR_SPECULAR || row == RR_RAIN ? 3 : 2; }
 
 /* The rain row shows Off, GameCube, PS2/Xbox; the setting keeps 0 GameCube,
    1 PS2/Xbox (its old meanings) and 2 off. */
@@ -690,7 +698,6 @@ int menu_recomp_row_get(int row) {
     case RR_TEXTURES: return g_settings.custom_textures ? 1 : 0;
     case RR_INTROS: return g_settings.skip_intros ? 1 : 0;
     case RR_SPECULAR: return g_settings.specular;
-    case RR_DELETE: return card_get();
     default: return g_settings.nintendo_labels ? 0 : 1;
     }
 }
@@ -702,7 +709,6 @@ static bool net_locked(int row) {
 }
 
 void menu_recomp_row_set(int row, int v) {
-    if (row == RR_DELETE) { card_set(v); return; }
     if (net_locked(row)) return;
     switch (row) {
     case RR_RAIN:
@@ -733,7 +739,6 @@ void menu_recomp_row_set(int row, int v) {
 }
 
 bool menu_recomp_row_enabled(int row) {
-    if (row == RR_DELETE) return card_enabled();
     if (net_locked(row)) return false;
     if (row == RR_TEXTURES) return g_info.textures_found && g_settings.renderer == 0;
     if (row == RR_SPECULAR) return g_settings.renderer == 0;
@@ -746,7 +751,6 @@ const char* menu_recomp_row_name(int row, int v) {
     case RR_FILTERS: case RR_INTROS: return v ? "On" : "Off";
     case RR_SPECULAR: return v == 2 ? "Accurate" : v == 1 ? "Subtle" : "Off";
     case RR_TEXTURES: return !g_info.textures_found ? "None Found" : v ? "On" : "Off";
-    case RR_DELETE: return card_value(v);
     default: return v ? "By Position" : "By Label";
     }
 }
@@ -758,7 +762,6 @@ const char* menu_recomp_row_help(int row) {
     case RR_TEXTURES: return "Use the replacement textures folder.";
     case RR_INTROS: return "Hides and skips the intro videos. Applies next start.";
     case RR_SPECULAR: return "Shiny highlights on players. Accurate: as on PS2.";
-    case RR_DELETE: return card_help();
     default: return "For Nintendo pads: A/B/X/Y by label or position.";
     }
 }

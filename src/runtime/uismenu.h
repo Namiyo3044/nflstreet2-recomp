@@ -66,4 +66,15 @@ void uismenu_video_closed(void);
 /* Once per video field: Video Settings' rows follow and set the settings. */
 void uismenu_video_frame(CPUState* cpu);
 
+/* Save/Load: a Delete User ID row (the Auto Save row copied under the
+   buttons). Its values (row 0 of these). */
+void uismenu_set_saveload_row(const UisVideoRows* row);
+/* The Save/Load screen setting itself up (its platform check): adds the row
+   (does nothing for another screen). */
+bool uismenu_saveload_screen(CPUState* cpu);
+void uismenu_saveload_closed(void);
+/* Once per video field: the row follows the values; true while it has the
+   cursor. */
+bool uismenu_saveload_frame(CPUState* cpu);
+
 #endif

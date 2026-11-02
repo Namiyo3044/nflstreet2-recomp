@@ -134,6 +134,7 @@ typedef struct {
     u32 nraw, cap_raw;
     u32* xfdata;                       /* deferred: values of transform unit writes */
     u32 nxf, cap_xf;
+    bool skipped;                      /* a frame not drawn (fast-forward): nothing of it is to be read back */
 } CmdList;
 
 /* A frame-buffer copy into a texture, as the GPU backend redoes it at its

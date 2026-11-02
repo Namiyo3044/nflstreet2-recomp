@@ -2169,7 +2169,7 @@ static void worker_main(void* arg) {
                 glr_tex_copy(g_job_copy);
             else {
                 glr_run_list(g_defer ? expand_list(l) : l);
-                if (g_probe_on)
+                if (g_probe_on && !l->skipped)   /* (a frame not drawn: the last values stand) */
                     for (u32 k = 0; k < g_nprobe; k++) {
                         u32 ea = g_probe_ea[k], v = 0;
                         glr_read_point((ea >> 2) & 0x3FFu, (ea >> 12) & 0x3FFu, (ea & 0x00400000u) != 0, &v);
@@ -2243,8 +2243,19 @@ static void wait_idle(void) {
 
 /* Ends the recorded frame: hands its list to the workers (or draws it here
    when there are none) and starts recording into the other list. */
+/* Fast-forward: frames not to be shown aren't drawn (their draws are left
+   out; their copy to the TV buffer too, so the last drawn picture stays).
+   Decided a frame ahead by the window (gx_raster_set_skip_next). */
+static bool g_skip_rec;                /* the frame being recorded isn't drawn */
+static bool g_skip_next;
+static u32 g_drawn;                    /* frames drawn */
+
+void gx_raster_set_skip_next(bool on) { g_skip_next = on; }
+u32 gx_raster_drawn_frames(void) { return g_drawn; }
+
 static void submit(void) {
-    if (!g_defer) hud_flush();         /* (the deferred lists' HUD is done as they're expanded) */
+    g_lists[g_rec].skipped = g_skip_rec;
+    if (!g_defer && !g_skip_rec) hud_flush();   /* (the deferred lists' HUD is done as they're expanded) */
     gx_state_serial++;                 /* the next draw starts a new list: take a fresh snapshot */
     /* Peeks this frame: one at the same pixel as before makes a probe. */
     /* Peeks this frame: a few pixels, the same ones as the frames before,
@@ -3070,7 +3081,7 @@ static const CmdList* expand_list(const CmdList* l) {
         }
     }
     rain_flush(e);
-    hud_flush();                       /* the frame's HUD, now that all of it is known */
+    if (!l->skipped) hud_flush();      /* the frame's HUD, now that all of it is known */
     return e;
 }
 
@@ -3168,6 +3179,7 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
 }
 
 void gx_raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* data) {
+    if (g_skip_rec) return;            /* fast-forward: a frame not shown */
     int prev = prof_enter(PROF_GX_VERTEX);
     raster_draw(cpu, prim, vat, count, data);
     prof_leave(prev);
@@ -3531,7 +3543,7 @@ void gx_raster_copy(u32 cmd) {
         }
     }
 
-    if (active && (to_xfb || clear)) {
+    if (active && (to_xfb || clear) && !(to_xfb && g_skip_rec)) {
         if (!g_defer) rain_flush(&g_lists[g_rec]);   /* (deferred: when the list is expanded) */
         Cmd* c = list_push(&g_lists[g_rec]);
         if (c) {
@@ -3588,10 +3600,14 @@ void gx_raster_copy(u32 cmd) {
             submit();
         }
         dlog_frame_end();
-        vote_widescreen();
+        if (!g_skip_rec) {
+            vote_widescreen();
+            g_drawn++;
+        }
         gx_state_serial++;          /* textures are re-checked each frame: take a fresh snapshot */
         g_frames++;
         gx_tex_flush_cache();   /* texture data in RAM may change between frames: re-check */
+        g_skip_rec = g_skip_next;   /* the next frame: drawn or not */
     }
 }
 

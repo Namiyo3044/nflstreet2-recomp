@@ -1422,3 +1422,314 @@ bool uismenu_video_screen(CPUState* cpu) {
     printf("uis: %s: Audio Settings screen opened in video mode (%d rows)\n", g_vcb->title, rows);
     return true;
 }
+
+/* ------------------------------------- Save/Load: Delete User ID row --- */
+/* The Save/Load screen (Auto Save, a choice row, then five buttons) gets a
+   second choice row under its buttons: Delete User ID. It is the Auto Save
+   row (object 1 and its parts 2-6) copied the way the video screens copy
+   the Audio Settings row (video_rows), into the port's memory: the parts'
+   instances, their object records' lists and descriptors, drawing records
+   and focus link blocks, with pointers and offsets into those moved to the
+   copy. Up / down: the last button (Remove NFL Gauntlet Team) leads to it
+   and it to Auto Save (the screen's list wraps round). Its start-up runs at
+   the end of the screen's own (as for the video rows); left / right change
+   its value as the row does Auto Save's, but the screen only reads Auto
+   Save's own row (and has nothing for an A on this one), so the port gives
+   it its User IDs, help line and A. */
+#define SL_NOBJ 0x26u
+#define SL_BASE (PORT_RAM_BASE + 0x30000u)
+#define SL_TEXT (SL_BASE + 0x0000u)      /* the label */
+#define SL_KIDS (SL_BASE + 0x0100u)      /* the root's children with the copy */
+#define SL_LIST (SL_BASE + 0x0300u)      /* the root's list of rows and buttons with the copy */
+#define SL_OBJTAB (SL_BASE + 0x0400u)    /* the object table with the copy (0x2C objects) */
+#define SL_CODE (SL_BASE + 0x0A00u)      /* script added to the screen */
+#define SL_VARS (SL_BASE + 0x0C00u)      /* the copy's text variables */
+#define SL_HEAP (SL_BASE + 0x1000u)      /* the copy itself */
+#define SL_END (SL_BASE + 0x8000u)
+
+static u32 g_sh;                       /* the Save/Load screen's script header (0: not open / no row) */
+static u32 g_srow;                     /* the copy's instance */
+static u32 g_stext, g_sval_var, g_sval_buf;   /* its value text record and variable */
+static u32 g_shelp, g_shelp_var;       /* the screen's help line: text record, variable (the game's) */
+static bool g_sstarted;
+static int g_slast;
+static const UisVideoRows* g_scb;
+static u32 g_sheap;
+
+void uismenu_set_saveload_row(const UisVideoRows* row) { g_scb = row; }
+
+static u32 sl_alloc(u32 n) {
+    u32 a = (g_sheap + 31u) & ~31u;
+    if (a + n > SL_END) return 0;
+    g_sheap = a + n;
+    return a;
+}
+
+static bool sl_is_screen(u32 h) {
+    if (!in_ram(h, 0x40) || rd(h) != SL_NOBJ || rd(h + 4) != h + 0x30) return false;
+    u32 vars = rd(h + 0xC);
+    return str_is(vars + 42 * 12, "Auto Save") && str_is(vars + 58 * 12, "Save/Load") &&
+           str_is(vars + 50 * 12, "Remove NFL Gauntlet Team");
+}
+
+static bool sl_build(u32 h) {
+    u32 tab = h + 0x30, nobj = SL_NOBJ, vars = rd(h + 0xC);
+    u32 ctrl = rd(tab), row = rd(tab + VR_FIRST * 20), last = rd(tab + 0x1B * 20), prev_btn = rd(tab + 0x16 * 20);
+    /* The parts' instances: from the row's to the next object's. */
+    u32 inst_lo = row, inst_hi = 0xFFFFFFFFu;
+    for (u32 o = 0; o < nobj; o++) {
+        u32 a = rd(tab + o * 20);
+        if (o >= VR_FIRST && o <= VR_LAST) continue;
+        if (a > inst_lo && a < inst_hi) inst_hi = a;
+    }
+    for (u32 o = VR_FIRST; o <= VR_LAST; o++)
+        if (rd(tab + o * 20) >= inst_hi) return false;
+    if (inst_hi - inst_lo > 0x800u) return false;
+    g_nvr = 0;
+    /* (all of it: here the row's label slot, +0x370, is the last word) */
+    vr_add(inst_lo, inst_hi);
+    u32 draw_lo = 0xFFFFFFFFu, draw_hi = 0;
+    for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
+        u32 r = tab + o * 20, n1 = rd(r + 4), p1 = rd(r + 8), n2 = rd(r + 12), p2 = rd(r + 16);
+        if (n1) vr_add(p1, p1 + n1 * 4);
+        if (n2) vr_add(p2, p2 + n2 * 8);
+        for (u32 i = 0; i < n1; i++) {
+            u32 q = rd(p1 + i * 4), c = rd(q + 4), l = rd(q + 8);
+            vr_add(q, q + 12);
+            if (c > 16) return false;
+            vr_add(l, l + c * 8);
+            for (u32 j = 0; j < c; j++) {
+                u32 k = rd(l + j * 8), v = rd(l + j * 8 + 4);
+                if (k == 0xFFFFFFFFu || !in_ram(v, 4)) continue;
+                u32 off = rd(v);
+                if (off < 0x800u || off >= 0x40000u) continue;
+                u32 size = (rd(h + off) >> 28) == 4 ? 0x60u : 0x40u;
+                if (h + off < draw_lo) draw_lo = h + off;
+                if (h + off + size > draw_hi) draw_hi = h + off + size;
+            }
+        }
+    }
+    for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
+        u32 inst = rd(tab + o * 20), lo = 0xFFFFFFFFu, hi = 0;
+        for (u32 x = 0x64; x <= 0x6C; x += 4) {
+            u32 off = rd(inst + x);
+            if (off < 0x40u || off >= 0x40000u) { lo = 0xFFFFFFFFu; break; }
+            if (h + off < lo) lo = h + off;
+            if (h + off + 12 > hi) hi = h + off + 12;
+        }
+        if (lo != 0xFFFFFFFFu && hi - lo <= 0x40u) vr_add(lo, hi);
+    }
+    u32 voff = rd(row + 0x368), loff = rd(row + 0x370);
+    if (voff < 0x800u || loff < 0x800u || voff >= 0x40000u || loff >= 0x40000u) return false;
+    if (h + voff + 0x40 > draw_hi) draw_hi = h + voff + 0x40;
+    if (h + loff + 0x40 > draw_hi) draw_hi = h + loff + 0x40;
+    if (draw_lo > h + voff) draw_lo = h + voff;
+    if (draw_hi <= draw_lo || draw_hi - draw_lo > 0x1000u) return false;
+    vr_add(draw_lo, draw_hi);
+    int nreg = g_nvr;
+
+    /* The new object table: the screen's objects, then the copy. */
+    u32 per = VR_LAST - VR_FIRST + 1, nnew = nobj + per, base = nobj;
+    if (SL_OBJTAB + nnew * 20 > SL_CODE) return false;
+    memcpy(R + (SL_OBJTAB - G), R + (tab - G), nobj * 20);
+    g_sheap = SL_HEAP;
+    for (int i = 0; i < nreg; i++) {
+        u32 n = g_vr[i].hi - g_vr[i].lo, a = sl_alloc(n);
+        if (!a) return false;
+        g_vr[i].nlo = a;
+        memcpy(R + (a - G), R + (g_vr[i].lo - G), n);
+    }
+    for (int i = 0; i < nreg; i++) {
+        u32 n = g_vr[i].hi - g_vr[i].lo;
+        bool is_draw = g_vr[i].lo == draw_lo;
+        for (u32 a = g_vr[i].nlo; a + 4 <= g_vr[i].nlo + n; a += 4) {
+            u32 w = rd(a);
+            if (w == 0xC000FFFFu || w == 0xFFFFFFFFu) {
+                if (a + 8 <= g_vr[i].nlo + n && !is_draw) {
+                    u32 idx = rd(a + 4);
+                    if (idx >= VR_FIRST && idx <= VR_LAST) { wr(a + 4, base + idx - VR_FIRST); a += 4; continue; }
+                }
+                continue;
+            }
+            wr(a, vr_reloc(w, h, !is_draw));
+        }
+    }
+    for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
+        u32 inst = rd(tab + o * 20), cinst = vr_reloc(inst, h, false);
+        for (u32 x = 0x64; x <= 0x6C; x += 4) {
+            u32 off = rd(inst + x), a = h + off;
+            for (int i = 0; i < nreg; i++)
+                if (a >= g_vr[i].lo && a < g_vr[i].hi) { wr(cinst + x, a - g_vr[i].lo + g_vr[i].nlo - h); break; }
+        }
+    }
+    for (u32 o = VR_FIRST; o <= VR_LAST; o++) {
+        u32 src = tab + o * 20, dst = SL_OBJTAB + (base + o - VR_FIRST) * 20;
+        wr(dst, vr_reloc(rd(src), h, false));
+        wr(dst + 4, rd(src + 4));
+        wr(dst + 8, vr_reloc(rd(src + 8), h, false));
+        wr(dst + 12, rd(src + 12));
+        wr(dst + 16, vr_reloc(rd(src + 16), h, false));
+    }
+    u32 crow = vr_reloc(row, h, false);
+    /* Under the last button, a button's step lower (the buttons' own spacing). */
+    union { u32 u; float f; } y, yl, yp;
+    yl.u = rd(last + 0x0C); yp.u = rd(prev_btn + 0x0C);
+    float step = yl.f - yp.f;
+    if (step < 20.0f || step > 60.0f) step = 32.0f;
+    y.f = yl.f + step;
+    wr(crow + 0x0C, y.u);
+    /* Its own text buffers. */
+    u32 vrec = h + rd(crow + 0x368), lrec = h + rd(crow + 0x370);
+    if (!in_ram(vrec, 0x40) || !in_ram(lrec, 0x40)) return false;
+    u32 vvar = SL_VARS, lvar = SL_VARS + 12, labvar = SL_VARS + 24;
+    u32 vbuf = sl_alloc(100), lbuf = sl_alloc(40), labbuf = sl_alloc(32);
+    if (!vbuf || !lbuf || !labbuf) return false;
+    put_var(vvar, vbuf, rd(rd(vrec + 0x20) + 4), (const char*)(R + (rd(rd(vrec + 0x20) + 8) - G)), 100);
+    static const char k_label[] = "Delete User ID";
+    u32 ln = (u32)strlen(k_label);
+    put_var(lvar, lbuf, ln, k_label, 40);
+    put_var(labvar, labbuf, ln, k_label, 32);
+    wr(vrec + 0x20, vvar);
+    wr(lrec + 0x20, lvar);
+    wr(lrec + 0x24, ln);
+    wr(crow + 0x94, labvar);            /* (the row's start-up writes its label from this) */
+    /* Up / down: the last button down to it, it down to Auto Save (the list
+       wraps round, as the last button did), Auto Save up to it. */
+    {
+        u32 self = crow - h;
+        u32 nb = sl_alloc(12), pb = sl_alloc(12);
+        if (!nb || !pb) return false;
+        wr(nb, 1); wr(nb + 4, self); wr(nb + 8, row - h);
+        wr(pb, 1); wr(pb + 4, self); wr(pb + 8, last - h);
+        wr(crow + 0x6C, nb - h);
+        wr(crow + 0x68, pb - h);
+        u32 ln6 = h + rd(last + 0x6C), rp = h + rd(row + 0x68);
+        if (!in_ram(ln6, 12) || rd(ln6) != 1 || rd(ln6 + 4) != last - h) return false;
+        if (!in_ram(rp, 12) || rd(rp) != 1 || rd(rp + 4) != row - h) return false;
+        wr(ln6 + 8, self);
+        wr(rp + 8, self);
+    }
+    wr(h, nnew);
+    wr(h + 4, SL_OBJTAB);
+    /* On screen and in the up / down order: after the last button, in the
+       root's children and its list of rows and buttons. */
+    {
+        u32 r0 = SL_OBJTAB, n2 = rd(r0 + 12), kids = rd(r0 + 16), out = SL_KIDS;
+        if (n2 > 60) return false;
+        for (u32 k = 0; k < n2; k++) {
+            wr(out, rd(kids + k * 8)); wr(out + 4, rd(kids + k * 8 + 4)); out += 8;
+            if (rd(kids + k * 8) == 0xC000FFFFu && rd(kids + k * 8 + 4) == 0x1Bu) { wr(out, 0xC000FFFFu); wr(out + 4, base); out += 8; }
+        }
+        wr(r0 + 12, (out - SL_KIDS) / 8);
+        wr(r0 + 16, SL_KIDS);
+        u32 n1 = rd(r0 + 4), p1 = rd(r0 + 8);
+        for (u32 i = 0; i < n1 && i < 8; i++) {
+            u32 desc = rd(p1 + i * 4), n = rd(desc + 4), list = rd(desc + 8);
+            if (n == 0 || n > 16 || rd(list + (n - 1) * 8) != 0xFFFFFFFFu || rd(list + (n - 1) * 8 + 4) != 0x1Bu) continue;
+            u32 lo = SL_LIST;
+            for (u32 k = 0; k < n; k++) { wr(lo + k * 8, rd(list + k * 8)); wr(lo + k * 8 + 4, rd(list + k * 8 + 4)); }
+            wr(lo + n * 8, 0xFFFFFFFFu); wr(lo + n * 8 + 4, base);
+            wr(desc + 4, n + 1);
+            wr(desc + 8, lo);
+        }
+    }
+    /* The copy's start-up (the game ran the row's as the screen loaded):
+       called at the end of the root's own, in place of its last call
+       ("dup; push -3; pick; call x; pop; pop; return"). */
+    u32 init = 0, cinit = 0;
+    {
+        u32 r = tab + VR_FIRST * 20, n2 = rd(r + 12), p2 = rd(r + 16);
+        for (u32 k = 0; k < n2; k++) if (rd(p2 + k * 8) == 0x8000FFFEu) init = rd(p2 + k * 8 + 4);
+        r = tab; n2 = rd(r + 12); p2 = rd(r + 16);
+        for (u32 k = 0; k < n2 && k < 64; k++) if (rd(p2 + k * 8) == 0x8000FFFEu) cinit = rd(p2 + k * 8 + 4);
+    }
+    u32 call = 0;
+    for (u32 a = cinit; cinit && a < cinit + 0x100; a++)
+        if (rb(a) == 0x43 && rb(a + 5) == 0x42 && rb(a + 6) == 0x42 && rb(a + 7) == 0x44 && rb(a - 1) == 0x1A) { call = a; break; }
+    if (!init || !call) return false;
+    {
+        u32 orig = rd(call + 1);
+        g_code = SL_CODE;
+        emit_push(crow); emit8(0x43); emit32(init - h); emit8(0x42);
+        emit8(0x41); emit_push(0xFFFFFFFDu); emit8(0x1A); emit8(0x43); emit32(orig); emit8(0x42); emit8(0x42);
+        emit8(0x44);
+        wr(call + 1, SL_CODE - h);
+    }
+    (void)ctrl;
+    g_srow = crow;
+    g_stext = vrec;
+    g_sval_var = vvar;
+    g_sval_buf = vbuf;
+    /* The help line: the text record showing var 57. */
+    g_shelp_var = vars + 57 * 12;
+    g_shelp = 0;
+    for (u32 a = h + 0x2000u; a < h + 0x6000u; a += 4)
+        if (rd(a + 0x20) == g_shelp_var && (rd(a) & 0xFFFFu) == 0x0402u) { g_shelp = a; break; }
+    return true;
+}
+
+/* The Save/Load screen is setting itself up (its platform check): add the row. */
+bool uismenu_saveload_screen(CPUState* cpu) {
+    R = cpu->ram;
+    RS = cpu->ram_size;
+    g_sh = 0;
+    if (!R || !g_scb || RS < (SL_END - G)) return false;
+    u32 h = 0;
+    for (u32 o = 0x00800000u; o + 0x40 < RS && o < 0x01800000u; o += 4) {
+        u32 a = G + o;
+        if (rd(a) == SL_NOBJ && rd(a + 4) == a + 0x30 && sl_is_screen(a)) { h = a; break; }
+    }
+    if (!h) return false;
+    if (!sl_build(h)) { printf("uis: Save/Load: the screen isn't as expected; no Delete User ID row\n"); return false; }
+    g_sh = h;
+    g_sstarted = false;
+    printf("uis: Save/Load: Delete User ID row added\n");
+    return true;
+}
+
+void uismenu_saveload_closed(void) { g_sh = 0; }
+
+static bool sl_open(void) {
+    u32 h = g_sh;
+    if (!h || !in_ram(h, 0x40) || rd(h) != SL_NOBJ + (VR_LAST - VR_FIRST + 1) || rd(h + 4) != SL_OBJTAB) return false;
+    if (!in_ram(g_srow, 0x400) || !in_ram(g_stext, 0x40) || !in_ram(g_sval_var, 12) || rd(g_sval_var + 8) != g_sval_buf)
+        return false;
+    return true;
+}
+
+/* Every video field: the row shows the User IDs; true while it has the cursor. */
+bool uismenu_saveload_frame(CPUState* cpu) {
+    if (!g_sh || !g_scb) return false;
+    R = cpu->ram;
+    RS = cpu->ram_size;
+    if (!R || !sl_open()) { g_sh = 0; return false; }
+    u32 row = g_srow;
+    if (!g_sstarted) {
+        if (rd(row + 0x80) != 1) return false;   /* its start-up still to run */
+        int n = g_scb->count(0), v = g_scb->get(0);
+        wr(row + 0x78, 0);
+        wr(row + 0x7C, (u32)(n - 1));
+        wr(row + 0x8C, 1);
+        wr(row + 0x74, (u32)v);
+        g_slast = v;
+        g_sstarted = true;
+    }
+    int n = g_scb->count(0), v = (int)rd(row + 0x74);
+    if ((int)rd(row + 0x7C) != n - 1) wr(row + 0x7C, (u32)(n - 1));
+    /* (+0x84: 1 with the cursor; 2 too, after A: the row's own "picked"
+       state, which it keeps until the cursor moves) */
+    u32 st = rd(row + 0x84);
+    bool focus = st == 1 || st == 2;
+    bool en = !g_scb->enabled || g_scb->enabled(0);
+    if (v < 0 || v >= n || (v != g_slast && (!focus || !en))) { v = g_slast < n ? g_slast : 0; wr(row + 0x74, (u32)v); }
+    if (v != g_slast) { g_scb->set(0, v); g_slast = v; }
+    int cur = g_scb->get(0);
+    if (cur != v) { v = g_slast = cur; wr(row + 0x74, (u32)v); }
+    set_text(g_stext, g_sval_var, g_scb->name(0, v), 100);
+    u32 lrec = g_sh + rd(row + 0x370);
+    /* Its label greyed while it can't be used (no User IDs, online); the
+       value stays as the row draws it (dark on its light box). */
+    if (in_ram(lrec, 0x20) && !focus) wr(lrec + 0x18, en ? TEXT_NORMAL : TEXT_GREY);
+    if (focus && g_shelp) set_text(g_shelp, g_shelp_var, g_scb->help(0), 120);
+    return focus;
+}

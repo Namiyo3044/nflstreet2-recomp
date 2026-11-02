@@ -365,14 +365,14 @@ static bool g_uis_trace;              /* --uis-trace: every call, in order */
    typed in and the host's port opened; --online (play.ps1 -Online) shows it,
    and a session (--net-host / --net-join) has it, to leave by. */
 static bool g_online_menu;
-typedef struct { const u8 sig[26]; u8 len; u8 off, on; bool screen_shape; const char* what; bool online; } UisEdit;
+typedef struct { const u8 sig[26]; u8 len; u8 off, on; bool screen_shape; const char* what; } UisEdit;
 static const UisEdit k_uis_edits[] = {
     {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x1C,0x3F,0x41,0x10,0,0,0x01,0x65,0x6F}, 26, 1, 2, false,
      "Options list: Audio Settings"},
     {{0x55,0,0,0,0xA0,0xFF,0xFA,0x10,0,0,0,0x01,0x36,0x10,0,0,0,0x26,0x3F,0x41,0x10,0,0,0x01,0x81,0x6F}, 26, 1, 2, false,
      "Options help: Adjust audio settings."},
     {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x02,0x36,0x41,0x10,0,0,0x01,0x36,0x10,0,0,0,0,0x0B}, 25, 2, 0x7F, false,
-     "main menu: Online", true},
+     "main menu: Online"},
     {{0x55,0,0,0,0xA0,0xFF,0xFD,0x10,0,0,0,0x02,0x36,0x10,0,0,0,0x1C,0x3F,0x41,0x10,0,0,0x01,0x67,0x6F}, 26, 2, 0x7F, false,
      "Credits list: Previews, Madden NFL 2005"},
     {{0x55,0,0,0,0xA0,0xFF,0xF7,0x10,0,0,0,0x02,0x36,0x10,0,0,0,0x68,0x3F}, 19, 2, 0x7F, false,
@@ -402,7 +402,6 @@ static void uis_main_menu_edits(CPUState* ctx) {
         const UisEdit* e = &k_uis_edits[i];
         if (!at[i]) continue;
         u8 want = (!e->screen_shape || g_settings.screen_shape != 0) ? e->on : e->off;
-        if (e->online && !g_online_menu) want = e->off;   /* Online: hidden for now (--online, or in a session) */
         if (ram[at[i] + 11] != want) {
             ram[at[i] + 11] = want;
             printf("uis: %s %s\n", e->what, want == e->on ? "on" : "off");
@@ -440,6 +439,13 @@ static void uis_credits_list(CPUState* ctx) {
     if (!ctx->ram || ctx->ram_size < 0x01800000u) return;
     if (uis_retext(ctx->ram, ctx->ram_size, "|Credits|Previews|Madden NFL 2005", "|Credits|Previews"))
         printf("uis: Credits list: Madden NFL 2005 left out\n");
+    /* Online hidden (g_online_menu): left off the end of the Game Modes list,
+       so the entries before it keep their places and actions. (Comparing the
+       console value the GameCube's way instead lost the whole list.) */
+    if (!g_online_menu &&
+        uis_retext(ctx->ram, ctx->ram_size, "|Own the City|Street Events|NFL Challenge|NFL Gauntlet|Pickup Game|Tutorials|Online",
+                   "|Own the City|Street Events|NFL Challenge|NFL Gauntlet|Pickup Game|Tutorials"))
+        printf("uis: Game Modes list: Online left out\n");
 }
 
 static bool g_video_screen;            /* the Options list asked for Video Settings */

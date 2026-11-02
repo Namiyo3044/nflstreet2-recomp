@@ -65,6 +65,7 @@ static u32 g_frames_at_stat;
 /* Fast-forward: no waiting for real time, few pictures shown, no sound.
    On while Tab is held, and set by the game side to skip the intro movies. */
 static bool g_turbo_forced, g_turbo_key;
+static bool g_card_focus;               /* Save/Load's Delete User ID row has the cursor */
 /* Skipping all the intro movies: black picture and no sound, at normal speed. */
 static bool g_hidden;
 static Uint64 g_hidden_since;
@@ -86,7 +87,7 @@ void window_set_turbo(bool on) {
             since = SDL_GetTicksNS();
             printf("window: fast-forward on (skipping intro movies)\n");
         } else {
-            printf("startup: THX intro fast-forwarded in %.1f s\n", (double)(SDL_GetTicksNS() - since) * 1e-9);
+            printf("startup: intro fast-forwarded in %.1f s\n", (double)(SDL_GetTicksNS() - since) * 1e-9);
         }
     }
     g_turbo_forced = on;
@@ -1255,7 +1256,7 @@ static void read_input(void) {
         bool a = false;
         for (int i = 0; i < PAD_PORTS; i++) if (st[i].buttons & PAD_A) a = true;
         if (page == 2 && focus >= 0 && a && !was_a) menu_online_press(focus);
-        if (page == 1 && focus == MENU_RECOMP_DELETE_ROW && a && !was_a) menu_card_press();   /* Delete User ID */
+        if (g_card_focus && a && !was_a) menu_card_press();   /* Save/Load's Delete User ID */
         was_a = a;
     }
     for (int i = 0; i < PAD_PORTS; i++) pad_set_live(i, &st[i]);
@@ -1556,7 +1557,7 @@ static void pace_and_stats(void) {
         char busiest[256];
         prof_since(sec_mark, busiest, sizeof busiest);
         sec_mark = prof_mark();
-        if (speed < 95.0) {
+        if (speed < 95.0 || turbo()) {   /* (fast-forward too: how fast it goes, and what holds it back) */
             double slept = (double)g_slept_ns * 1e-9, shown = (double)g_present_ns * 1e-9;
             double game = secs - slept - shown - wait;
             printf("perf: %5.1f s game time, %3.0f%% speed, %2.0f fps | per second: game code %3.0f ms, waiting for "
@@ -2014,7 +2015,16 @@ void window_field(CPUState* cpu) {
                the connection going on (both games restart once it's made). */
             int page = -1, focus = uismenu_video_focus(&page);
             menu_online_focus(page == 2 ? focus : -1);
-            menu_card_focus(page == 1 && focus == MENU_RECOMP_DELETE_ROW);
+            {
+                /* Save/Load's Delete User ID row */
+                static const char* const k_card_label[1] = {"Delete User ID"};
+                static const UisVideoRows k_card = {menu_card_row_count, menu_card_row_get, menu_card_row_set,
+                                                    menu_card_row_name, menu_card_row_help, menu_card_row_enabled,
+                                                    1, "Delete User ID", k_card_label};
+                uismenu_set_saveload_row(&k_card);
+                g_card_focus = uismenu_saveload_frame(cpu);
+                menu_card_focus(g_card_focus);
+            }
             if (menu_card_tick(g_restart_args, sizeof g_restart_args)) {
                 /* a User ID deleted: the game starts again, reading the card afresh */
                 settings_save();
@@ -2103,14 +2113,29 @@ void window_field(CPUState* cpu) {
     g_turbo_key = keys && keys[SDL_SCANCODE_TAB];
     Uint64 t0 = SDL_GetTicksNS();
     int prev = prof_enter(PROF_PRESENT);
-    /* Fast-forward: show one field in eight; while skipping the THX intro,
-       a black window. */
+    /* Fast-forward (Tab): a picture whenever one is due on the screen (60 a
+       second), the fields in between not shown. (One field in eight, as
+       before, looked like 10 frames a second in a match, where the game
+       can't run much faster than normal.) While skipping the intros, a black
+       window now and then. */
+    /* Frames not shown aren't drawn either (raster.c): while Tab is held, a
+       frame is drawn about 30 times a second and shown when it's done, the
+       others left out, which leaves the game's own work more of the time. */
+    static Uint64 last_shown;
+    static u32 shown_drawn;
+    bool tab = turbo() && !g_turbo_forced && !g_hidden;
     if (g_turbo_forced || g_hidden) {
         if (!g_turbo_forced || (g_field & 7u) == 0)
             present_black();
-    } else if (!turbo() || (g_field & 7u) == 0) {
+    } else if (!tab) {
         present(cpu);
+        last_shown = t0;
+    } else if (gx_raster_drawn_frames() != shown_drawn) {
+        present(cpu);
+        shown_drawn = gx_raster_drawn_frames();
+        last_shown = t0;
     }
+    gx_raster_set_skip_next(tab && t0 - last_shown < 25000000ull);
     prof_leave(prev);
     g_present_ns += SDL_GetTicksNS() - t0;
     pace_and_stats();
