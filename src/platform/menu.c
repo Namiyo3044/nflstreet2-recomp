@@ -187,6 +187,89 @@ bool menu_take_restart(char* args, size_t cap) {
     return true;
 }
 
+/* --------------------------------------------- Delete User ID row --- */
+/* Recomp Settings' last row: the User IDs on the card in slot A, picked with
+   left / right; A asks again (the value and the help line say so), and A
+   once more deletes that User ID's file. The game then restarts at once, so
+   its card library (which keeps the old directory in memory) writes nothing
+   back. The GameCube deleted saves from its own memory card manager; the
+   game has no screen for it. */
+/* (runtime/exi.h; declared here to keep the CPU's types out of this file) */
+int exi_card_list(int slot, char files[][33], int max);
+bool exi_card_delete(int slot, const char* name);
+#define CARD_PREFIX "GN7E-69UserID"   /* the game's User ID files: this, then the name */
+#define CARD_MAX 32
+static char g_card_file[CARD_MAX][33];
+static int g_card_n;                   /* User IDs on the card */
+static int g_card_sel;                 /* the one picked */
+static bool g_card_armed;              /* asking "delete?" */
+static int g_card_done_fields;         /* deleted: fields left before the restart (0: none) */
+static char g_card_help[160];
+
+static void card_scan(void) {
+    char files[64][33];
+    int n = exi_card_list(0, files, 64);
+    size_t pl = strlen(CARD_PREFIX);
+    g_card_n = 0;
+    for (int i = 0; i < n && g_card_n < CARD_MAX; i++)
+        if (strncmp(files[i], CARD_PREFIX, pl) == 0 && files[i][pl])
+            snprintf(g_card_file[g_card_n++], sizeof g_card_file[0], "%s", files[i]);
+    if (g_card_sel >= g_card_n) g_card_sel = 0;
+}
+
+static const char* card_name(int i) { return g_card_file[i] + strlen(CARD_PREFIX); }
+
+static int card_count(void) { card_scan(); return g_card_n ? g_card_n : 1; }
+static int card_get(void) { return g_card_n ? g_card_sel : 0; }
+static void card_set(int v) {
+    if (v != g_card_sel) g_card_armed = false;
+    g_card_sel = v < 0 || v >= g_card_n ? 0 : v;
+}
+static bool card_enabled(void) { return g_card_n > 0 && !netplay_active() && !g_card_done_fields; }
+
+static const char* card_value(int v) {
+    if (!g_card_n) return "None";
+    if (g_card_done_fields) return "Deleted";
+    if (g_card_armed && v == g_card_sel) return "Delete?";
+    return card_name(v < 0 || v >= g_card_n ? 0 : v);
+}
+
+static const char* card_help(void) {
+    if (g_card_done_fields) return "Deleted. The game is restarting...";
+    if (netplay_active()) return "Not during an online game.";
+    if (!g_card_n) return "No User IDs on the Memory Card in Slot A.";
+    if (g_card_armed) {
+        snprintf(g_card_help, sizeof g_card_help, "Press A again to delete %s. Its saved data will be lost and the game restarts.",
+                 card_name(g_card_sel));
+        return g_card_help;
+    }
+    return "Pick a User ID with left / right, then press A to delete it.";
+}
+
+void menu_card_focus(bool on) {
+    if (!on) g_card_armed = false;
+}
+
+void menu_card_press(void) {
+    if (!card_enabled()) return;
+    if (!g_card_armed) { g_card_armed = true; return; }
+    g_card_armed = false;
+    if (!exi_card_delete(0, g_card_file[g_card_sel])) {
+        printf("delete user id: couldn't delete %s\n", g_card_file[g_card_sel]);
+        return;
+    }
+    g_card_done_fields = 2;            /* at once (see above) */
+}
+
+bool menu_card_tick(char* args, size_t cap) {
+    if (g_card_done_fields > 0 && --g_card_done_fields == 0) {
+        g_card_done_fields = 1;        /* (stays as it is while the game closes) */
+        snprintf(args, cap, "%s", "");
+        return true;
+    }
+    return false;
+}
+
 /* ------------------------------------- the game's own Online screen --- */
 /* The main menu's Online opens the Audio Settings screen in video mode with
    these rows (like Recomp Settings): Host a Game and Join a Game switch
@@ -586,12 +669,15 @@ const char* menu_game_row_help(int row) {
 
 /* The game's Recomp Settings screen (Options): the port's own additions. */
 extern int g_rain_style, g_screen_filters, g_specular;
-enum { RR_RAIN, RR_FILTERS, RR_TEXTURES, RR_SPECULAR, RR_LABELS, RR_INTROS };
+enum { RR_RAIN, RR_FILTERS, RR_TEXTURES, RR_SPECULAR, RR_LABELS, RR_INTROS, RR_DELETE };
 const char* const k_recomp_label[MENU_RECOMP_ROWS] = {"The Alley Rain", "Screen Filters", "Custom Textures",
                                                       "Specular Highlights", "Nintendo Buttons",
-                                                      "Skip Intro Videos"};
+                                                      "Skip Intro Videos", "Delete User ID"};
 
-int menu_recomp_row_count(int row) { return row == RR_SPECULAR || row == RR_RAIN ? 3 : 2; }
+int menu_recomp_row_count(int row) {
+    if (row == RR_DELETE) return card_count();
+    return row == RR_SPECULAR || row == RR_RAIN ? 3 : 2;
+}
 
 /* The rain row shows Off, GameCube, PS2/Xbox; the setting keeps 0 GameCube,
    1 PS2/Xbox (its old meanings) and 2 off. */
@@ -604,6 +690,7 @@ int menu_recomp_row_get(int row) {
     case RR_TEXTURES: return g_settings.custom_textures ? 1 : 0;
     case RR_INTROS: return g_settings.skip_intros ? 1 : 0;
     case RR_SPECULAR: return g_settings.specular;
+    case RR_DELETE: return card_get();
     default: return g_settings.nintendo_labels ? 0 : 1;
     }
 }
@@ -615,6 +702,7 @@ static bool net_locked(int row) {
 }
 
 void menu_recomp_row_set(int row, int v) {
+    if (row == RR_DELETE) { card_set(v); return; }
     if (net_locked(row)) return;
     switch (row) {
     case RR_RAIN:
@@ -645,6 +733,7 @@ void menu_recomp_row_set(int row, int v) {
 }
 
 bool menu_recomp_row_enabled(int row) {
+    if (row == RR_DELETE) return card_enabled();
     if (net_locked(row)) return false;
     if (row == RR_TEXTURES) return g_info.textures_found && g_settings.renderer == 0;
     if (row == RR_SPECULAR) return g_settings.renderer == 0;
@@ -657,6 +746,7 @@ const char* menu_recomp_row_name(int row, int v) {
     case RR_FILTERS: case RR_INTROS: return v ? "On" : "Off";
     case RR_SPECULAR: return v == 2 ? "Accurate" : v == 1 ? "Subtle" : "Off";
     case RR_TEXTURES: return !g_info.textures_found ? "None Found" : v ? "On" : "Off";
+    case RR_DELETE: return card_value(v);
     default: return v ? "By Position" : "By Label";
     }
 }
@@ -668,6 +758,7 @@ const char* menu_recomp_row_help(int row) {
     case RR_TEXTURES: return "Use the replacement textures folder.";
     case RR_INTROS: return "Hides and skips the intro videos. Applies next start.";
     case RR_SPECULAR: return "Shiny highlights on players. Accurate: as on PS2.";
+    case RR_DELETE: return card_help();
     default: return "For Nintendo pads: A/B/X/Y by label or position.";
     }
 }

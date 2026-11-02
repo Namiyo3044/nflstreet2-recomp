@@ -322,6 +322,123 @@ static void card_dma(Card* c, CPUState* cpu, u32 mar, u32 len, bool to_ram) {
     }
 }
 
+/* ------------------------------------------------- the card's files --- */
+/* The card's file system, for the port's own Memory Card screen (the
+   GameCube's memory card manager deleted files; the game has no screen for
+   it). Blocks 1 and 2 are two copies of the directory, 3 and 4 two copies of
+   the block table; the copy with good checksums and the higher update count
+   is the one in use. Each ends with (directory) or starts with (table) an
+   update count and two checksums over the rest. Files are changed only while
+   the game isn't using the card (it restarts after). */
+#define DIR_ENTRIES 127u
+#define BE16(p) ((u32)(p)[0] << 8 | (p)[1])
+
+static void put16(u8* p, u32 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; }
+
+static void card_checksum(const u8* p, u32 len, u32* sum, u32* inv) {
+    u32 a = 0, b = 0;
+    for (u32 i = 0; i + 1 < len; i += 2) {
+        u32 w = BE16(p + i);
+        a = (a + w) & 0xFFFFu;
+        b = (b + (~w & 0xFFFFu)) & 0xFFFFu;
+    }
+    *sum = a == 0xFFFFu ? 0 : a;
+    *inv = b == 0xFFFFu ? 0 : b;
+}
+
+static bool dir_ok(const u8* d) {
+    u32 a, b;
+    card_checksum(d, 0x1FFC, &a, &b);
+    return BE16(d + 0x1FFC) == a && BE16(d + 0x1FFE) == b;
+}
+
+static bool bat_ok(const u8* t) {
+    u32 a, b;
+    card_checksum(t + 4, 0x1FFC, &a, &b);
+    return BE16(t) == a && BE16(t + 2) == b;
+}
+
+/* The copy in use (0 or 1), -1 if neither is good. */
+static int pick_copy(const u8* c0, const u8* c1, bool ok0, bool ok1, u32 count_at) {
+    if (ok0 && ok1) return (short)(BE16(c0 + count_at) - BE16(c1 + count_at)) >= 0 ? 0 : 1;
+    return ok0 ? 0 : ok1 ? 1 : -1;
+}
+
+static u8* card_dir(Card* c) {
+    if (!c->present || c->size < 5 * SECTOR_SIZE) return NULL;
+    u8* d0 = c->data + 1 * SECTOR_SIZE;
+    u8* d1 = c->data + 2 * SECTOR_SIZE;
+    int k = pick_copy(d0, d1, dir_ok(d0), dir_ok(d1), 0x1FFA);
+    return k < 0 ? NULL : k ? d1 : d0;
+}
+
+static u8* card_bat(Card* c) {
+    if (!c->present || c->size < 5 * SECTOR_SIZE) return NULL;
+    u8* t0 = c->data + 3 * SECTOR_SIZE;
+    u8* t1 = c->data + 4 * SECTOR_SIZE;
+    int k = pick_copy(t0, t1, bat_ok(t0), bat_ok(t1), 4);
+    return k < 0 ? NULL : k ? t1 : t0;
+}
+
+int exi_card_list(int slot, char files[][33], int max) {
+    if (slot < 0 || slot > 1) return 0;
+    const u8* d = card_dir(&g_card[slot]);
+    if (!d) return 0;
+    int n = 0;
+    for (u32 i = 0; i < DIR_ENTRIES && n < max; i++) {
+        const u8* e = d + i * 64;
+        if (e[0] == 0xFF) continue;
+        memcpy(files[n], e + 8, 32);
+        files[n][32] = 0;
+        n++;
+    }
+    return n;
+}
+
+bool exi_card_delete(int slot, const char* name) {
+    if (slot < 0 || slot > 1) return false;
+    Card* c = &g_card[slot];
+    u8* d = card_dir(c);
+    u8* t = card_bat(c);
+    if (!d || !t) return false;
+    u8 dir[SECTOR_SIZE], bat[SECTOR_SIZE];
+    memcpy(dir, d, SECTOR_SIZE);
+    memcpy(bat, t, SECTOR_SIZE);
+    u32 blocks = c->size / SECTOR_SIZE;
+    for (u32 i = 0; i < DIR_ENTRIES; i++) {
+        u8* e = dir + i * 64;
+        if (e[0] == 0xFF || strncmp((const char*)e + 8, name, 32) != 0) continue;
+        /* Its blocks back to free, following the table from its first. */
+        u32 b = BE16(e + 0x36), freed = 0;
+        while (b >= 5 && b < blocks && freed < blocks) {
+            u8* m = bat + 0x0A + (b - 5) * 2;
+            u32 next = BE16(m);
+            put16(m, 0);
+            freed++;
+            if (next == 0xFFFFu) break;
+            b = next;
+        }
+        memset(e, 0xFF, 64);
+        u32 a, x;
+        put16(dir + 0x1FFA, BE16(dir + 0x1FFA) + 1);
+        card_checksum(dir, 0x1FFC, &a, &x);
+        put16(dir + 0x1FFC, a); put16(dir + 0x1FFE, x);
+        put16(bat + 4, BE16(bat + 4) + 1);
+        put16(bat + 6, BE16(bat + 6) + freed);
+        card_checksum(bat + 4, 0x1FFC, &a, &x);
+        put16(bat, a); put16(bat + 2, x);
+        /* Both copies alike. */
+        for (u32 k = 0; k < 2; k++) {
+            memcpy(c->data + (1 + k) * SECTOR_SIZE, dir, SECTOR_SIZE);
+            memcpy(c->data + (3 + k) * SECTOR_SIZE, bat, SECTOR_SIZE);
+        }
+        card_save(c, 1 * SECTOR_SIZE, 4 * SECTOR_SIZE);
+        printf("memory card %c: deleted %.32s (%u blocks)\n", 'A' + slot, name, freed);
+        return true;
+    }
+    return false;
+}
+
 /* ------------------------------------------------------ IPL / RTC / SRAM --- */
 static u8 g_sram[64];
 static u32 g_ipl_cmd, g_ipl_pos;

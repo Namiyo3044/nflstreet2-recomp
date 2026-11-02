@@ -74,7 +74,7 @@ void menu_bind(int code);
    Window Size, Renderer and Internal Resolution, values numbered from 0.
    Setting one counts as a change (menu_take_changes). */
 #define MENU_GAME_ROWS 5
-#define MENU_RECOMP_ROWS 6
+#define MENU_RECOMP_ROWS 7
 /* The game's own Online screen (the main menu's Online): Host a Game, Join a
    Game, Input Delay, This PC's Address. */
 #define MENU_ONLINE_ROWS 4
@@ -98,6 +98,13 @@ bool menu_online_tick(char* args, size_t cap);
 /* The netplay session badge (a picture like menu_draw's, NULL when nothing is to be shown). */
 const uint32_t* menu_hud(int w, int h, bool* dirty, const NetplayStatus* st, bool in_menus);
 extern const char* const k_recomp_label[MENU_RECOMP_ROWS];
+/* Recomp Settings' Delete User ID row (the last): the cursor on it or not,
+   A pressed on it, and every video field: true once the game should restart
+   (a User ID deleted). */
+#define MENU_RECOMP_DELETE_ROW 6
+void menu_card_focus(bool on);
+void menu_card_press(void);
+bool menu_card_tick(char* args, size_t cap);
 /* What the menus show about the session (the GPU, textures), kept up to date
    for the game's own settings screens too. */
 void menu_set_info(const MenuInfo* info);

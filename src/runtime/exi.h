@@ -24,6 +24,12 @@ bool exi_interrupt_pending(void);
 void exi_tick(u64 now);
 u64 exi_next_event(void);
 void exi_report(void);
+/* The files on the card in a slot (their 32-character names), up to max;
+   how many. */
+int exi_card_list(int slot, char files[][33], int max);
+/* Deletes a file from the card (only while the game isn't using it: the
+   game restarts after). */
+bool exi_card_delete(int slot, const char* name);
 /* Saves not yet in the memory card's file written out now. */
 void exi_flush(void);
 

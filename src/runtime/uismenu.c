@@ -909,14 +909,15 @@ void uismenu_hide_licence(CPUState* cpu) {
 #define PV_LIST (PV_BASE + 0x0200u)
 #define PV_KIDS2 (PV_BASE + 0x0300u)   /* the root's children with the row copies */
 #define PV_OBJTAB (PV_BASE + 0x0400u)   /* the object table with the row copies */
-#define PV_ROWLIST (PV_BASE + 0x0900u)  /* the root's list of rows */
+#define PV_ROWLIST (PV_BASE + 0x0980u)  /* the root's list of rows (seven rows: the table runs to 0x978) */
 #define PV_CODE (PV_BASE + 0x0A00u)     /* script added to the screen */
 #define PV_VARS (PV_BASE + 0x0C00u)     /* the copies' text variables */
 #define PV_HEAP (PV_BASE + 0x1000u)     /* the copies themselves */
 #define PV_END (PV_BASE + 0x8000u)
-#define VROWS 6                          /* rows on the screen: the original + 5 copies */
+#define VROWS 7                          /* rows on the screen: the original + 6 copies */
 #define VROW_DY 50.0f                    /* the rows' spacing (the volume rows' own) */
 #define VROW_DY6 40.0f                   /* with six rows: closer, so they take the room five did */
+#define VROW_DY7 35.0f                   /* ... and seven */
 #define AUD_NOBJ 0x22u
 #define AUD_NVAR 0x27u
 #define AUD_NFUNC 7u
@@ -1090,7 +1091,7 @@ static int video_rows(u32 h) {
         g_vrow[c] = crow;
         /* One row lower. */
         union { u32 u; float f; } y;
-        y.u = rd(row + 0x0C); y.f += (g_vn >= 6 ? VROW_DY6 : VROW_DY) * (float)c; wr(crow + 0x0C, y.u);
+        y.u = rd(row + 0x0C); y.f += (g_vn >= 7 ? VROW_DY7 : g_vn >= 6 ? VROW_DY6 : VROW_DY) * (float)c; wr(crow + 0x0C, y.u);
         /* Its own text buffers: the text records point at variables. */
         u32 vrec = h + rd(crow + 0x368), lrec = h + rd(crow + 0x370);
         if (!in_ram(vrec, 0x40) || !in_ram(lrec, 0x40)) return c;
@@ -1209,7 +1210,11 @@ void uismenu_set_video_page(int page) { g_vpage = page < 0 || page > 2 ? 0 : pag
 static int g_vfocus = -1;              /* the row with the cursor, last field */
 
 int uismenu_video_focus(int* page) {
-    if (page) *page = g_vh && g_vcb ? (g_vcb == g_vpages[2] ? 2 : g_vcb == g_vpages[1] ? 1 : 0) : -1;
+    if (page) {
+        *page = -1;
+        for (int k = 0; k < 3 && g_vh && g_vcb; k++)
+            if (g_vcb == g_vpages[k]) { *page = k; break; }
+    }
     return g_vh && g_vstarted ? g_vfocus : -1;
 }
 

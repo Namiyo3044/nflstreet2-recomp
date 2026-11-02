@@ -45,7 +45,7 @@ typedef struct {
     const char* (*name)(int row, int value);
     const char* (*help)(int row);
     bool (*enabled)(int row);          /* can be used now (else greyed out and skipped) */
-    int rows;                          /* how many (2-6) */
+    int rows;                          /* how many (2-7) */
     const char* title;
     const char* const* labels;         /* each row's label */
 } UisVideoRows;

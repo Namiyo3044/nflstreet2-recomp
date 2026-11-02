@@ -1255,6 +1255,7 @@ static void read_input(void) {
         bool a = false;
         for (int i = 0; i < PAD_PORTS; i++) if (st[i].buttons & PAD_A) a = true;
         if (page == 2 && focus >= 0 && a && !was_a) menu_online_press(focus);
+        if (page == 1 && focus == MENU_RECOMP_DELETE_ROW && a && !was_a) menu_card_press();   /* Delete User ID */
         was_a = a;
     }
     for (int i = 0; i < PAD_PORTS; i++) pad_set_live(i, &st[i]);
@@ -2013,6 +2014,14 @@ void window_field(CPUState* cpu) {
                the connection going on (both games restart once it's made). */
             int page = -1, focus = uismenu_video_focus(&page);
             menu_online_focus(page == 2 ? focus : -1);
+            menu_card_focus(page == 1 && focus == MENU_RECOMP_DELETE_ROW);
+            if (menu_card_tick(g_restart_args, sizeof g_restart_args)) {
+                /* a User ID deleted: the game starts again, reading the card afresh */
+                settings_save();
+                g_restart = true;
+                g_quit = true;
+                printf("window: restarting the game (a User ID was deleted)\n");
+            }
             bool typing = menu_online_typing();
             if (typing != g_online_typing) {
                 g_online_typing = typing;
