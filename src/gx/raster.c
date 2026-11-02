@@ -963,6 +963,9 @@ static void hud_flush(void) {
     for (int k = 0; k < g_nhud; k++) {
         const HudRec* r = &g_hud[k];
         if (!r->textured || r->mx - r->mn < 2.1f || r->yhi - r->ylo < 1.5f || nwipe >= WIPE_KEYS) continue;
+        /* (not a dimming laid over the whole screen, as under a "Feat
+           Complete!" popup: a shard is slanted, leaving part of the screen) */
+        if (r->mn <= -0.98f && r->mx >= 0.98f && r->ylo <= -0.98f && r->yhi >= 0.98f) continue;
         bool seen = false;
         for (int j = 0; j < nwipe; j++) seen |= wipe_u[j] == r->ou0 && wipe_y[j] == r->oy0;
         if (!seen) { wipe_u[nwipe] = r->ou0; wipe_y[nwipe] = r->oy0; nwipe++; }
@@ -1103,6 +1106,15 @@ static void hud_flush(void) {
             }
             continue;
         }
+        /* The play screens' title and button bars, flying in and out
+           through the side: placed from off the picture, their object
+           beyond the side (team 1's, on the left) or far above the bar
+           (both teams': placed from the top corner, team 2's mirrored to
+           the right). They slide through the side rather than being meant
+           to reach the edge, so they are left as drawn. (The team panels'
+           red bars, which do reach it, are placed inside and at their own
+           height.) */
+        if (r->ou0 < -1.0f || r->ou0 > 1.0f || r->oy0 > r->yhi + 0.3f || r->oy0 < ylo - 0.3f) continue;
         edge_tail(v, n, textured, frame, mn, mx);
     }
     g_nhud = 0;
