@@ -737,7 +737,7 @@ static void hudlog_piece(const char* what, u32 n, u32 mtx, bool textured, float 
     if (g_frames != g_hudlog_frame) {
         g_hudlog_frame = g_frames;
         if (--g_hudlog_frames <= 0) { fclose(g_hudlog); g_hudlog = NULL; return; }
-        fprintf(g_hudlog, "-- next frame\n");
+        fprintf(g_hudlog, "-- next frame %u\n", g_frames);
     }
     fprintf(g_hudlog, "%-7s n %2u mtx %2u %s a %.2f  x %6.3f..%6.3f y %6.3f..%6.3f  origin %6.3f,%6.3f used %6.3f,%6.3f  side %s  cards %d/%d bars %d/%d banner %d/%d\n",
             what, n, mtx, textured ? "tex " : "flat", alpha, mn, mx, ylo, yhi, ou0, oy0, ou, oy,
@@ -860,6 +860,7 @@ typedef struct {
     float ou, oy, mn, mx, ylo, yhi, avg_a, ou0, oy0, frame;
     bool textured, ticker;
     u8 counted;                        /* HUD_CNT_*: what it counted towards as it was recorded */
+    bool scene;                        /* part of the scene, not the overlay (below) */
 } HudRec;
 #define HUD_CNT_CARD 1
 #define HUD_CNT_BAR 2
@@ -923,6 +924,20 @@ static void hud_record(SVtx* v, u32 n, bool textured, float alpha, float mn, flo
     r->ou0 = v[0].org[0] / frame; r->oy0 = v[0].org[1]; r->frame = frame; r->textured = textured;
     r->ticker = g_tick_seq == g_tick_seq_now;
     r->counted = counted;
+    /* The coloured lines on the field (the line of scrimmage, the first
+       down line) are drawn over the ground with no depth test, so they come
+       through here, lying in the scene, going away from the camera (their
+       corners at different depths). They are drawn across the
+       wider picture already; moved, stretched or pulled to the side as
+       overlay pieces, they swung about whenever the camera looked along the
+       field at an angle (the Gamebreaker scenes). The overlay faces the
+       camera, every corner at one depth. */
+    float w0 = 1e30f, w1 = 0.0f;
+    for (u32 i = 0; i < n; i++) {
+        w0 = fminf(w0, v[i].clip[3]);
+        w1 = fmaxf(w1, v[i].clip[3]);
+    }
+    r->scene = w1 > w0 * 1.05f;
 }
 
 /* The pieces sharing piece k's origin (the letters of one word): is that
@@ -962,7 +977,7 @@ static void hud_flush(void) {
     int nwipe = 0, wipe_lo = -1, wipe_hi = -1;
     for (int k = 0; k < g_nhud; k++) {
         const HudRec* r = &g_hud[k];
-        if (!r->textured || r->mx - r->mn < 2.1f || r->yhi - r->ylo < 1.5f || nwipe >= WIPE_KEYS) continue;
+        if (r->scene || !r->textured || r->mx - r->mn < 2.1f || r->yhi - r->ylo < 1.5f || nwipe >= WIPE_KEYS) continue;
         /* (not a dimming laid over the whole screen, as under a "Feat
            Complete!" popup: a shard is slanted, leaving part of the screen) */
         if (r->mn <= -0.98f && r->mx >= 0.98f && r->ylo <= -0.98f && r->yhi >= 0.98f) continue;
@@ -1003,6 +1018,10 @@ static void hud_flush(void) {
         u32 n = r->n;
         float ou = r->ou, oy = r->oy, mn = r->mn, mx = r->mx, ylo = r->ylo, frame = r->frame;
         bool textured = r->textured;
+        if (r->scene) {
+            hudlog_piece("scene", n, (u32)v[0].mtx, textured, r->avg_a, mn, mx, ylo, r->yhi, r->ou0, r->oy0, ou, oy, 1e9f);
+            continue;
+        }
         if (k >= wipe_lo && k <= wipe_hi && wipe_lo >= 0) {
             bool shard = r->counted == 0x80;
             /* (what is on a shard goes by where its object lies now, the
@@ -2452,7 +2471,7 @@ static u32 g_dlog_cullall;            /* draws dropped as "cull all" this logged
 void gx_raster_draw_log(double at_seconds, int frames) {
     g_dlog_at = at_seconds;
     g_dlog_frames = frames;
-    g_hudlog_frames = 4;
+    g_hudlog_frames = 120;             /* two seconds: long enough to catch a brief jump */
 }
 
 static const char* const k_csel[16] = {"PREV.rgb", "PREV.a", "REG0.rgb", "REG0.a", "REG1.rgb", "REG1.a",
