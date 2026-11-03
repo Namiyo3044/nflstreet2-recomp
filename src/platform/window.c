@@ -1,3 +1,4 @@
+#include "version.h"
 #include "runtime/netplay.h"
 #include "runtime/prof.h"
 #include "platform/window.h"
@@ -252,7 +253,7 @@ static char g_title_cam[48] = "";
 
 static void set_title(void) {
     char title[192];
-    snprintf(title, sizeof(title), "NFL Street 2%s%s  -  %s%s", g_title_stats[0] ? "  -  " : "", g_title_stats,
+    snprintf(title, sizeof(title), "NFL Street 2 Recomp v" NFLS2_VERSION "%s%s  -  %s%s", g_title_stats[0] ? "  -  " : "", g_title_stats,
              g_title_shape, g_title_cam);
     SDL_SetWindowTitle(g_window, title);
 }
@@ -424,7 +425,7 @@ bool window_open(int height) {
     float start_aspect = g_aspect_mode == 4 ? 32.0f / 9.0f : g_aspect_mode == 3 ? 21.0f / 9.0f : start_wide ? 16.0f / 9.0f : 4.0f / 3.0f;
     int win_h = height, win_w = (int)((float)height * start_aspect + 0.5f);
     if (g_gpu_scale > 0) {
-        g_window = SDL_CreateWindow("NFL Street 2", win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
+        g_window = SDL_CreateWindow("NFL Street 2 Recomp v" NFLS2_VERSION, win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
         if (g_window && gpu_setup()) {
             menu_set_gpu_name(gx_raster_gpu_name());
             g_gpu = true;
@@ -436,7 +437,7 @@ bool window_open(int height) {
         }
     }
     if (!g_window)
-        g_window = SDL_CreateWindow("NFL Street 2", win_w, win_h, SDL_WINDOW_RESIZABLE);
+        g_window = SDL_CreateWindow("NFL Street 2 Recomp v" NFLS2_VERSION, win_w, win_h, SDL_WINDOW_RESIZABLE);
     if (start_wide)
         g_aspect = 16.0f / 9.0f;
     if (!g_window) {

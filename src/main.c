@@ -4,6 +4,7 @@
  * entry point and run the recompiled code until it stops, reporting where and
  * why. Nothing is drawn yet; this proves the CPU side works end to end.
  */
+#include "version.h"
 #include "generated.h"
 #include "runtime/disc.h"
 #include "runtime/dol.h"
@@ -1462,6 +1463,7 @@ int main(int argc, char** argv) {
     direct_hook(g_dvd_close);
     g_direct_default = !(g_no_direct || g_debug || g_watch_n || g_lod_log || g_cardtrace || g_trace_at > 0);
     g_nfls2_direct_on = g_direct_default;
+    printf("NFL Street 2 Recomp v" NFLS2_VERSION "\n");
     printf("direct calls between chunks: %s\n", g_direct_default ? "on" : "off (a debug option is on)");
     if (textures_dir) {
         if (gpu_scale) {

@@ -17,12 +17,14 @@ lives outside this repo and is ignored by `.gitignore`.
 - **Build Tools for Visual Studio 2022** (free, from
   [visualstudio.microsoft.com/downloads](https://visualstudio.microsoft.com/downloads/)), with the
   *Desktop development with C++* workload and, in its options, **C++ Clang tools for Windows**.
-  (A full Visual Studio 2022 with the same pieces works too.)
+  (A full Visual Studio 2022 with the same pieces works too, as does a separate
+  [LLVM](https://releases.llvm.org/) install on the PATH in place of the Clang option.)
 - About 4 GB of disk space and an internet connection for the first setup.
 
 ## Setup (once)
 
-In PowerShell, in this folder:
+Double-click **`setup.bat`** and, when it asks, drag your disc image onto its window. Or, in
+PowerShell in this folder:
 
 ```powershell
 .\setup.ps1 -Disc "D:\Games\NFL Street 2.iso"
@@ -33,10 +35,9 @@ It unpacks the disc into `C:\nfls2\disc`, checks it's the right version, downloa
 `main.dol` into `C:\nfls2\recomp`, and builds the port. The first build takes several minutes.
 Running it again only does what's missing. `-Root D:\nfls2` puts all of it somewhere else.
 
-If PowerShell refuses to run scripts, run this once first:
-`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
-
 ## Play
+
+Double-click **`play.bat`**, or in PowerShell:
 
 ```powershell
 .\play.ps1

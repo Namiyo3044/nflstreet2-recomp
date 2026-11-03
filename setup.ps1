@@ -2,7 +2,8 @@
 #
 #   .\setup.ps1 -Disc D:\Games\NFL Street 2.iso     (a .iso / .gcm image of the disc)
 #   .\setup.ps1 -Disc D:\nfls2-extracted             (or a folder from Dolphin's "Extract Entire Disc")
-#   .\setup.ps1                                      (the disc already unpacked in C:\nfls2\disc)
+#   .\setup.ps1                                      (the disc already unpacked in C:\nfls2\disc; otherwise it asks)
+#   setup.bat                                        (the same, by double-clicking it)
 #
 # What it does, each step only if it isn't done yet:
 #   1. loads Visual Studio's C++ build tools (they need installing once; see README)
@@ -49,6 +50,11 @@ Write-Host "cmake, ninja, cl and clang-cl found."
 # 2. The disc ---------------------------------------------------------------
 Step "Game disc"
 $extract = Join-Path $toolsDir "nfls2_discextract.exe"
+if ($Disc -eq "" -and -not (Test-Path (Join-Path $discDir "sys\main.dol"))) {
+    Write-Host "Where is your NFL Street 2 disc? Drag the .iso (or the extracted disc folder) onto this window, then press Enter."
+    $Disc = (Read-Host "Disc").Trim().Trim('"')
+    if ($Disc -eq "") { Fail "No disc given." }
+}
 if ($Disc -ne "" -and (Test-Path $Disc -PathType Leaf)) {
     if ($Disc -notmatch '\.(iso|gcm)$') { Fail "$Disc isn't a .iso / .gcm image (convert .rvz / .ciso to .iso in Dolphin: right-click the game, Convert File)." }
     if (-not (Test-Path $extract) -or (Get-Item $extract).LastWriteTime -lt (Get-Item "tools\discextract.c").LastWriteTime) {
