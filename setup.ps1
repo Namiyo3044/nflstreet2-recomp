@@ -80,11 +80,15 @@ Write-Host "main.dol is NFL Street 2 (GN7E69 rev 0)."
 # The program's icon, from the disc's own banner (the picture Dolphin's game list shows).
 $icon = Join-Path $Root "icon.ico"
 $bnr = Join-Path $discDir "files\opening.bnr"
-if (-not (Test-Path $icon) -and (Test-Path $bnr)) {
+if (Test-Path $icon) {
+    Write-Host "Icon: $icon (already made)."
+} elseif (-not (Test-Path $bnr)) {
+    Write-Host "Icon: the disc has no files\opening.bnr to make it from; carrying on without one."
+} else {
     $makeicon = Join-Path $toolsDir "nfls2_makeicon.exe"
     & clang-cl /nologo /O2 /D_CRT_SECURE_NO_WARNINGS "tools\makeicon.c" "/Fe:$makeicon" "/Fo:$toolsDir\makeicon.obj" | Out-Host
     if ($LASTEXITCODE -eq 0) { & $makeicon $bnr $icon | Out-Host }
-    if (-not (Test-Path $icon)) { Write-Host "(couldn't make the icon from the disc's banner; carrying on without it)" }
+    if (-not (Test-Path $icon)) { Write-Host "Icon: couldn't make it from the disc's banner; carrying on without one." }
 }
 
 # 3. DolRecomp --------------------------------------------------------------
