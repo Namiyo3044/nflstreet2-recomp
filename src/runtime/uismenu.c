@@ -1513,13 +1513,13 @@ bool uismenu_video_screen(CPUState* cpu) {
 
 /* ------------------------------------- Save/Load: Delete User ID row --- */
 /* The Save/Load screen (Auto Save, a choice row, then five buttons) gets a
-   second choice row under its buttons: Delete User ID. It is the Auto Save
+   second choice row under Auto Save: Delete User ID. It is the Auto Save
    row (object 1 and its parts 2-6) copied the way the video screens copy
    the Audio Settings row (video_rows), into the port's memory: the parts'
    instances, their object records' lists and descriptors, drawing records
    and focus link blocks, with pointers and offsets into those moved to the
-   copy. Up / down: the last button (Remove NFL Gauntlet Team) leads to it
-   and it to Auto Save (the screen's list wraps round). Its start-up runs at
+   copy, placed right under Auto Save (what came after moves down a step).
+   Up / down go Auto Save, it, then the screen's next row. Its start-up runs at
    the end of the screen's own (as for the video rows); left / right change
    its value as the row does Auto Save's, but the screen only reads Auto
    Save's own row (and has nothing for an A on this one), so the port gives
@@ -1661,13 +1661,25 @@ static bool sl_build(u32 h) {
         wr(dst + 16, vr_reloc(rd(src + 16), h, false));
     }
     u32 crow = vr_reloc(row, h, false);
-    /* Under the last button, a button's step lower (the buttons' own spacing). */
-    union { u32 u; float f; } y, yl, yp;
-    yl.u = rd(last + 0x0C); yp.u = rd(prev_btn + 0x0C);
-    float step = yl.f - yp.f;
-    if (step < 20.0f || step > 60.0f) step = 32.0f;
-    y.f = yl.f + step;
-    wr(crow + 0x0C, y.u);
+    /* Right under Auto Save, where the next row was; that row and everything
+       after it in the up / down order move down a step (the spacing from
+       Auto Save to that row). */
+    u32 dn = h + rd(row + 0x6C);
+    if (!in_ram(dn, 12) || rd(dn) != 1 || rd(dn + 4) != row - h) return false;
+    u32 next = h + rd(dn + 8);
+    u32 nup = h + rd(next + 0x68);
+    if (!in_ram(next, 0x100) || !in_ram(nup, 12) || rd(nup) != 1 || rd(nup + 4) != next - h || rd(nup + 8) != row - h)
+        return false;
+    union { u32 u; float f; } yr, yn, yy;
+    yr.u = rd(row + 0x0C); yn.u = rd(next + 0x0C);
+    float step = yn.f - yr.f;
+    if (step < 20.0f || step > 80.0f) {
+        union { u32 u; float f; } yl, yp;
+        yl.u = rd(last + 0x0C); yp.u = rd(prev_btn + 0x0C);
+        step = yl.f - yp.f;
+        if (step < 20.0f || step > 60.0f) step = 32.0f;
+    }
+    wr(crow + 0x0C, yn.u);
     /* Its own text buffers. */
     u32 vrec = h + rd(crow + 0x368), lrec = h + rd(crow + 0x370);
     if (!in_ram(vrec, 0x40) || !in_ram(lrec, 0x40)) return false;
@@ -1683,21 +1695,18 @@ static bool sl_build(u32 h) {
     wr(lrec + 0x20, lvar);
     wr(lrec + 0x24, ln);
     wr(crow + 0x94, labvar);            /* (the row's start-up writes its label from this) */
-    /* Up / down: the last button down to it, it down to Auto Save (the list
-       wraps round, as the last button did), Auto Save up to it. */
+    /* Up / down: Auto Save down to it, it down to the row that came next
+       (and that row up to it), it up to Auto Save. */
     {
         u32 self = crow - h;
         u32 nb = sl_alloc(12), pb = sl_alloc(12);
         if (!nb || !pb) return false;
-        wr(nb, 1); wr(nb + 4, self); wr(nb + 8, row - h);
-        wr(pb, 1); wr(pb + 4, self); wr(pb + 8, last - h);
+        wr(nb, 1); wr(nb + 4, self); wr(nb + 8, next - h);
+        wr(pb, 1); wr(pb + 4, self); wr(pb + 8, row - h);
         wr(crow + 0x6C, nb - h);
         wr(crow + 0x68, pb - h);
-        u32 ln6 = h + rd(last + 0x6C), rp = h + rd(row + 0x68);
-        if (!in_ram(ln6, 12) || rd(ln6) != 1 || rd(ln6 + 4) != last - h) return false;
-        if (!in_ram(rp, 12) || rd(rp) != 1 || rd(rp + 4) != row - h) return false;
-        wr(ln6 + 8, self);
-        wr(rp + 8, self);
+        wr(dn + 8, self);
+        wr(nup + 8, self);
     }
     wr(h, nnew);
     wr(h + 4, SL_OBJTAB);
@@ -1716,11 +1725,23 @@ static bool sl_build(u32 h) {
         for (u32 i = 0; i < n1 && i < 8; i++) {
             u32 desc = rd(p1 + i * 4), n = rd(desc + 4), list = rd(desc + 8);
             if (n == 0 || n > 16 || rd(list + (n - 1) * 8) != 0xFFFFFFFFu || rd(list + (n - 1) * 8 + 4) != 0x1Bu) continue;
-            u32 lo = SL_LIST;
-            for (u32 k = 0; k < n; k++) { wr(lo + k * 8, rd(list + k * 8)); wr(lo + k * 8 + 4, rd(list + k * 8 + 4)); }
-            wr(lo + n * 8, 0xFFFFFFFFu); wr(lo + n * 8 + 4, base);
+            /* (the copy goes in after Auto Save; the rows and buttons after
+               it move down a step) */
+            u32 lo = SL_LIST, out = lo;
+            bool after = false;
+            for (u32 k = 0; k < n; k++) {
+                u32 kind = rd(list + k * 8), idx = rd(list + k * 8 + 4);
+                if (after && kind == 0xFFFFFFFFu && idx < nobj) {
+                    u32 inst = rd(tab + idx * 20);
+                    yy.u = rd(inst + 0x0C); yy.f += step; wr(inst + 0x0C, yy.u);
+                }
+                wr(out, kind); wr(out + 4, idx); out += 8;
+                if (kind == 0xFFFFFFFFu && idx == VR_FIRST) { wr(out, 0xFFFFFFFFu); wr(out + 4, base); out += 8; after = true; }
+            }
+            if (!after) return false;
             wr(desc + 4, n + 1);
             wr(desc + 8, lo);
+            break;
         }
     }
     /* The copy's start-up (the game ran the row's as the screen loaded):
