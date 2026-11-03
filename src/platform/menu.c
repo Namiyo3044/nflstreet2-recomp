@@ -770,7 +770,7 @@ const char* menu_recomp_row_name(int row, int v) {
 const char* menu_recomp_row_help(int row) {
     switch (row) {
     case RR_RAIN: return "PS2/Xbox: more rain, with streaks and splashes.";
-    case RR_FILTERS: return "Colour tint in matches. Off is unstable: it may flash.";
+    case RR_FILTERS: return "Color tint in matches. Off is unstable: it may flash.";
     case RR_TEXTURES: return "Use the replacement textures folder.";
     case RR_INTROS: return "Hides and skips the intro videos. Applies next start.";
     case RR_DISCORD: return "Shows what you're playing on your Discord profile.";
