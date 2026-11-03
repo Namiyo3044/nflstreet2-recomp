@@ -44,6 +44,11 @@ bool pad_add_press(const char* spec);
    buttons, main stick, C-stick, analog triggers. */
 void pad_poll_response(int port, double game_seconds, uint8_t out[8]);
 
+/* Rumble: the game switching a controller's motor on or off (the command it
+   sends with each poll); the window passes it on to the real controller. */
+void pad_set_rumble(int port, bool on);
+bool pad_rumble(int port);
+
 /* While on, port 1 taps START a few times a second (skips the intro movies). */
 void pad_set_skip_taps(bool on);
 

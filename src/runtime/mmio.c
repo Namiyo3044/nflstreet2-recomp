@@ -340,12 +340,15 @@ void mmio_pe_finish(void) {
         return;
     }
     g_pe_ctrl |= PE_FINISH_INT;
+    interrupts_dirty();
 }
 
 void mmio_pe_token(u16 token, bool interrupt) {
     set16(PE_TOKEN, token);
-    if (interrupt)
+    if (interrupt) {
         g_pe_ctrl |= PE_TOKEN_INT;
+        interrupts_dirty();
+    }
 }
 
 /* ----------------------------------------------------------------- DI --- */
@@ -651,6 +654,11 @@ static bool si_write(u32 off, u32 value, u8 size) {
         g_si_sr &= ~(value & 0x0F0F0F0Fu);           /* write 1 to clear error bits */
         return true;
     }
+    /* A port's poll command (0x40 0x03 0xMM): its last bits drive the
+       controller's rumble motor (1 on; 0 or 2 off, 2 braking it). Kept as
+       written too (falls through). */
+    if (off < SI + 0x30 && (off - SI) % 0x0Cu == 0 && (value >> 16) == 0x0040u)
+        pad_set_rumble((int)((off - SI) / 0x0Cu), (value & 3u) == 1u);
     return false;
 }
 
@@ -837,10 +845,20 @@ void mmio_wpar_written(void) {
 }
 
 static void pipe_write(CPUState* cpu, u32 value, u8 size) {
-    for (int i = size - 1; i >= 0; i--) {
-        g_burst[g_burst_len++] = (u8)(value >> (i * 8));
+    if (g_burst_len + size <= 32u) {
+        /* (the usual case: the value fits in the burst, big-endian) */
+        u32 be = value << (8u * (4u - size));
+        u8 b[4] = {(u8)(be >> 24), (u8)(be >> 16), (u8)(be >> 8), (u8)be};
+        memcpy(g_burst + g_burst_len, b, size);
+        g_burst_len += size;
         if (g_burst_len == 32)
             pipe_flush_burst(cpu);
+    } else {
+        for (int i = size - 1; i >= 0; i--) {
+            g_burst[g_burst_len++] = (u8)(value >> (i * 8));
+            if (g_burst_len == 32)
+                pipe_flush_burst(cpu);
+        }
     }
     if (gp_linked()) {
         gx_fifo_write(cpu, value, size);
@@ -860,6 +878,7 @@ void mmio_pipe_write(CPUState* cpu, u32 value, u8 size) {
     int prev = prof_enter(PROF_GX_FIFO);
     pipe_write(cpu, value, size);
     prof_leave(prev);
+    /* (a command raising the finish / token interrupt marks it there) */
 }
 
 static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
@@ -897,6 +916,7 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         return 0;
     }
     u32 off = ea - MMIO_BASE;
+    interrupts_dirty();                /* (reading status registers acknowledges things) */
     Device* d = device_for(ea);
     if (d)
         d->reads++;
@@ -952,6 +972,7 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
         return;
     }
     u32 off = ea - MMIO_BASE;
+    interrupts_dirty();                /* (a write can start a transfer or raise / clear an interrupt) */
     Device* d = device_for(ea);
     if (d)
         d->writes++;

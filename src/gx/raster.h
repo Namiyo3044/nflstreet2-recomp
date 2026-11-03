@@ -40,6 +40,7 @@ bool gx_raster_xfb_rgb(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, u32* o
 
 /* Writes every draw of `frames` frames, starting at that much game time,
    with the GPU setup each uses, to drawlog.txt. */
+void gx_raster_hud_log(void);   /* hudlog.txt only: two seconds of the match HUD (any renderer) */
 void gx_raster_draw_log(double at_seconds, int frames);
 
 /* Draw every frame (needed when frames are shown live). */

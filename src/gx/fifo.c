@@ -319,8 +319,12 @@ void gx_fifo_write(CPUState* cpu, u32 value, u8 size) {
             exit(1);
         }
     }
-    for (u8 i = 0; i < size; i++)
-        g_buf[g_len++] = (u8)(value >> (8 * (size - 1 - i)));
+    {
+        u32 be = value << (8u * (4u - size));
+        u8 b[4] = {(u8)(be >> 24), (u8)(be >> 16), (u8)(be >> 8), (u8)be};
+        memcpy(g_buf + g_len, b, size);
+        g_len += size;
+    }
     g_stats.bytes += size;
     if (g_len < g_need)
         return;                        /* the command at the front is still incomplete */

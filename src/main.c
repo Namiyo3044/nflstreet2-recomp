@@ -804,6 +804,60 @@ static void watch_check(CPUState* ctx, u32 address) {
     }
 }
 
+/* Why the game code came back to the loop (report at the end): its cycle
+   budget used up, or a call / return / jump the code couldn't follow itself
+   (where to, sampled). */
+#ifndef DOLRECOMP_C_LOOP_CYCLE_BUDGET
+#define DOLRECOMP_C_LOOP_CYCLE_BUDGET 256
+#endif
+static unsigned long long g_steps_budget, g_steps_other;
+unsigned long long g_nfls2_direct_calls;
+#define STEP_HASH 4096
+static struct { u32 pc; unsigned long long n; } g_step_hash[STEP_HASH];
+static void step_stats(CPUState* cpu, s64 consumed) {
+    if (consumed >= (s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET) { g_steps_budget++; return; }
+    if ((++g_steps_other & 15u) != 0) return;
+    u32 pc = cpu->pc, h = (pc * 2654435761u) >> 20;
+    for (u32 k = 0; k < 64; k++, h = (h + 1u) & (STEP_HASH - 1u)) {
+        if (g_step_hash[h].pc == pc) { g_step_hash[h].n++; return; }
+        if (!g_step_hash[h].pc) { g_step_hash[h].pc = pc; g_step_hash[h].n = 1; return; }
+    }
+}
+static void step_report(void) {
+    unsigned long long total = g_steps_budget + g_steps_other;
+    if (!total) return;
+    printf("steps: %llu, %.0f%% ended by the cycle budget (%d), the rest by calls / returns / jumps the code "
+           "left to the loop; %llu direct calls between chunks\n",
+           total, 100.0 * (double)g_steps_budget / (double)total, (int)DOLRECOMP_C_LOOP_CYCLE_BUDGET, g_nfls2_direct_calls);
+    printf("steps: where those went next (sampled, top 25):\n");
+    for (int t = 0; t < 25; t++) {
+        int best = -1;
+        for (int i = 0; i < STEP_HASH; i++)
+            if (g_step_hash[i].pc && g_step_hash[i].n && (best < 0 || g_step_hash[i].n > g_step_hash[best].n)) best = i;
+        if (best < 0) break;
+        u32 pc = g_step_hash[best].pc, off = 0;
+        const char* name = g_have_symbols ? symbols_lookup(pc, &off) : "?";
+        bool start = g_have_symbols && symbols_function_start(pc) == pc;
+        printf("   %5.1f%%  0x%08X  %s+0x%X%s\n", 100.0 * (double)g_step_hash[best].n * 16.0 / (double)g_steps_other, pc,
+               name ? name : "?", off, start ? "  (a function's start: a call)" : "");
+        g_step_hash[best].n = 0;
+    }
+}
+
+/* Direct calls between the game code's chunks (tools/directcalls.c): the
+   calls the dispatcher hooks below stay with the dispatcher (their bit set),
+   and while a debug trace is on, all of them. */
+unsigned char g_nfls2_direct_off[0x02000000u >> 5];
+int g_nfls2_direct_on = 1;
+unsigned g_nfls2_direct_depth;
+static int g_direct_default = 1;
+static bool g_no_direct;               /* --no-direct-calls */
+static void direct_hook(u32 address) {
+    if (!address) return;
+    u32 w = (address & 0x01FFFFFFu) >> 2;
+    g_nfls2_direct_off[w >> 3] |= (unsigned char)(1u << (w & 7u));
+}
+
 int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
     if (g_watch_n) watch_check(ctx, address);
     if (address == UIS_NATIVE_DISPATCH && uis_native_hook(ctx)) return 1;
@@ -813,7 +867,7 @@ int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
     if (g_cardtrace) card_trace(ctx, address);
     if (g_text_watch_until > 0) {
         if (interrupts_game_seconds() < g_text_watch_until) text_watch(ctx, address);
-        else { g_text_watch_until = 0; printf("textcall: watch ended\n"); }
+        else { g_text_watch_until = 0; g_nfls2_direct_on = g_direct_default; printf("textcall: watch ended\n"); }
     }
     if (g_debug) {
         u32 slot = (address - GC_RAM_BASE) >> 2;
@@ -1321,6 +1375,8 @@ int main(int argc, char** argv) {
             if (gpu_scale < 1) gpu_scale = 1;
         } else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
             window_height = 480 * atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--no-direct-calls") == 0) {
+            g_no_direct = true;
         } else if (strcmp(argv[i], "--debug") == 0) {
             g_debug = true;
         } else if (strcmp(argv[i], "--quiet") == 0) {
@@ -1392,12 +1448,21 @@ int main(int argc, char** argv) {
         g_calls = (u32*)calloc(GC_MAIN_RAM_SIZE >> 2, sizeof(u32));
     }
     disc_set_clock(interrupts_game_seconds);
-    if (g_have_symbols) {
-        g_dvd_open = symbols_address("DVDOpen");
-        g_dvd_path = symbols_address("DVDConvertPathToEntrynum");
-        g_dvd_read = symbols_address("DVDReadAsyncPrio");
-        g_dvd_close = symbols_address("DVDClose");
-    }
+    /* The few SDK functions the port watches, in the verified main.dol (so
+       they don't depend on a symbol map's names). */
+    g_dvd_open = 0x8023F094u;          /* DVDOpen */
+    g_dvd_path = 0x8023EDA0u;          /* DVDConvertPathToEntrynum */
+    g_dvd_read = 0x8023F3A4u;          /* DVDReadAsyncPrio */
+    g_dvd_close = 0x8023F15Cu;         /* DVDClose */
+    direct_hook(UIS_NATIVE_DISPATCH);
+    direct_hook(LOD_AREA_FN);
+    direct_hook(g_dvd_open);
+    direct_hook(g_dvd_path);
+    direct_hook(g_dvd_read);
+    direct_hook(g_dvd_close);
+    g_direct_default = !(g_no_direct || g_debug || g_watch_n || g_lod_log || g_cardtrace || g_trace_at > 0);
+    g_nfls2_direct_on = g_direct_default;
+    printf("direct calls between chunks: %s\n", g_direct_default ? "on" : "off (a debug option is on)");
     if (textures_dir) {
         if (gpu_scale) {
             hires_init(textures_dir);
@@ -1511,8 +1576,7 @@ int main(int argc, char** argv) {
     const char* reason = "step limit reached";
     unsigned long long steps = 0;
     unsigned long long quit_steps = 0;   /* step at which the window was closed */
-    u32 idle_lo = g_have_symbols ? symbols_address("SelectThread") : 0;
-    u32 idle_hi = idle_lo ? symbols_function_end(idle_lo) : 0;
+    u32 idle_lo = 0x8023D924u, idle_hi = 0x8023D924u + 0x228u;   /* SelectThread (the OS's idle loop is in it) */
     while (steps < max_steps) {
         u32 pc = cpu.pc;
         if (g_trace_at > 0 && !g_tracing && g_trace_lines == 0 && interrupts_game_seconds() >= g_trace_at) {
@@ -1542,6 +1606,7 @@ int main(int argc, char** argv) {
             }
         }
         s64 consumed = -cpu.downcount;
+        step_stats(&cpu, consumed);
         cpu.timebase += (u64)(consumed > 0 ? consumed : 1) / 12u + 1u;
         steps++;
 
@@ -1581,6 +1646,7 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < sizeof k_phrases / sizeof *k_phrases; i++)
                 textscan_run(&cpu, k_phrases[i]);
             g_text_watch_until = interrupts_game_seconds() + 3.0;
+            g_nfls2_direct_on = 0;     /* (every call through the dispatcher while watching) */
             printf("textcall: watching game calls for 3 seconds\n");
             fflush(stdout);
         }
@@ -1656,6 +1722,7 @@ int main(int argc, char** argv) {
     printf("\n");
     hle_exceptions_report();
     interrupts_report();
+    step_report();
     netsync_report();
     netplay_report();
     netplay_close();

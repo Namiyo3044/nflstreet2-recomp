@@ -29,6 +29,39 @@ file(GLOB NFLS2_CHUNKS CONFIGURE_DEPENDS "${NFLS2_GENERATED_DIR}/chunks/*.c")
 list(LENGTH NFLS2_CHUNKS NFLS2_CHUNK_COUNT)
 message(STATUS "Recompiled chunks: ${NFLS2_CHUNK_COUNT}")
 
+# Direct calls between chunks: a build-time tool (tools/directcalls.c)
+# rewrites copies of the generated chunks so a call into another chunk calls
+# it directly instead of going out through the dispatcher (the generated
+# code itself is left as it is).
+option(NFLS2_DIRECT_CALLS "Call between the game code's chunks directly (faster)" ON)
+if(NFLS2_DIRECT_CALLS)
+    add_executable(nfls2_directcalls tools/directcalls.c)
+    if(MSVC)
+        target_compile_definitions(nfls2_directcalls PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+    set(NFLS2_DIRECT_DIR "${CMAKE_BINARY_DIR}/direct_chunks")
+    file(MAKE_DIRECTORY "${NFLS2_DIRECT_DIR}")
+    set(NFLS2_DIRECT_CHUNKS "")
+    foreach(c ${NFLS2_CHUNKS})
+        get_filename_component(n "${c}" NAME)
+        list(APPEND NFLS2_DIRECT_CHUNKS "${NFLS2_DIRECT_DIR}/${n}")
+    endforeach()
+    add_custom_command(
+        OUTPUT ${NFLS2_DIRECT_CHUNKS}
+        COMMAND nfls2_directcalls "${NFLS2_DIRECT_DIR}" ${NFLS2_CHUNKS}
+        DEPENDS nfls2_directcalls ${NFLS2_CHUNKS} "${CMAKE_CURRENT_SOURCE_DIR}/tools/directcalls.c"
+        COMMENT "Making the calls between chunks direct"
+        VERBATIM)
+    set(NFLS2_CHUNKS ${NFLS2_DIRECT_CHUNKS})
+endif()
+
+# Unpacks a GameCube disc image (.iso / .gcm) into the folder layout the game
+# reads (tools/discextract.c); play.ps1 runs it when given an image.
+add_executable(nfls2_discextract tools/discextract.c)
+if(MSVC)
+    target_compile_definitions(nfls2_discextract PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 # Settings shared by everything that includes generated.h.
 add_library(nfls2_settings INTERFACE)
 target_include_directories(nfls2_settings INTERFACE
@@ -52,6 +85,12 @@ target_link_libraries(nfls2_game PUBLIC gekko_cpu)
 # Inline fast paths for guest memory access (src/runtime/fastmem.h).
 target_include_directories(nfls2_game PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(nfls2_game PRIVATE "DOLRECOMP_CPU_HEADER=\"runtime/fastmem.h\"")
+# How many instructions the game code runs before going back to the port's
+# loop (which advances the timer and polls the hardware): DolRecomp's default
+# is 256; a few microseconds of game time between polls is still far finer
+# than anything the hardware needs.
+set(NFLS2_LOOP_BUDGET "1024" CACHE STRING "Game instructions between hardware polls")
+target_compile_definitions(nfls2_settings INTERFACE "DOLRECOMP_C_LOOP_CYCLE_BUDGET=${NFLS2_LOOP_BUDGET}")
 if(CMAKE_C_COMPILER_ID STREQUAL "Clang" AND CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     # clang-cl: /clang: passes the GCC-style flag through (/O1 would mean "minimise size").
     target_compile_options(nfls2_game PRIVATE /w "/clang:${NFLS2_GAME_OPT}")

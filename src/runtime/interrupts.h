@@ -7,6 +7,10 @@
    one is pending, enters the OS interrupt handler. Call between steps. */
 void interrupts_poll(CPUState* cpu);
 
+/* The game touched the hardware (or the hardware raised something): the next
+   poll works everything out again instead of taking the last answer. */
+void interrupts_dirty(void);
+
 /* Game time so far, in seconds, counted in video fields. */
 double interrupts_game_seconds(void);
 

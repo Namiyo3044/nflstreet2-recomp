@@ -47,6 +47,14 @@ bool pad_connected(int port) {
     return netsync_connected(port, port >= 0 && port < PAD_PORTS && g_connected[port]);
 }
 
+static volatile bool g_rumble[PAD_PORTS];
+
+void pad_set_rumble(int port, bool on) {
+    if (port >= 0 && port < PAD_PORTS) g_rumble[port] = on;
+}
+
+bool pad_rumble(int port) { return port >= 0 && port < PAD_PORTS && g_rumble[port]; }
+
 void pad_get_live(int port, PadLive* out) {
     *out = g_lives[port >= 0 && port < PAD_PORTS ? port : 0];
 }

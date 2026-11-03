@@ -87,7 +87,27 @@ void interrupts_set_field_callback(void (*cb)(CPUState* cpu)) {
     g_field_cb = cb;
 }
 
+/* Polled after every block of game code (every call and return), so it has
+   to be cheap: the hardware's timers and its interrupt lines only change at
+   a timed event (the next field, a DMA or disc transfer finishing) or when
+   the game touches the hardware. Until the next such event, and as long as
+   nothing touched the hardware (interrupts_dirty), the last answer stands:
+   only whether an interrupt is waiting, and whether the game will take it
+   now, is checked. */
+static u64 g_poll_at;                  /* the next timed event (0: work it all out again) */
+static bool g_pending;                 /* an enabled interrupt was raised, as of the last full poll */
+static unsigned long long g_polls_full, g_polls_fast;
+
+void interrupts_dirty(void) { g_poll_at = 0; }
+
 void interrupts_poll(CPUState* cpu) {
+    if (cpu->timebase < g_poll_at) {
+        g_polls_fast++;
+        if (!g_pending || !(cpu->msr & MSR_EE))
+            return;
+        /* (an interrupt waiting for the game to enable them: the full check) */
+    }
+    g_polls_full++;
     /* Video: one display interrupt per field, alternating the two that VIInit
        enables (DI1 at the top of the frame, DI0 at the field boundary). */
     while (cpu->timebase >= g_next_field) {
@@ -109,11 +129,16 @@ void interrupts_poll(CPUState* cpu) {
     mmio_dma_tick(cpu);
     exi_tick(cpu->timebase);
 
+    u32 pending = mmio_pi_cause() & mmio_pi_mask() & ~0x00010000u;
+    g_pending = pending != 0;
+    u64 a = g_next_field, b = mmio_next_event();
+    g_poll_at = a < b ? a : b;
     if (!(cpu->msr & MSR_EE))
         return;
-    u32 pending = mmio_pi_cause() & mmio_pi_mask() & ~0x00010000u;
-    if (pending && mem_read32(cpu, OS_EXCEPTION_TABLE + OS_EXCEPTION_EXTERNAL * 4u))
+    if (pending && mem_read32(cpu, OS_EXCEPTION_TABLE + OS_EXCEPTION_EXTERNAL * 4u)) {
         take_external_interrupt(cpu);
+        g_poll_at = 0;                 /* (the handler changes things: look again next time) */
+    }
 }
 
 u64 interrupts_next_event(void) {
@@ -126,6 +151,7 @@ double interrupts_game_seconds(void) {
 }
 
 void interrupts_report(void) {
+    printf("interrupt polls: %llu full, %llu skipped (nothing due)\n", g_polls_full, g_polls_fast);
     printf("video fields: %llu (%.1f s of game time), external interrupts taken: %llu\n",
            g_fields, (double)g_fields * 1001.0 / 60000.0, g_taken);
 }
