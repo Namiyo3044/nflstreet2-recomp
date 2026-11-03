@@ -8,39 +8,55 @@ built by statically recompiling the game's own `main.dol` with
 Everything derived from the disc (the DOL, extracted files, and the recompiler's output)
 lives outside this repo and is ignored by `.gitignore`.
 
-## Expected layout
+## What you need
 
-```
-C:\nfls2\
-  disc\            your extracted disc (sys\main.dol, files\...)
-  decomp\          https://github.com/mitsevox/nflstreet2 (symbol source)
-  symbols\         main.map from tools\export_symbols.py
-  recomp\dolrecomp\generated\   DolRecomp output for your main.dol
-  tools\dolrecomp\ DolRecomp checkout
-  port\            this repo
-```
+- **Your own NFL Street 2 for GameCube, USA (GN7E69), first release (rev 0)**, as a disc image
+  (`.iso` / `.gcm`) or a folder from Dolphin's *Extract Entire Disc*. Compressed `.rvz` / `.ciso`
+  images: convert them to `.iso` in Dolphin first (right-click the game, *Convert File*).
+- **Windows 10 or 11**, 64-bit.
+- **Build Tools for Visual Studio 2022** (free, from
+  [visualstudio.microsoft.com/downloads](https://visualstudio.microsoft.com/downloads/)), with the
+  *Desktop development with C++* workload and, in its options, **C++ Clang tools for Windows**.
+  (A full Visual Studio 2022 with the same pieces works too.)
+- About 4 GB of disk space and an internet connection for the first setup.
 
-## Build (Windows, clang-cl + Ninja)
+## Setup (once)
 
-From **Developer PowerShell for VS**:
-
-```powershell
-cd C:\nfls2\port
-cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-Paths to DolRecomp and the generated code default to the layout above; override with
-`-DNFLS2_DOLRECOMP_DIR=...` and `-DNFLS2_GENERATED_DIR=...`.
-
-## Run
+In PowerShell, in this folder:
 
 ```powershell
-.\build\nfls2.exe C:\nfls2\disc --map C:\nfls2\symbols\main.map
+.\setup.ps1 -Disc "D:\Games\NFL Street 2.iso"
 ```
 
-Options: `--max-steps N` (default 50,000,000), `--quiet` (don't list functions as they are
-first entered), `--skip-hash` (run a DOL that isn't the verified build).
+It unpacks the disc into `C:\nfls2\disc`, checks it's the right version, downloads and builds
+[DolRecomp](https://github.com/expansionpak/dolrecomp), recompiles the game's code from your own
+`main.dol` into `C:\nfls2\recomp`, and builds the port. The first build takes several minutes.
+Running it again only does what's missing. `-Root D:\nfls2` puts all of it somewhere else.
+
+If PowerShell refuses to run scripts, run this once first:
+`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+## Play
+
+```powershell
+.\play.ps1
+```
+
+Rebuilds if anything changed and opens the game. Esc quits; **F1** (or the controller's
+Back / View button) opens the port's menu: video, controls, sound and the recomp settings.
+A controller works out of the box; the keyboard keys are listed at the top of `play.ps1` and
+can be changed in the menu. Settings are saved in `C:\nfls2\settings.ini`, the memory card in
+`C:\nfls2\saves`.
+
+Optional extras:
+
+- **Custom textures** (Dolphin's format, `.png` / `.dds`): put the pack's files in
+  `C:\nfls2\textures`.
+- **Text changes**: `text-replacements.txt`; **menu colours**: `ui-colors.txt` (both explained
+  inside the files).
+- **Replacement movies**: files in `C:\nfls2\replace` are read instead of the disc's.
+
+`play.ps1` lists all its switches at the top; the log of each run goes to `play.txt`.
 
 ## Credits
 
@@ -49,8 +65,9 @@ affiliated with or endorsed by EA, the NFL or Nintendo.
 
 **The NFL Street 2 decomp** ([mitsevox/nflstreet2](https://github.com/mitsevox/nflstreet2)),
 by the team behind NFL Street Reborn. Their mapping of the game's functions is what the
-recompiler is given to know where each function starts and ends (see `tools\export_symbols.py`
-in the layout above). This repo contains none of the decomp's source code, and the two are
+recompiler is given to know where each function starts and ends: `data\gn7e69-functions.map`
+lists those addresses and sizes (no names), taken from their symbol map. This repo contains none of
+the decomp's source code, and the two are
 separate projects: the decomp is rebuilding the game as readable C, while this port recompiles
 the original program as it is. Thanks for all the work understanding this game.
 

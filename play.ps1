@@ -5,6 +5,7 @@
 #   .\play.ps1 -Scale 3        (window size, N x 640x480)
 #   .\play.ps1 -Res 2          (graphics card's internal resolution, N x 640x528)
 #   .\play.ps1 -Debug          (extra diagnostics: call counts, file/stream logs, profile at exit; a little slower)
+#   .\play.ps1 -NoDirectCalls (every call between the game code's chunks through the dispatcher, as before; for testing)
 #   .\play.ps1 -Software       (the old CPU renderer instead of the graphics card)
 #   .\play.ps1 -Textures D:\pack (custom textures in Dolphin's format, .png or .dds; default C:\nfls2\textures, used if it exists)
 #   .\play.ps1 -NoTextures     (the game's own textures only)
@@ -19,6 +20,8 @@
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
 #   .\play.ps1 -ShowTHX        (keep the THX intro; it is skipped by default)
 #   .\play.ps1 -Aspect 16:9    (screen shape for this run: 4:3 or 16:9)
+#   .\play.ps1 -Disc D:\nfls2.iso  (the game's disc: an extracted folder, default C:\nfls2\disc, or a .iso / .gcm
+#                               image, which is unpacked into -DiscFolder, default C:\nfls2\disc, the first time)
 #   .\play.ps1 -Record         (netplay groundwork: record every controller input to C:\nfls2\netsync\input.rec, with
 #                               a sync log of game memory; the memory card isn't written to)
 #   .\play.ps1 -Replay         (play that recording back, write a second sync log and compare the two)
@@ -44,6 +47,7 @@ param(
     [switch]$Debug,
     [int]$Res = 4,
     [switch]$NoIdleSkip,
+    [switch]$NoDirectCalls,
     [switch]$ShowTHX,
     [string]$MemCard = "C:\nfls2\saves\MemoryCardA.raw",
     [switch]$NoMemCard,
@@ -68,48 +72,14 @@ param(
     [int]$NetDelay = 3,
     [string[]]$Press = @(),
     [string]$Disc = "C:\nfls2\disc",
+    [string]$DiscFolder = "C:\nfls2\disc",
     [string]$Map = "C:\nfls2\symbols\main.map"
 )
 $ErrorActionPreference = "Continue"
 Set-Location $PSScriptRoot
 
-# Build tools: a plain PowerShell window doesn't have CMake on its PATH, and the
-# "Developer PowerShell for VS" shortcut sets up 32-bit (x86) libraries, which
-# can't link the 64-bit game. Unless a 64-bit Visual Studio environment is
-# already loaded, load one from the Visual Studio install that has the C++
-# build tools (vcvars64.bat), and take over its settings.
-if (-not (Get-Command cmake -ErrorAction SilentlyContinue) -or $env:VSCMD_ARG_TGT_ARCH -ne "x64") {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    $vcvars = $null
-    # Prefer the Visual Studio the build folder was set up with.
-    $cache = Join-Path $PSScriptRoot "build\CMakeCache.txt"
-    if (Test-Path $cache) {
-        $line = Select-String -Path $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.*)\\Common7\\' | Select-Object -First 1
-        if (-not $line) { $line = Select-String -Path $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.*)/Common7/' | Select-Object -First 1 }
-        if ($line) {
-            $bat = Join-Path $line.Matches[0].Groups[1].Value "VC\Auxiliary\Build\vcvars64.bat"
-            if (Test-Path $bat) { $vcvars = $bat }
-        }
-    }
-    if (-not $vcvars -and (Test-Path $vswhere)) {
-        $installs = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-        foreach ($vs in $installs) {
-            $bat = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-            if (Test-Path $bat) { $vcvars = $bat }
-        }
-    }
-    if ($vcvars) {
-        Write-Host "Loading the Visual Studio build tools (64-bit) from $vcvars"
-        $vars = cmd /c "set LIB=& set LIBPATH=& set INCLUDE=& call `"$vcvars`" >nul 2>&1 & set"
-        foreach ($line in $vars) {
-            if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
-        }
-    }
-    if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-        Write-Host "CMake not found. Open 'x64 Native Tools Command Prompt for VS 2022' from the Start menu, type powershell, and run this again." -ForegroundColor Red
-        exit 1
-    }
-}
+# Build tools: a 64-bit Visual Studio environment (tools\vsenv.ps1).
+. (Join-Path $PSScriptRoot "tools\vsenv.ps1")
 
 $second = [bool](Get-Process nfls2 -ErrorAction SilentlyContinue)
 if ($second) {
@@ -120,12 +90,27 @@ if ($second) {
     if ($LASTEXITCODE -ne 0) { Write-Host "Build failed." -ForegroundColor Red; exit 1 }
 }
 
+# A disc image: unpacked into a folder (only what isn't there yet).
+if ((Test-Path $Disc -PathType Leaf) -and ($Disc -match '\.(iso|gcm)$')) {
+    Write-Host "Unpacking the disc image into $DiscFolder (only the first time takes a while)..."
+    & .\build\nfls2_discextract.exe $Disc $DiscFolder GN7E69
+    if ($LASTEXITCODE -ne 0) { Write-Host "Couldn't unpack $Disc." -ForegroundColor Red; exit 1 }
+    $Disc = $DiscFolder
+}
+if (-not (Test-Path (Join-Path $Disc "sys\main.dol"))) {
+    Write-Host "No game disc at $Disc. Give the disc image or extracted folder with -Disc (e.g. -Disc D:\nfls2.iso)." -ForegroundColor Red
+    exit 1
+}
+# Function names for the logs: your own map if you made one, otherwise the port's list of addresses.
+if (-not (Test-Path $Map)) { $Map = Join-Path $PSScriptRoot "data\gn7e69-functions.map" }
+
 New-Item -ItemType Directory -Force -Path (Split-Path $Settings) | Out-Null
 $gameArgs = @($Disc, "--map", $Map, "--quiet", "--window", "--dump-every", "0", "--settings", $Settings)
 if ($PSBoundParameters.ContainsKey("Scale")) { $gameArgs += @("--scale", $Scale) }
 if ($PSBoundParameters.ContainsKey("Aspect")) { $gameArgs += @("--aspect", $Aspect) }
 foreach ($p in $Press) { $gameArgs += @("--press", $p) }
 if ($NoIdleSkip) { $gameArgs += "--no-idle-skip" }
+if ($NoDirectCalls) { $gameArgs += "--no-direct-calls" }
 if (-not $ShowTHX) { $gameArgs += "--skip-thx" }
 if ($NoText) { $gameArgs += @("--no-text") }
 if ($NoUiColors) { $gameArgs += @("--no-ui-colors") }

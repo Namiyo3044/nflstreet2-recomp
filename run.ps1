@@ -21,43 +21,8 @@ param(
 $ErrorActionPreference = "Continue"   # the runner's warnings on stderr aren't errors
 Set-Location $PSScriptRoot
 
-# Build tools: a plain PowerShell window doesn't have CMake on its PATH, and the
-# "Developer PowerShell for VS" shortcut sets up 32-bit (x86) libraries, which
-# can't link the 64-bit game. Unless a 64-bit Visual Studio environment is
-# already loaded, load one from the Visual Studio install that has the C++
-# build tools (vcvars64.bat), and take over its settings.
-if (-not (Get-Command cmake -ErrorAction SilentlyContinue) -or $env:VSCMD_ARG_TGT_ARCH -ne "x64") {
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
-    $vcvars = $null
-    # Prefer the Visual Studio the build folder was set up with.
-    $cache = Join-Path $PSScriptRoot "build\CMakeCache.txt"
-    if (Test-Path $cache) {
-        $line = Select-String -Path $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.*)\\Common7\\' | Select-Object -First 1
-        if (-not $line) { $line = Select-String -Path $cache -Pattern '^CMAKE_COMMAND:INTERNAL=(.*)/Common7/' | Select-Object -First 1 }
-        if ($line) {
-            $bat = Join-Path $line.Matches[0].Groups[1].Value "VC\Auxiliary\Build\vcvars64.bat"
-            if (Test-Path $bat) { $vcvars = $bat }
-        }
-    }
-    if (-not $vcvars -and (Test-Path $vswhere)) {
-        $installs = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-        foreach ($vs in $installs) {
-            $bat = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-            if (Test-Path $bat) { $vcvars = $bat }
-        }
-    }
-    if ($vcvars) {
-        Write-Host "Loading the Visual Studio build tools (64-bit) from $vcvars"
-        $vars = cmd /c "set LIB=& set LIBPATH=& set INCLUDE=& call `"$vcvars`" >nul 2>&1 & set"
-        foreach ($line in $vars) {
-            if ($line -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($Matches[1])" -Value $Matches[2] }
-        }
-    }
-    if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
-        Write-Host "CMake not found. Open 'x64 Native Tools Command Prompt for VS 2022' from the Start menu, type powershell, and run this again." -ForegroundColor Red
-        exit 1
-    }
-}
+# Build tools: a 64-bit Visual Studio environment (tools\vsenv.ps1).
+. (Join-Path $PSScriptRoot "tools\vsenv.ps1")
 
 cmake --build build
 if ($LASTEXITCODE -ne 0) { Write-Host "Build failed." -ForegroundColor Red; exit 1 }
