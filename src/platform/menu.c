@@ -38,6 +38,10 @@ static bool g_shape_locked;
 static float g_aspect = 4.0f / 3.0f;   /* the window's shape now (for window sizes) */
 static char g_gpu_name[48];            /* the graphics card's name ("": not known) */
 
+/* Rows left off the page for now: Menu Colours (unfinished; ui-colors.txt
+   still works). */
+static bool item_hidden(int i) { return i == MI_COLORS; }
+
 void menu_set_gpu_name(const char* name) {
     snprintf(g_gpu_name, sizeof g_gpu_name, "%s", name ? name : "");
     g_dirty = true;
@@ -662,7 +666,7 @@ const char* menu_game_row_name(int row, int v) {
         snprintf(buf, sizeof buf, "%d x %d", (int)((float)h * g_aspect + 0.5f), h);
         return buf;
     }
-    case MI_RENDERER: return v ? "Software (slow)" : g_gpu_name[0] ? g_gpu_name : "Graphics Card";
+    case MI_RENDERER: return v ? "Software (slow)" : "OpenGL";
     default: snprintf(buf, sizeof buf, "%dx", v + 1); return buf;
     }
 }
@@ -893,7 +897,7 @@ void menu_action(int a) {
         int d = a == MENU_UP ? -1 : 1;
         for (int n = 0; n < MI_COUNT; n++) {
             g_sel = (g_sel + d + MI_COUNT) % MI_COUNT;
-            if (item_enabled(g_sel)) break;
+            if (item_enabled(g_sel) && !item_hidden(g_sel)) break;
         }
         break;
     }
@@ -1065,11 +1069,7 @@ static void item_value(int i, char* out, size_t cap) {
         break;
     }
     case MI_RENDERER:
-        if (s->renderer || !g_gpu_name[0]) snprintf(out, cap, "%s", s->renderer ? "SOFTWARE (SLOW)" : "GRAPHICS CARD");
-        else {
-            snprintf(out, cap, "%s", g_gpu_name);
-            for (char* c = out; *c; c++) if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 32);
-        }
+        snprintf(out, cap, "%s", s->renderer ? "SOFTWARE (SLOW)" : "OPENGL");
         break;
     case MI_RES:
         snprintf(out, cap, "%dX", s->resolution);
@@ -1096,7 +1096,7 @@ static const char* item_help(int i) {
                           "starts); change it in the game's menus.";
     case MI_DISPLAY: return "Play in a window or on the whole screen (F11 also switches).";
     case MI_WINSIZE: return "How big the window is when not playing full screen.";
-    case MI_RENDERER: return "The graphics card draws faster and sharper than the software renderer. Takes effect "
+    case MI_RENDERER: return "OpenGL draws on the graphics card: faster and sharper than the software renderer. Takes effect "
                              "the next time the game starts.";
     case MI_RES: return "How sharply the graphics card draws the game, as a multiple of the GameCube's own picture. "
                         "Higher needs a faster card.";
@@ -1204,8 +1204,10 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
 
     /* Rows */
     int row_h = U(70), ry = py0 + U(130), lx = px0 + U(60), vx = px0 + pw - U(70);
+    int slot = 0;
     for (int i = 0; i < MI_COUNT; i++) {
-        int y0 = ry + i * row_h + (i == MI_CLOSE ? U(18) : 0);
+        if (item_hidden(i)) continue;
+        int y0 = ry + slot++ * row_h + (i == MI_CLOSE ? U(18) : 0);
         bool sel = i == g_sel, en = item_enabled(i);
         if (sel) {
             fill_rect(px0 + U(24), y0, px0 + pw - U(24), y0 + row_h - U(8), COL_ORANGE, 46);
@@ -1232,7 +1234,7 @@ const uint32_t* menu_draw(int w, int h, bool* dirty) {
     }
 
     /* What the selected item does. */
-    int hy = ry + MI_COUNT * row_h + U(48);
+    int hy = ry + slot * row_h + U(48);
     fill_rect(px0 + U(60), hy - U(10), px0 + pw - U(60), hy - U(8), COL_DIM, 255);
     text_wrapped(item_help(g_sel), (float)(px0 + U(60)), hy + U(36), (float)(pw - U(120)), U(28), U(36), COL_GREY, 255);
 
