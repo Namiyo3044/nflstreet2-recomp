@@ -1527,12 +1527,23 @@ static void log_hitch(Uint64 now) {
     Uint64 shown = g_present_ns >= last_present ? g_present_ns - last_present : g_present_ns;
     g_hitch_last = now;
     last_present = g_present_ns;
+    static unsigned long long dec0, tex0;
+    static double td0, th0, ti0, tt0;
+    unsigned long long dec, tex;
+    double td, th, ti, tt;
+    gx_tex_counters(&dec, &tex);
+    gx_tex_times(&td, &th, &ti, &tt);
     if (took > 50000000ull && !turbo() && g_field > 120) {
         char where[256];
         prof_since(mark, where, sizeof where);
-        printf("hitch: %5.1f s game time, one field took %3.0f ms (showing the picture %2.0f ms)%s%s\n",
-               interrupts_game_seconds(), (double)took * 1e-6, (double)shown * 1e-6, where[0] ? " | " : "", where);
+        printf("hitch: %5.1f s game time, one field took %3.0f ms (showing the picture %2.0f ms)%s%s"
+               " | %llu textures decoded (%.1f M pixels) | textures %.1f ms: decoding %.1f, custom lookups %.1f, index %.1f\n",
+               interrupts_game_seconds(), (double)took * 1e-6, (double)shown * 1e-6, where[0] ? " | " : "", where,
+               dec - dec0, (double)(tex - tex0) * 1e-6, (tt - tt0) * 1e3, (td - td0) * 1e3, (th - th0) * 1e3,
+               (ti - ti0) * 1e3);
     }
+    dec0 = dec; tex0 = tex;
+    td0 = td; th0 = th; ti0 = ti; tt0 = tt;
     mark = prof_mark();
 }
 

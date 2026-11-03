@@ -5,6 +5,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* Where texture time goes (hitch reports): seconds spent in decoding, custom
+   texture lookups, index rebuilds, and in gx_tex_get as a whole. */
+static double g_t_decode, g_t_hires, g_t_index, g_t_total;
+static double now_sec(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 
 /* Texture memory, used here for colour tables (TLUTs). */
 #define TMEM_SIZE (1024u * 1024u)
@@ -38,14 +49,30 @@ static u32 from_ia8(u32 v) {        /* high byte alpha, low byte intensity */
     return argb(a, i, i, i);
 }
 
+/* The 16-bit colour formats, looked up instead of worked out texel by
+   texel (decoding is what a new scene's first frame spends its time on). */
+static u32* g_lut565;
+static u32* g_lut5a3;
+static void make_luts(void) {
+    if (g_lut565) return;
+    u32* a = (u32*)malloc(65536u * 4u);
+    u32* b = (u32*)malloc(65536u * 4u);
+    if (!a || !b) { free(a); free(b); return; }
+    for (u32 v = 0; v < 65536u; v++) { a[v] = from_rgb565(v); b[v] = from_rgb5a3(v); }
+    g_lut5a3 = b;
+    g_lut565 = a;
+}
+static inline u32 c565(u32 v) { return g_lut565 ? g_lut565[v] : from_rgb565(v); }
+static inline u32 c5a3(u32 v) { return g_lut5a3 ? g_lut5a3[v] : from_rgb5a3(v); }
+
 static u32 palette(const u8* tlut, u32 tlut_fmt, u32 index) {
     if (!tlut)
         return argb(255, index & 255, index & 255, index & 255);
     u32 v = rd16(tlut + (index & 0x3FFFu) * 2u);
     switch (tlut_fmt) {
     case 0: return from_ia8(v);
-    case 1: return from_rgb565(v);
-    default: return from_rgb5a3(v);
+    case 1: return c565(v);
+    default: return c5a3(v);
     }
 }
 
@@ -90,6 +117,11 @@ bool gx_tex_decode(const u8* src, u32 fmt, u32 w, u32 h, const u8* tlut, u32 tlu
     block_dims(fmt, &bw, &bh);
     u32 bx_count = (w + bw - 1) / bw, by_count = (h + bh - 1) / bh;
     const u8* p = src;
+    make_luts();
+    /* C4 / C8: the palette's colours worked out once for the whole texture. */
+    u32 pal[256];
+    if (fmt == FMT_C4 || fmt == FMT_C8)
+        for (u32 i = 0; i < (fmt == FMT_C4 ? 16u : 256u); i++) pal[i] = palette(tlut, tlut_fmt, i);
 
     for (u32 by = 0; by < by_count; by++) {
         for (u32 bx = 0; bx < bx_count; bx++) {
@@ -121,12 +153,12 @@ bool gx_tex_decode(const u8* src, u32 fmt, u32 w, u32 h, const u8* tlut, u32 tlu
                 break;
             case FMT_RGB565:
                 for (u32 i = 0; i < 16; i++)
-                    block[i] = from_rgb565(rd16(p + i * 2));
+                    block[i] = c565(rd16(p + i * 2));
                 p += 32;
                 break;
             case FMT_RGB5A3:
                 for (u32 i = 0; i < 16; i++)
-                    block[i] = from_rgb5a3(rd16(p + i * 2));
+                    block[i] = c5a3(rd16(p + i * 2));
                 p += 32;
                 break;
             case FMT_RGBA8:   /* AR pairs for 16 texels, then GB pairs */
@@ -135,13 +167,15 @@ bool gx_tex_decode(const u8* src, u32 fmt, u32 w, u32 h, const u8* tlut, u32 tlu
                 p += 64;
                 break;
             case FMT_C4:
-                for (u32 i = 0; i < 64; i++)
-                    block[i] = palette(tlut, tlut_fmt, (p[i / 2] >> ((i & 1) ? 0 : 4)) & 15);
+                for (u32 i = 0; i < 32; i++) {
+                    block[i * 2] = pal[p[i] >> 4];
+                    block[i * 2 + 1] = pal[p[i] & 15];
+                }
                 p += 32;
                 break;
             case FMT_C8:
                 for (u32 i = 0; i < 32; i++)
-                    block[i] = palette(tlut, tlut_fmt, p[i]);
+                    block[i] = pal[p[i]];
                 p += 32;
                 break;
             case FMT_C14X2:
@@ -163,6 +197,11 @@ bool gx_tex_decode(const u8* src, u32 fmt, u32 w, u32 h, const u8* tlut, u32 tlu
             }
             default:
                 return false;
+            }
+            if ((bx + 1) * bw <= w && (by + 1) * bh <= h) {   /* (the whole block inside: rows at once) */
+                u32* o = out + by * bh * w + bx * bw;
+                for (u32 y = 0; y < bh; y++, o += w) memcpy(o, block + y * bw, bw * 4u);
+                continue;
             }
             for (u32 y = 0; y < bh; y++) {
                 u32 ty = by * bh + y;
@@ -463,13 +502,29 @@ static u32 mip_layout(u32 fmt, u32 w, u32 h, u32 levels, GxTexture* t, u32* texe
     return bytes;
 }
 
+static unsigned long long g_decoded_texels;   /* texels decoded so far (hitch reports) */
+
+void gx_tex_counters(unsigned long long* decodes, unsigned long long* texels) {
+    *decodes = g_decodes;
+    *texels = g_decoded_texels;
+}
+
+void gx_tex_times(double* decode, double* custom, double* index, double* total) {
+    *decode = g_t_decode; *custom = g_t_hires; *index = g_t_index; *total = g_t_total;
+}
+
 static bool decode_levels(const u8* base, u32 fmt, const GxTexture* t, const u8* tlut, u32 tlut_fmt, u32* out) {
+    double t0 = now_sec();
     u32 src = 0;
+    for (u32 l = 0; l < t->levels; l++) g_decoded_texels += (unsigned long long)t->lw[l] * t->lh[l];
     for (u32 l = 0; l < t->levels; l++) {
-        if (!gx_tex_decode(base + src, fmt, t->lw[l], t->lh[l], tlut, tlut_fmt, out + t->off[l]))
+        if (!gx_tex_decode(base + src, fmt, t->lw[l], t->lh[l], tlut, tlut_fmt, out + t->off[l])) {
+            g_t_decode += now_sec() - t0;
             return false;
+        }
         src += gx_tex_size(fmt, t->lw[l], t->lh[l]);
     }
+    g_t_decode += now_sec() - t0;
     return true;
 }
 
@@ -495,6 +550,7 @@ static const u8* rgba8_from_tmem(u32 even, u32 odd, u32 size) {
 }
 
 static void index_rebuild(void) {
+    double t0 = now_sec();
     for (u32 i = 0; i < INDEX_SIZE; i++) g_index[i] = -1;
     for (u32 n = 0; n < g_cache_count; n++) {
         const CacheEntry* c = &g_cache[n];
@@ -505,6 +561,7 @@ static void index_rebuild(void) {
         g_index[k] = (int)n;
     }
     g_index_ready = true;
+    g_t_index += now_sec() - t0;
 }
 
 /* Looks up a custom replacement for a freshly decoded texture (hashed the
@@ -528,8 +585,10 @@ static void attach_hires(CacheEntry* e, const u8* src, bool preloaded, u32 even,
     if (paletted && !tlut)
         return;
     bool mipmaps = ((mode0 >> 5) & 3u) != 0;
+    double t0 = now_sec();
     e->tex.hires_entry = hires_find(fmt, w, h, mipmaps, data, size0, tlut, e->data);
     e->tex.hires = hires_ready(e->tex.hires_entry);
+    g_t_hires += now_sec() - t0;
 }
 
 /* The least recently used entry, unless every entry is used this frame. */
@@ -743,12 +802,12 @@ new_entry:
             return NULL;               /* every entry is in use this frame */
         slot = (u32)lru;
         retire(g_cache[slot].data);
+        g_index_ready = false;         /* (the old key leaves the index: rebuilt) */
     } else {
-        g_cache_count++;
+        g_cache_count++;               /* (a new slot: added to the index below, not rebuilt) */
     }
     e = &g_cache[slot];
     memset(e, 0, sizeof(*e));
-    g_index_ready = false;
     e->tex = layout;
     e->tex.width = w;
     e->tex.height = h;
@@ -769,6 +828,11 @@ new_entry:
     e->pal_stamp = e->data_stamp = g_tmem_stamp;
     e->tex.texels = e->data;
     last_hit[map & 7u] = slot;
+    if (g_index_ready) {               /* into the index as it stands (a scene's new textures each rebuilt it) */
+        u32 k = key_hash(addr, fmt, w, h, tlut_addr, tlut_fmt, levels);
+        while (g_index[k] >= 0) k = (k + 1u) & (INDEX_SIZE - 1u);
+        g_index[k] = (int)slot;
+    }
     g_decodes++;
     if (g_decode_hook) g_decode_hook(w, h, fmt);
     attach_hires(e, src, preloaded, even, mode0);
@@ -778,7 +842,9 @@ new_entry:
 
 const GxTexture* gx_tex_get(CPUState* cpu, u32 map) {
     int prev = prof_enter(PROF_GX_TEXTURE);
+    double t0 = now_sec();
     GxTexture* t = (GxTexture*)tex_get(cpu, map);
+    g_t_total += now_sec() - t0;
     if (t && t->hires_entry && !t->hires)
         t->hires = hires_ready(t->hires_entry);   /* finished loading in the background */
     prof_leave(prev);

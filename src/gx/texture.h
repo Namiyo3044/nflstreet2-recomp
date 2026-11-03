@@ -67,6 +67,12 @@ void gx_tex_set_decode_hook(void (*hook)(u32 w, u32 h, u32 fmt));
 /* Prints cache statistics. */
 void gx_tex_report(void);
 
+/* Textures decoded so far and their texels (the hitch log reports each
+   stalled field's share). */
+void gx_tex_counters(unsigned long long* decodes, unsigned long long* texels);
+/* Seconds spent so far: decoding, custom texture lookups, index rebuilds, all of gx_tex_get. */
+void gx_tex_times(double* decode, double* custom, double* index, double* total);
+
 /* Decodes one texture; exposed for tests. fmt: GX texture format id.
    tlut / tlut_fmt are used for the paletted formats (4/8/14-bit index). */
 bool gx_tex_decode(const u8* src, u32 fmt, u32 w, u32 h, const u8* tlut, u32 tlut_fmt, u32* out);
