@@ -2941,11 +2941,19 @@ static void rain_offset(u32 k, u32 d, int up, float w[3]) {
    kept those behind. They are held back and drawn after the rest of the
    3D scene instead: before the first 2D draw after them (the HUD, screen
    filters), a frame-buffer copy, or the end of the list. */
-static struct { CmdList* l; u32 (*t)[4]; u32 n, cap; } g_rain_held;
+static struct { CmdList* l; u32 (*t)[4]; u32 n, cap; u32 proj[7]; } g_rain_held;
+
+/* The streaks also go in before anything drawn through another camera (the
+   scoreboard, pause menu and warning boxes are 3D too, with a camera of
+   their own): only the scene drawn through the rain's camera comes after. */
+static bool rain_other_camera(void) {
+    return memcmp(g_rain_held.proj, &XFR[0x20], sizeof g_rain_held.proj) != 0;
+}
 
 static void rain_hold(CmdList* l, u32 state, u32 a, u32 b, u32 c) {
     if (g_rain_held.l != l) g_rain_held.n = 0;
     g_rain_held.l = l;
+    if (!g_rain_held.n) memcpy(g_rain_held.proj, &XFR[0x20], sizeof g_rain_held.proj);
     if (g_rain_held.n == g_rain_held.cap) {
         u32 cap = g_rain_held.cap ? g_rain_held.cap * 2 : 1024;
         u32 (*t)[4] = (u32 (*)[4])realloc(g_rain_held.t, sizeof(*t) * cap);
@@ -3092,7 +3100,7 @@ static void line_point_state(u32* lp, u32* toffs) {
 
 /* Triangles of a primitive whose transformed vertices are at base..base+count. */
 static void emit_prim(CmdList* l, u32 state, u8 prim, u32 base, u32 count, u32 lp, u32 toffs) {
-    if (g_rain_held.n && !g_setup.persp) rain_flush(l);   /* 2D after the rain: the streaks first */
+    if (g_rain_held.n && (!g_setup.persp || rain_other_camera())) rain_flush(l);   /* 2D or another camera after the rain: the streaks first */
 #define EMIT(i0, i1, i2) emit_tri(l, state, base + (i0), base + (i1), base + (i2))
 
     switch (prim & 0xF8) {
