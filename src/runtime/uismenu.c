@@ -1536,6 +1536,8 @@ bool uismenu_video_screen(CPUState* cpu) {
 #define SL_END (SL_BASE + 0x8000u)
 
 static u32 g_sh;                       /* the Save/Load screen's script header (0: not open / no row) */
+static u32 g_sh_away;                  /* set aside while another screen is up (uismenu_saveload_closed) */
+static bool g_away_focus;              /* the row had the cursor when last seen */
 static u32 g_srow;                     /* the copy's instance */
 static u32 g_stext, g_sval_var, g_sval_buf;   /* its value text record and variable */
 static u32 g_shelp, g_shelp_var;       /* the screen's help line: text record, variable (the game's) */
@@ -1793,12 +1795,25 @@ bool uismenu_saveload_screen(CPUState* cpu) {
     if (!h) return false;
     if (!sl_build(h)) { printf("uis: Save/Load: the screen isn't as expected; no Delete User ID row\n"); return false; }
     g_sh = h;
+    g_sh_away = 0;
     g_sstarted = false;
     printf("uis: Save/Load: Delete User ID row added\n");
     return true;
 }
 
-void uismenu_saveload_closed(void) { g_sh = 0; }
+/* Another screen loading: Save/Load closed, or a screen opened on top of it
+   (Load Options), after which Save/Load carries on with the row still in it.
+   Which of the two isn't known yet, so the row is set aside: it comes back
+   when the cursor is seen moving onto it (only a screen that's running
+   does that; a closed one's memory just stays as it was). */
+void uismenu_saveload_closed(void) {
+    if (g_sh && R && in_ram(g_srow, 0x400)) {
+        g_sh_away = g_sh;
+        u32 st = rd(g_srow + 0x84);
+        g_away_focus = st == 1 || st == 2;
+    }
+    g_sh = 0;
+}
 
 static bool sl_open(void) {
     u32 h = g_sh;
@@ -1810,9 +1825,21 @@ static bool sl_open(void) {
 
 /* Every video field: the row shows the User IDs; true while it has the cursor. */
 bool uismenu_saveload_frame(CPUState* cpu) {
-    if (!g_sh || !g_scb) return false;
+    if ((!g_sh && !g_sh_away) || !g_scb) return false;
     R = cpu->ram;
     RS = cpu->ram_size;
+    if (!g_sh) {
+        /* (set aside: back once the cursor moves onto the row) */
+        g_sh = g_sh_away;
+        if (!R || !sl_open()) { g_sh = g_sh_away = 0; return false; }
+        u32 st = rd(g_srow + 0x84);
+        bool on = st == 1 || st == 2;
+        bool was = g_away_focus;
+        g_away_focus = on;
+        if (!on || was) { g_sh = 0; return false; }
+        g_sh_away = 0;
+        printf("uis: Save/Load: Delete User ID row back\n");
+    }
     if (!R || !sl_open()) { g_sh = 0; return false; }
     u32 row = g_srow;
     if (!g_sstarted) {
