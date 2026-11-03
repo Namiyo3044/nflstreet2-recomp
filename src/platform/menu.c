@@ -1053,7 +1053,7 @@ static int text_wrapped(const char* s, float x, int y, float maxw, int size, int
 
 static const char* item_label(int i) {
     static const char* const k[MI_COUNT] = {"ASPECT RATIO", "DISPLAY", "WINDOW RESOLUTION", "INTERNAL RESOLUTION",
-                                            "RENDERER", "CUSTOM TEXTURES", "MENU COLOURS",
+                                            "RENDERER", "CUSTOM TEXTURES", "MENU COLORS",
                                             "CONTROLS", "BACK TO THE GAME"};
     return k[i];
 }
@@ -1105,7 +1105,7 @@ static const char* item_help(int i) {
                                    ".png or .dds). Turn off and on again (or press F5 twice) to load files added or changed since."
                                  : "No custom texture folder was found. Put Dolphin-format texture packs in "
                                    "C:\\nfls2\\textures to use them.";
-    case MI_COLORS: return "Change the colours of the game's menu bars and music ticker (shapes custom textures can't "
+    case MI_COLORS: return "Change the colors of the game's menu bars and music ticker (shapes custom textures can't "
                            "reach). The game carries on behind the page so you can see each change.";
     case MI_CONTROLS: return "Choose which keys and controller buttons work each GameCube button and stick.";
     default: return "Close this menu and carry on playing.";
@@ -1327,7 +1327,7 @@ static void draw_colors(int w, int h, float u) {
     int by0 = py0 - U(30), by1 = py0 + U(70);
     fill_slant(px0 - U(24), by0, px0 + U(470), by1, U(24), COL_ORANGE, 255);
     fill_slant(px0 + U(480), by0 + U(16), px0 + U(506), by1, U(22), COL_YELLOW, 255);
-    text("MENU COLOURS", (float)(px0 + U(28)), by1 - U(20), U(68), 0x111111u, 255, 0);
+    text("MENU COLORS", (float)(px0 + U(28)), by1 - U(20), U(68), 0x111111u, 255, 0);
 
     int lx = px0 + U(50), sx = px0 + pw - U(90), vx = sx - U(40), fs = U(28);
     for (int r = 0; r < rows; r++) {
@@ -1386,12 +1386,12 @@ static void draw_colors(int w, int h, float u) {
         text_wrapped(uicolors_slot_help(g_krow), (float)lx, iy + U(190), (float)(pw - U(100)), U(24), U(30),
                      COL_GREY, 255);
     } else {
-        text_wrapped(g_krow == n ? "Put every colour on this page back to the game's own."
-                                 : "Back to the video settings. Colours are saved to ui-colors.txt.",
+        text_wrapped(g_krow == n ? "Put every color on this page back to the game's own."
+                                 : "Back to the video settings. Colors are saved to ui-colors.txt.",
                      (float)lx, iy + U(40), (float)(pw - U(100)), U(24), U(30), COL_GREY, 255);
     }
     const char* help = g_kedit ? "UP / DOWN: RED, GREEN OR BLUE     LEFT / RIGHT: CHANGE     A OR B: DONE"
-                               : "LEFT / RIGHT: COLOUR     A / ENTER: FINE-TUNE     B / ESC: BACK";
+                               : "LEFT / RIGHT: COLOR     A / ENTER: FINE-TUNE     B / ESC: BACK";
     text(help, (float)(px0 + pw / 2), py0 + ph + U(40), U(22), COL_WHITE, 255, 2);
 #undef U
 }

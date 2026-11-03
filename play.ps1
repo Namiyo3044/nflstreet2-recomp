@@ -16,7 +16,7 @@
 #   .\play.ps1 -Watch 80A7BCE0:6@20  (debug: log changes to those words of game memory from 20 s of game time on, with who made them, "watch:" lines)
 #   .\play.ps1 -DumpTextures   (save every texture the game uses to C:\nfls2\dump\textures, with Dolphin's names)
 #   .\play.ps1 -NoText         (game text exactly as on the disc; ignores text-replacements.txt)
-#   .\play.ps1 -NoUiColors    (the game's own menu shape colours; ignores ui-colors.txt)
+#   .\play.ps1 -NoUiColors    (the game's own menu shape colors; ignores ui-colors.txt)
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
 #   .\play.ps1 -ShowTHX        (keep the THX intro; it is skipped by default)
 #   .\play.ps1 -Aspect 16:9    (screen shape for this run: 4:3 or 16:9)

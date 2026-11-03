@@ -187,7 +187,7 @@ static bool dsp_read(u32 off, u8 size, u32* out) {
      0x80544348; every later boot is the ROM, which reports 0x8071FEED;
    - __DSP_boot_task then sends the task's load parameters, ending with
      0x80F3D001 and the entry point; the task starts and reports 0xDCD10000
-     ("task initialised") with a DSP interrupt, which runs the task's init
+     ("task initialized") with a DSP interrupt, which runs the task's init
      callback in the game (for AX, the audio library). */
 static bool g_dsp_booted_once;
 static unsigned long long g_ax_frames, g_ai_dma_blocks;

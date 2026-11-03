@@ -53,7 +53,7 @@ Optional extras:
 
 - **Custom textures** (Dolphin's format, `.png` / `.dds`): put the pack's files in
   `C:\nfls2\textures`.
-- **Text changes**: `text-replacements.txt`; **menu colours**: `ui-colors.txt` (both explained
+- **Text changes**: `text-replacements.txt`; **menu colors**: `ui-colors.txt` (both explained
   inside the files).
 - **Replacement movies**: files in `C:\nfls2\replace` are read instead of the disc's.
 
@@ -77,7 +77,7 @@ runtime this port is built on (GPLv3).
 
 Libraries used (SDL is downloaded at build time; the rest are in `src/third_party`):
 
-- [SDL 3](https://github.com/libsdl-org/SDL): window, input and sound (zlib licence)
+- [SDL 3](https://github.com/libsdl-org/SDL): window, input and sound (zlib license)
 - [pl_mpeg](https://github.com/phoboslab/pl_mpeg) by Dominic Szablewski: replacement movie
   playback (MIT)
 - [stb_image, stb_image_write, stb_truetype](https://github.com/nothings/stb) by Sean Barrett:
@@ -87,7 +87,7 @@ Libraries used (SDL is downloaded at build time; the rest are in `src/third_part
 - [Anton](https://github.com/googlefonts/AntonFont) font by The Anton Project Authors: the
   port's own menus (SIL Open Font License 1.1, see `src/third_party/Anton-OFL.txt`)
 
-## Licence note
+## License note
 
 The port links DolRecomp's CPU runtime (`src/cpu/cpu.c`), which is GPLv3, so the port as a
 whole is GPLv3: if you distribute builds, you must also publish the source.

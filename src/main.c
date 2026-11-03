@@ -1216,7 +1216,7 @@ static void usage(const char* argv0) {
             "         [--sync-log FILE [--sync-every FIELDS] (hashes of game memory, to compare runs)] [--rtc SECONDS]\n"
             "         [--online (the main menu's Online, hidden for now)] [--net-host [PORT] | --net-join ADDRESS[:PORT] (netplay; port 7120)] [--net-delay FIELDS]\n"
             "         [--text FILE (game text replacements, default text-replacements.txt) | --no-text]\n"
-            "         [--ui-colors FILE (menu shape colours, default ui-colors.txt) | --no-ui-colors]\n"
+            "         [--ui-colors FILE (menu shape colors, default ui-colors.txt) | --no-ui-colors]\n"
             "         [--aspect auto|4:3|16:9 (screen shape; auto follows the game's widescreen option)]\n"
             "         [--gpu (draw with the graphics card) [--res N (its internal resolution, N x 640x528)]]\n"
             "         [--settings FILE (saved video settings; switches override them)] [--software]\n"

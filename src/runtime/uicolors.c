@@ -153,7 +153,7 @@ int uicolors_preset_count(void) { return NHUES + 3; }   /* + original, grey, whi
 const char* uicolors_preset_name(int p) {
     if (p == 0) return "ORIGINAL";
     if (p <= NHUES) return k_hues[p - 1].name;
-    return p == NHUES + 1 ? "GREY" : "WHITE";
+    return p == NHUES + 1 ? "GRAY" : "WHITE";
 }
 
 u32 uicolors_preset_color(int slot, int p) {
@@ -250,13 +250,14 @@ void uicolors_load(const char* path) {
     }
     fclose(f);
     rebuild();
-    printf("ui colors: %d colour swap%s from %s\n", g_nswaps, g_nswaps == 1 ? "" : "s", path);
+    printf("ui colors: %d color swap%s from %s\n", g_nswaps, g_nswaps == 1 ? "" : "s", path);
     if (off)
         printf("ui colors: %d changed line%s still start%s with \"# \" (switched off); remove the \"# \" to use %s\n",
                off, off == 1 ? "" : "s", off == 1 ? "s" : "", off == 1 ? "it" : "them");
 }
 
-#define MENU_HEADER "# Set in the game (Video Settings > Menu Colours):"
+#define MENU_HEADER "# Set in the game (Video Settings > Menu Colors):"
+#define MENU_HEADER_OLD "# Set in the game (Video Settings > Menu Colours):"   /* (as files written before say it) */
 
 bool uicolors_save(void) {
     /* Keep the file's other lines (notes, switched-off examples, colours
@@ -271,7 +272,8 @@ bool uicolors_save(void) {
             bool commented, blank;
             bool ok = parse_line(line, &w, &commented, &blank);
             if (ok && !commented && slot_of(w.from, NULL) >= 0) continue;
-            if (strncmp(line, MENU_HEADER, strlen(MENU_HEADER)) == 0) continue;
+            if (strncmp(line, MENU_HEADER, strlen(MENU_HEADER)) == 0 ||
+                strncmp(line, MENU_HEADER_OLD, strlen(MENU_HEADER_OLD)) == 0) continue;
             size_t n = strlen(line);
             if (nkeep + n + 2 > cap) {
                 cap = (nkeep + n + 2) * 2;
@@ -393,6 +395,6 @@ void uicolors_frame(CPUState* cpu) {
     static bool told;
     if (!told && g_changed > before) {
         told = true;
-        printf("ui colors: recolouring shapes (first at 0x%08X)\n", 0x80000000u + lo);
+        printf("ui colors: recoloring shapes (first at 0x%08X)\n", 0x80000000u + lo);
     }
 }

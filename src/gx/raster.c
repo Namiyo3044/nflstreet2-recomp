@@ -2636,7 +2636,7 @@ static void dlog_draw(u8 prim, u32 count, const SVtx* first) {
         fprintf(g_dlog, "draw log from %.2f s of game time, frame %u\n", interrupts_game_seconds(), g_frames + 1);
         if (g_dlog_short)
             fprintf(g_dlog_short, "draw log from %.2f s of game time, frame %u (box = screen x0,y0-x1,y1; "
-                    "f = mag/min filter; c/a = TEV colour/alpha op words)\n", interrupts_game_seconds(), g_frames + 1);
+                    "f = mag/min filter; c/a = TEV color/alpha op words)\n", interrupts_game_seconds(), g_frames + 1);
     }
     FILE* f = g_dlog;
     g_dlog_draws++;
