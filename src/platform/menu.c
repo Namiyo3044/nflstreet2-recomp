@@ -244,7 +244,7 @@ static const char* card_help(void) {
     if (netplay_active()) return "Not during an online game.";
     if (!g_card_n) return "No User IDs on the Memory Card in Slot A.";
     if (g_card_armed) {
-        snprintf(g_card_help, sizeof g_card_help, "Press A again to delete %s. Its saved data will be lost and the game restarts.",
+        snprintf(g_card_help, sizeof g_card_help, "Press A again to delete %s. The game restarts.",
                  card_name(g_card_sel));
         return g_card_help;
     }
