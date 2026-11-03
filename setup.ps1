@@ -10,15 +10,18 @@
 #   2. unpacks the disc image into C:\nfls2\disc and checks main.dol is the right version
 #   3. downloads DolRecomp (the recompiler) into C:\nfls2\tools\dolrecomp and builds it
 #   4. recompiles the game's code from your main.dol into C:\nfls2\recomp\dolrecomp\generated
-#   5. builds the port (the first build takes several minutes)
-# Then play with .\play.ps1.
+#   5. builds the port (the first build takes several minutes), with an icon made from your disc's banner
+#   6. puts an "NFL Street 2 Recomp" shortcut on the desktop
+# Then play with that shortcut, play.bat or .\play.ps1.
 #
 #   -Root D:\nfls2     (put all of it somewhere other than C:\nfls2)
 #   -Regenerate        (run step 4 again even if its output is there)
+#   -NoShortcut        (no desktop shortcut)
 param(
     [string]$Disc = "",
     [string]$Root = "C:\nfls2",
-    [switch]$Regenerate
+    [switch]$Regenerate,
+    [switch]$NoShortcut
 )
 $ErrorActionPreference = "Continue"   # (native tools write progress to stderr; each step checks its result)
 Set-Location $PSScriptRoot
@@ -74,6 +77,16 @@ $hash = (Get-FileHash -Algorithm SHA1 $dol).Hash.ToLower()
 if ($hash -ne $DolSha1) { Fail "This main.dol isn't NFL Street 2 for GameCube, USA, revision 0 (SHA-1 $hash). The port only works with that version." }
 Write-Host "main.dol is NFL Street 2 (GN7E69 rev 0)."
 
+# The program's icon, from the disc's own banner (the picture Dolphin's game list shows).
+$icon = Join-Path $Root "icon.ico"
+$bnr = Join-Path $discDir "files\opening.bnr"
+if (-not (Test-Path $icon) -and (Test-Path $bnr)) {
+    $makeicon = Join-Path $toolsDir "nfls2_makeicon.exe"
+    & clang-cl /nologo /O2 /D_CRT_SECURE_NO_WARNINGS "tools\makeicon.c" "/Fe:$makeicon" "/Fo:$toolsDir\makeicon.obj" | Out-Host
+    if ($LASTEXITCODE -eq 0) { & $makeicon $bnr $icon | Out-Host }
+    if (-not (Test-Path $icon)) { Write-Host "(couldn't make the icon from the disc's banner; carrying on without it)" }
+}
+
 # 3. DolRecomp --------------------------------------------------------------
 Step "DolRecomp"
 if (-not (Test-Path (Join-Path $drDir "src\cpu\cpu.c"))) {
@@ -114,14 +127,34 @@ if ($Regenerate -or -not (Test-Path (Join-Path $genDir "generated.h"))) {
 
 # 5. Build the port -----------------------------------------------------------
 Step "Building the port"
+$iconArg = "-DNFLS2_ICON=$($icon -replace '\\','/')"
 if (-not (Test-Path "build\CMakeCache.txt")) {
     & cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release `
-        "-DNFLS2_DOLRECOMP_DIR=$($drDir -replace '\\','/')" "-DNFLS2_GENERATED_DIR=$($genDir -replace '\\','/')" | Out-Host
-    if ($LASTEXITCODE -ne 0) { Fail "CMake couldn't set up the build." }
+        "-DNFLS2_DOLRECOMP_DIR=$($drDir -replace '\\','/')" "-DNFLS2_GENERATED_DIR=$($genDir -replace '\\','/')" $iconArg | Out-Host
+} else {
+    & cmake -S . -B build $iconArg | Out-Host   # (picks up the icon if it's new)
 }
+if ($LASTEXITCODE -ne 0) { Fail "CMake couldn't set up the build." }
 & cmake --build build | Out-Host
 if ($LASTEXITCODE -ne 0) { Fail "The build failed." }
 
+# 6. A desktop shortcut ---------------------------------------------------------
+$playArgs = if ($discDir -ne "C:\nfls2\disc") { "-Disc `"$discDir`"" } else { "" }
+if (-not $NoShortcut) {
+    $lnk = Join-Path ([Environment]::GetFolderPath("Desktop")) "NFL Street 2 Recomp.lnk"
+    if (-not (Test-Path $lnk)) {
+        $sh = New-Object -ComObject WScript.Shell
+        $sc = $sh.CreateShortcut($lnk)
+        $sc.TargetPath = Join-Path $PSScriptRoot "play.bat"
+        $sc.Arguments = $playArgs
+        $sc.WorkingDirectory = $PSScriptRoot
+        $sc.WindowStyle = 7                # (the launcher's console window minimized)
+        $sc.Description = "NFL Street 2 Recomp"
+        if (Test-Path $icon) { $sc.IconLocation = "$icon,0" }
+        $sc.Save()
+        Write-Host "Made a desktop shortcut: NFL Street 2 Recomp"
+    }
+}
+
 Write-Host ""
-Write-Host "All set. Play with:  .\play.ps1" -ForegroundColor Green
-if ($discDir -ne (Join-Path $Root "disc")) { Write-Host "  (your disc is in ${discDir}: add -Disc `"$discDir`")" }
+Write-Host "All set. Play with the desktop shortcut, play.bat or:  .\play.ps1 $playArgs" -ForegroundColor Green

@@ -32,12 +32,14 @@ PowerShell in this folder:
 
 It unpacks the disc into `C:\nfls2\disc`, checks it's the right version, downloads and builds
 [DolRecomp](https://github.com/expansionpak/dolrecomp), recompiles the game's code from your own
-`main.dol` into `C:\nfls2\recomp`, and builds the port. The first build takes several minutes.
+`main.dol` into `C:\nfls2\recomp`, and builds the port with an icon made from your disc's own
+banner. The first build takes several minutes. At the end it puts an **NFL Street 2 Recomp**
+shortcut on the desktop (`-NoShortcut` to skip it).
 Running it again only does what's missing. `-Root D:\nfls2` puts all of it somewhere else.
 
 ## Play
 
-Double-click **`play.bat`**, or in PowerShell:
+Double-click the desktop shortcut or **`play.bat`**, or in PowerShell:
 
 ```powershell
 .\play.ps1

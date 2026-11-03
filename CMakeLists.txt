@@ -61,6 +61,13 @@ add_executable(nfls2_discextract tools/discextract.c)
 if(MSVC)
     target_compile_definitions(nfls2_discextract PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
+# Makes the program's icon from the disc's banner (setup.ps1 runs it).
+add_executable(nfls2_makeicon tools/makeicon.c)
+if(MSVC)
+    target_compile_definitions(nfls2_makeicon PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_link_libraries(nfls2_makeicon PRIVATE m)
+endif()
 
 # Settings shared by everything that includes generated.h.
 add_library(nfls2_settings INTERFACE)
@@ -163,6 +170,16 @@ if(NFLS2_WINDOW)
 endif()
 if(WIN32)
     target_link_libraries(nfls2 PRIVATE ws2_32)   # netplay sockets
+    # The program's icon: made by setup.ps1 from your own disc's banner
+    # (tools/makeicon.c); without it Windows shows its default.
+    set(NFLS2_ICON "C:/nfls2/icon.ico" CACHE FILEPATH "Icon for nfls2.exe (made by setup.ps1 from the disc's banner)")
+    if(EXISTS "${NFLS2_ICON}")
+        enable_language(RC)
+        configure_file("${NFLS2_ICON}" "${CMAKE_BINARY_DIR}/nfls2.ico" COPYONLY)
+        file(WRITE "${CMAKE_BINARY_DIR}/nfls2_icon.rc" "1 ICON \"nfls2.ico\"\n")
+        target_sources(nfls2 PRIVATE "${CMAKE_BINARY_DIR}/nfls2_icon.rc")
+        message(STATUS "Program icon: ${NFLS2_ICON}")
+    endif()
 endif()
 if(NOT WIN32)
     find_package(Threads REQUIRED)
