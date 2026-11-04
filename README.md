@@ -51,6 +51,14 @@ The same set up without the window, in PowerShell in this folder (`setup.bat` al
 Running it again only does what's missing. `-Root D:\nfls2` puts all of it somewhere else,
 `-NoShortcut` skips the shortcut, `-PS2Disc "D:\Games\NFL Street 2 (PS2).iso"` adds the PS2 extras.
 
+## Updating
+
+The launcher checks for a newer release when it opens and shows **Update to v…** when there is
+one: one click downloads it (or runs `git pull` in a copy made with git), then finishes setting
+up whatever the new version needs (a new DolRecomp, recompiling the game's code) by itself.
+Your saves, settings, textures and the unpacked disc stay as they are. Without the launcher:
+get the new files, then run `setup.ps1` again.
+
 ## Play
 
 Double-click the desktop shortcut, **Play** in the launcher or **`play.bat`**, or in PowerShell:

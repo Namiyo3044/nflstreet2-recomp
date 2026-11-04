@@ -8,6 +8,11 @@
 #   4. Play
 #
 # The choices (disc, install folder) are remembered in %LOCALAPPDATA%\nfls2-recomp\launcher.ini.
+# It also checks GitHub for a newer release of the port and offers to update
+# (tools\update.ps1, then setup.ps1 for whatever the new version needs redone).
+param(
+    [switch]$AfterUpdate               # (started again by an update: runs setup at once)
+)
 $ErrorActionPreference = "Continue"
 Set-Location $PSScriptRoot
 Add-Type -AssemblyName System.Windows.Forms
@@ -17,6 +22,16 @@ try {
     [Nfls2.Dpi]::SetProcessDPIAware() | Out-Null
 } catch { }
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+$Repo = "Namiyo3044/nflstreet2-recomp"
+$Version = "?"
+$vh = Select-String -Path (Join-Path $PSScriptRoot "src\version.h") -Pattern '#define NFLS2_VERSION "([^"]+)"' -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($vh) { $Version = $vh.Matches[0].Groups[1].Value }
+function ConvertTo-Ver($s) {
+    $s = "$s".Trim().TrimStart("v", "V")
+    if ($s -notmatch '\.') { $s += ".0" }
+    try { [version]$s } catch { $null }
+}
 
 $Ok = [string][char]0x2713
 $No = [string][char]0x2717
@@ -103,7 +118,12 @@ function Add-Button($text, $x, $y, $w) {
 
 $bold = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 Add-Label "NFL Street 2 Recomp" 16 12 400 30 (New-Object System.Drawing.Font("Segoe UI", 15, [System.Drawing.FontStyle]::Bold)) | Out-Null
-Add-Label "A native PC port, built on your PC from your own GameCube disc (USA)." 18 44 600 20 $null | Out-Null
+Add-Label "A native PC port, built on your PC from your own GameCube disc (USA)." 18 44 430 20 $null | Out-Null
+$verLabel = Add-Label "v$Version" 452 44 172 20 $null
+$verLabel.TextAlign = [System.Drawing.ContentAlignment]::TopRight
+$verLabel.ForeColor = [System.Drawing.Color]::DimGray
+$updateButton = Add-Button "Update" 488 12 136
+$updateButton.Visible = $false
 
 # 1. Build tools
 Add-Label "1. Build tools" 16 78 200 20 $bold | Out-Null
@@ -259,6 +279,15 @@ $timer.Add_Tick({
                 $step.Text = "Set up failed (see below)."
                 [System.Windows.Forms.MessageBox]::Show($form, "Setting up didn't finish. The reason is at the end of the log.", "NFL Street 2 Recomp", "OK", "Warning") | Out-Null
             }
+        } elseif ($kind -eq "update") {
+            if ($code -eq 0) {
+                # Start again with the new launcher, which runs setup for whatever the new version needs.
+                Start-Process powershell -ArgumentList (Join-Args @("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                    "-File", (Join-Path $PSScriptRoot "launcher.ps1"), "-AfterUpdate")) -WorkingDirectory $PSScriptRoot | Out-Null
+                $form.Close()
+            } else {
+                $step.Text = "Update failed (see below)."
+            }
         } elseif ($kind -eq "tools") {
             if (Test-BuildTools) { $step.Text = "Build tools installed." } else { $step.Text = "The build tools aren't there yet." }
         }
@@ -343,7 +372,7 @@ $texButton.Add_Click({
     Start-Process explorer.exe -ArgumentList ('"' + $t + '"')
 })
 
-$setupButton.Add_Click({
+function Start-Setup {
     Save-Config
     $a = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "setup.ps1"), "-Root", (Get-Root))
     $d = $discBox.Text.Trim().Trim('"')
@@ -354,6 +383,52 @@ $setupButton.Add_Click({
     if (-not $shortcutBox.Checked) { $a += "-NoShortcut" }
     Start-Job2 "setup" $a
     $step.Text = "Starting..."
+}
+$setupButton.Add_Click({ Start-Setup })
+
+# Updates: GitHub's latest release, checked in the background when the window opens.
+$script:release = $null
+$script:checkTask = $null
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $wc = New-Object System.Net.WebClient
+    $wc.Headers.Add("User-Agent", "nfls2-recomp-launcher")
+    $script:checkTask = $wc.DownloadStringTaskAsync("https://api.github.com/repos/$Repo/releases/latest")
+} catch { }
+$checkTimer = New-Object System.Windows.Forms.Timer
+$checkTimer.Interval = 500
+$checkTimer.Add_Tick({
+    $t = $script:checkTask
+    if (-not $t -or -not $t.IsCompleted) { return }
+    $checkTimer.Stop()
+    $script:checkTask = $null
+    if ($t.Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) { return }   # (offline, or no release yet)
+    try { $rel = $t.Result | ConvertFrom-Json } catch { return }
+    $latest = ConvertTo-Ver $rel.tag_name
+    $mine = ConvertTo-Ver $Version
+    if ($latest -and $mine -and $latest -gt $mine) {
+        $script:release = $rel
+        $updateButton.Text = "Update to $($rel.tag_name)"
+        $updateButton.Visible = $true
+        $verLabel.Text = "v$Version  ($($rel.tag_name) is out)"
+    } elseif ($latest -and $mine) {
+        $verLabel.Text = "v$Version  (up to date)"
+    }
+})
+$checkTimer.Start()
+
+$updateButton.Add_Click({
+    $rel = $script:release
+    if (-not $rel -or $script:job) { return }
+    $notes = "$($rel.body)".Trim()
+    if ($notes.Length -gt 900) { $notes = $notes.Substring(0, 900) + "..." }
+    $msg = "Update from v$Version to $($rel.tag_name)?`r`n`r`n$notes`r`n`r`nYour saves, settings, textures and set-up files stay as they are. After the update the launcher restarts and finishes setting up."
+    $r = [System.Windows.Forms.MessageBox]::Show($form, $msg, "NFL Street 2 Recomp", "OKCancel", "Question")
+    if ($r -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $updateButton.Enabled = $false
+    Start-Job2 "update" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "tools\update.ps1"),
+        "-Tag", "$($rel.tag_name)", "-ZipUrl", "$($rel.zipball_url)")
+    $step.Text = "Updating..."
 })
 
 $playButton.Add_Click({
@@ -384,4 +459,8 @@ $form.Add_FormClosing({
 Update-Status
 if (-not (Test-BuildTools)) { Write-Log "Start with 1: the build tools. They're Microsoft's free C++ compiler, which builds the port on your PC." }
 elseif (-not (Test-Built)) { Write-Log "Pick your disc, then press Set Up. The first set up takes several minutes." }
+if ($AfterUpdate) {
+    if ($setupButton.Enabled) { Start-Setup }
+    Write-Log "Updated to v$Version. Setting up what the new version needs..."
+}
 [void]$form.ShowDialog()

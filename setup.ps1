@@ -112,7 +112,22 @@ if (Test-Path $icon) {
 }
 
 # 3. DolRecomp --------------------------------------------------------------
+# Each step that depends on a version notes it (a .nfls2-version file), so an
+# update of the port that moves to another DolRecomp or changes the function
+# list redoes just those steps. (Folders from before these notes are taken to
+# be the current version: until now the version never changed.)
+function Read-Stamp($dir) { $f = Join-Path $dir ".nfls2-version"; if (Test-Path $f) { (Get-Content $f -Raw).Trim() } else { $null } }
+function Write-Stamp($dir, $text) { Set-Content -Path (Join-Path $dir ".nfls2-version") -Value $text -Encoding ASCII }
 Step "DolRecomp"
+$drStamp = "dolrecomp=$DolRecompCommit"
+if ((Test-Path (Join-Path $drDir "src\cpu\cpu.c"))) {
+    $old = Read-Stamp $drDir
+    if ($null -eq $old) { Write-Stamp $drDir $drStamp }
+    elseif ($old -ne $drStamp) {
+        Write-Host "This version of the port uses another DolRecomp ($($DolRecompCommit.Substring(0, 7))): replacing the old one."
+        Remove-Item -Recurse -Force $drDir
+    }
+}
 if (-not (Test-Path (Join-Path $drDir "src\cpu\cpu.c"))) {
     $zip = Join-Path $toolsDir "dolrecomp.zip"
     Write-Host "Downloading DolRecomp ($($DolRecompCommit.Substring(0, 7)))..."
@@ -125,6 +140,7 @@ if (-not (Test-Path (Join-Path $drDir "src\cpu\cpu.c"))) {
     Expand-Archive $zip -DestinationPath $tmp
     Move-Item (Get-ChildItem $tmp | Select-Object -First 1).FullName $drDir
     Remove-Item -Recurse -Force $tmp, $zip
+    Write-Stamp $drDir $drStamp
 } else {
     Write-Host "Using the DolRecomp already in $drDir."
 }
@@ -157,11 +173,22 @@ if (-not (Test-Path $drExe)) {
 
 # 4. Recompile the game's code ------------------------------------------------
 Step "Recompiling the game's code"
+$map = Join-Path $PSScriptRoot "data\gn7e69-functions.map"
+$genStamp = "dolrecomp=$DolRecompCommit map=$((Get-FileHash -Algorithm SHA1 $map).Hash.ToLower())"
+if (Test-Path (Join-Path $genDir "generated.h")) {
+    $old = Read-Stamp $genParent
+    if ($null -eq $old) { Write-Stamp $genParent $genStamp }
+    elseif ($old -ne $genStamp -and -not $Regenerate) {
+        Write-Host "This version of the port recompiles the game's code differently: doing it again."
+        $Regenerate = $true
+    }
+}
 if ($Regenerate -or -not (Test-Path (Join-Path $genDir "generated.h"))) {
+    if (Test-Path $genDir) { Remove-Item -Recurse -Force $genDir }   # (no stale pieces left behind)
     New-Item -ItemType Directory -Force -Path $genParent | Out-Null
-    $map = Join-Path $PSScriptRoot "data\gn7e69-functions.map"
     & $drExe --gamecube --map $map $dol $genParent | Out-Host
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $genDir "generated.h"))) { Fail "DolRecomp failed." }
+    Write-Stamp $genParent $genStamp
 } else {
     Write-Host "Already done ($genDir)."
 }
