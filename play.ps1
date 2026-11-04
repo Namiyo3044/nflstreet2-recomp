@@ -104,6 +104,9 @@ if (-not (Test-Path (Join-Path $Disc "sys\main.dol"))) {
 # Function names for the logs: your own map if you made one, otherwise the port's list of addresses.
 if (-not (Test-Path $Map)) { $Map = Join-Path $PSScriptRoot "data\gn7e69-functions.map" }
 
+# Your menu colors file: made from the port's template (every swap switched off) the first time.
+if (-not (Test-Path "ui-colors.txt") -and (Test-Path "data\ui-colors.txt")) { Copy-Item "data\ui-colors.txt" "ui-colors.txt" }
+
 New-Item -ItemType Directory -Force -Path (Split-Path $Settings) | Out-Null
 $gameArgs = @($Disc, "--map", $Map, "--quiet", "--window", "--dump-every", "0", "--settings", $Settings)
 if ($PSBoundParameters.ContainsKey("Scale")) { $gameArgs += @("--scale", $Scale) }
