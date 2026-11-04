@@ -162,6 +162,9 @@ static void card_save(Card* c, u32 offset, u32 bytes) {
     gx_mutex_unlock(&g_card_mx);
 }
 
+static void card_format(u8* d, u32 size);
+static u32 rtc_now(void);
+
 bool exi_insert_memcard(int slot, const char* path) {
     if (slot < 0 || slot > 1 || !path || !*path)
         return false;
@@ -176,7 +179,8 @@ bool exi_insert_memcard(int slot, const char* path) {
         fseek(f, 0, SEEK_SET);
     }
     /* A card is 4 to 128 Mbit (59 to 2043 blocks). New cards: 16 Mbit
-       (251 blocks), unformatted, so the game offers to format it. */
+       (251 blocks), formatted, as a new card from the shop is (blank, the
+       game called it damaged and asked to format it). */
     u32 size = 0x200000u;
     if (f && len > 0) {
         u32 mbit = (u32)((unsigned long long)len * 8u / (1024u * 1024u));
@@ -197,7 +201,18 @@ bool exi_insert_memcard(int slot, const char* path) {
     if (f) {
         if (fread(c->data, 1, size, f) != size)
             fprintf(stderr, "memory card: short read from %s\n", path);
+        /* A card made blank by an earlier version and never formatted: format it now. */
+        bool blank = true;
+        for (u32 i = 0; i < 5 * SECTOR_SIZE && blank; i++) blank = c->data[i] == 0xFF;
+        if (blank) {
+            card_format(c->data, size);
+            fseek(f, 0, SEEK_SET);
+            fwrite(c->data, 1, 5 * SECTOR_SIZE, f);
+            fflush(f);
+            printf("memory card: %s was blank: formatted it\n", path);
+        }
     } else {
+        card_format(c->data, size);
         f = fopen(path, "w+b");
         if (!f) {
             fprintf(stderr, "memory card: couldn't create %s (does the folder exist?)\n", path);
@@ -207,7 +222,7 @@ bool exi_insert_memcard(int slot, const char* path) {
         }
         fwrite(c->data, 1, size, f);
         fflush(f);
-        printf("memory card: created a new, unformatted %u-block card at %s\n", size / SECTOR_SIZE - 5, path);
+        printf("memory card: created a new, formatted %u-block card at %s\n", size / SECTOR_SIZE - 5, path);
     }
     c->file = f;
     c->size = size;
@@ -356,6 +371,52 @@ static bool bat_ok(const u8* t) {
     u32 a, b;
     card_checksum(t + 4, 0x1FFC, &a, &b);
     return BE16(t) == a && BE16(t + 2) == b;
+}
+
+/* Formats a card image the way the GameCube's CARDFormat does, for slot A
+   with the console's flash ID all zero (as the SRAM here says): the header
+   (its serial from the format time and that flash ID, which the game checks
+   when it mounts the card), two empty directories and two block tables with
+   every block free. */
+static void card_format(u8* d, u32 size) {
+    memset(d, 0xFF, 5 * SECTOR_SIZE);
+    u32 blocks = size / SECTOR_SIZE;
+    /* Header: serial, format time (timebase ticks since 2000, 40.5 MHz),
+       SRAM bias and language, device ID 0, size in Mbit, encoding 0 (ANSI,
+       the USA's), then a checksum over the first 0x1FC bytes. */
+    u64 now = (u64)rtc_now() * 40500000ull;
+    u64 r = now;
+    for (int i = 0; i < 12; i++) {
+        r = (r * 0x41C64E6Dull + 0x3039ull) >> 16;
+        d[i] = (u8)(0 + (u32)r);       /* (flash ID byte + rand) */
+        r = ((r * 0x41C64E6Dull + 0x3039ull) >> 16) & 0x7FFFull;
+    }
+    for (int i = 0; i < 8; i++) d[12 + i] = (u8)(now >> (56 - 8 * i));
+    memset(d + 0x14, 0, 12);           /* SRAM bias, language, (unused) */
+    put16(d + 0x20, 0);                /* device ID */
+    put16(d + 0x22, size * 8u / (1024u * 1024u));
+    put16(d + 0x24, 0);                /* encoding */
+    u32 a, x;
+    card_checksum(d, 0x1FC, &a, &x);
+    put16(d + 0x1FC, a); put16(d + 0x1FE, x);
+    /* Directories: 127 empty entries (all 0xFF), update count 0, checksums. */
+    for (u32 k = 0; k < 2; k++) {
+        u8* dir = d + (1 + k) * SECTOR_SIZE;
+        put16(dir + 0x1FFA, 0);
+        card_checksum(dir, 0x1FFC, &a, &x);
+        put16(dir + 0x1FFC, a); put16(dir + 0x1FFE, x);
+    }
+    /* Block tables: update count 0, free blocks, the last one handed out
+       (4: none yet), every block's entry 0 (free); checksums over the rest. */
+    for (u32 k = 0; k < 2; k++) {
+        u8* bat = d + (3 + k) * SECTOR_SIZE;
+        memset(bat, 0, SECTOR_SIZE);
+        put16(bat + 4, 0);
+        put16(bat + 6, blocks - 5);
+        put16(bat + 8, 4);
+        card_checksum(bat + 4, 0x1FFC, &a, &x);
+        put16(bat, a); put16(bat + 2, x);
+    }
 }
 
 /* The copy in use (0 or 1), -1 if neither is good. */
