@@ -134,6 +134,7 @@ $shortcutBox.Location = New-Object System.Drawing.Point(34, 266)
 $shortcutBox.Size = New-Object System.Drawing.Size(300, 22)
 $shortcutBox.Checked = $cfg.shortcut -ne "0"
 $form.Controls.Add($shortcutBox)
+$texButton = Add-Button "Textures Folder" 488 264 136
 
 # Optional: the PS2 disc
 Add-Label "Optional: your PS2 disc (.iso), for the Previews trailers and sharper intro movies" 16 298 608 20 $bold | Out-Null
@@ -335,6 +336,12 @@ $rootButton.Add_Click({
 })
 $rootBox.Add_Leave({ Save-Config; Update-Status })
 $shortcutBox.Add_CheckedChanged({ Save-Config })
+$texButton.Add_Click({
+    # (made if it isn't there yet; custom texture packs go in it)
+    $t = Join-Path (Get-Root) "textures"
+    New-Item -ItemType Directory -Force -Path $t | Out-Null
+    Start-Process explorer.exe -ArgumentList ('"' + $t + '"')
+})
 
 $setupButton.Add_Click({
     Save-Config

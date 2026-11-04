@@ -244,6 +244,22 @@ if ($PS2Disc -ne "") {
     }
 }
 
+# The custom textures folder (empty until you add a pack), with a note on what goes in it.
+$texDir = Join-Path $Root "textures"
+if (-not (Test-Path $texDir)) {
+    New-Item -ItemType Directory -Force -Path $texDir | Out-Null
+    @(
+        "Custom textures for NFL Street 2 Recomp go in this folder.",
+        "",
+        "- Dolphin's custom texture format: .png or .dds files named the Dolphin way,",
+        "  e.g. tex1_256x128_m_28f70c0f458f47f2_14.png. Packs made for Dolphin work as they are.",
+        "- Subfolders are fine: a pack's GN7E69 folder can go straight in here.",
+        "- In the game: F5 turns custom textures on and off, Shift+F5 reloads them after an edit.",
+        "  Recomp Settings > Custom Textures says None Found while the folder is empty."
+    ) | Set-Content -Path (Join-Path $texDir "Put custom textures here.txt") -Encoding ASCII
+    Write-Host "Made the custom textures folder: $texDir"
+}
+
 # 7. A desktop shortcut ---------------------------------------------------------
 $playArgs = if ($discDir -ne "C:\nfls2\disc") { "-Disc `"$discDir`"" } else { "" }
 if (-not $NoShortcut) {

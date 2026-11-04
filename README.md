@@ -68,7 +68,8 @@ can be changed in the menu. Settings are saved in `C:\nfls2\settings.ini`, the m
 Optional extras:
 
 - **Custom textures** (Dolphin's format, `.png` / `.dds`): put the pack's files in
-  `C:\nfls2\textures`.
+  `C:\nfls2\textures`, which setup makes (the launcher's **Textures Folder** button opens it).
+  Subfolders are fine, so a pack's `GN7E69` folder can go straight in.
 - **Text changes**: `text-replacements.txt`; **menu colors**: `ui-colors.txt` (both explained
   inside the files).
 - **Replacement movies**: files in `C:\nfls2\replace` are read instead of the disc's.
