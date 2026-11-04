@@ -3,6 +3,8 @@
 #   .\setup.ps1 -Disc D:\Games\NFL Street 2.iso     (a .iso / .gcm image of the disc)
 #   .\setup.ps1 -Disc D:\nfls2-extracted             (or a folder from Dolphin's "Extract Entire Disc")
 #   .\setup.ps1                                      (the disc already unpacked in C:\nfls2\disc; otherwise a window asks for it)
+#   .\setup.ps1 -PS2Disc D:\Games\NFL Street 2 (PS2).iso
+#                       (optional: your PS2 disc too, for the Previews trailers and sharper intro movies)
 #   setup.bat                                        (the same, by double-clicking it)
 #
 # What it does, each step only if it isn't done yet:
@@ -11,7 +13,8 @@
 #   3. downloads DolRecomp (the recompiler) into C:\nfls2\tools\dolrecomp and builds it
 #   4. recompiles the game's code from your main.dol into C:\nfls2\recomp\dolrecomp\generated
 #   5. builds the port (the first build takes several minutes), with an icon made from your disc's banner
-#   6. puts an "NFL Street 2 Recomp" shortcut on the desktop
+#   6. with -PS2Disc: takes the movies off your PS2 disc and converts them (downloads ffmpeg for that)
+#   7. puts an "NFL Street 2 Recomp" shortcut on the desktop
 # Then play with that shortcut, play.bat or .\play.ps1.
 #
 #   -Root D:\nfls2     (put all of it somewhere other than C:\nfls2)
@@ -19,11 +22,13 @@
 #   -NoShortcut        (no desktop shortcut)
 param(
     [string]$Disc = "",
+    [string]$PS2Disc = "",
     [string]$Root = "C:\nfls2",
     [switch]$Regenerate,
     [switch]$NoShortcut
 )
 $ErrorActionPreference = "Continue"   # (native tools write progress to stderr; each step checks its result)
+$ProgressPreference = "SilentlyContinue"   # (Windows PowerShell's download progress bar slows downloads to a crawl)
 Set-Location $PSScriptRoot
 
 # DolRecomp, at the version this port is built and tested against.
@@ -174,7 +179,72 @@ if ($LASTEXITCODE -ne 0) { Fail "CMake couldn't set up the build." }
 & cmake --build build | Out-Host
 if ($LASTEXITCODE -ne 0) { Fail "The build failed." }
 
-# 6. A desktop shortcut ---------------------------------------------------------
+# 6. Optional: the PS2 disc's movies ---------------------------------------------
+# The Previews trailers (left out of the GameCube version) and the intro movies
+# at the PS2's quality: taken out of the PS2 MOVIEDAT.DAT and converted to the
+# MPEG-1 the port plays, into <Root>\replace (play.ps1 -Replace).
+$replaceDir = Join-Path $Root "replace"
+$trailers = @("madden_nfl_2005", "nba_live_2005", "nba_street_v3", "fifa_street", "fifa_soccer_2005", "ncaa_football_2005",
+              "ncaa_march_madness_2005", "nascar_2005", "nhl_2005", "tiger_woods_2005", "nfs_underground_2")
+$ps2Outs = @(0..2 | ForEach-Object { Join-Path $replaceDir "moviedat_$_.mpg" }) + @($trailers | ForEach-Object { Join-Path $replaceDir "previews\$_.mpg" })
+if ($PS2Disc -ne "") {
+    Step "PS2 extras (Previews trailers, sharper intro movies)"
+    $PS2Disc = $PS2Disc.Trim().Trim('"')
+    if (-not ($ps2Outs | Where-Object { -not (Test-Path $_) })) {
+        Write-Host "Already done ($replaceDir)."
+    } else {
+        if (-not (Test-Path $PS2Disc -PathType Leaf)) { Fail "$PS2Disc doesn't exist: give your PS2 disc image (.iso) with -PS2Disc." }
+        $ps2m = Join-Path $toolsDir "nfls2_ps2movies.exe"
+        if (-not (Test-Path $ps2m) -or (Get-Item $ps2m).LastWriteTime -lt (Get-Item "tools\ps2movies.c").LastWriteTime) {
+            & clang-cl /nologo /O2 /D_CRT_SECURE_NO_WARNINGS "tools\ps2movies.c" "/Fe:$ps2m" "/Fo:$toolsDir\ps2movies.obj" | Out-Host
+            if ($LASTEXITCODE -ne 0) { Fail "Couldn't build the PS2 movie tool." }
+        }
+        # ffmpeg (free) converts the PS2's MPEG-2 movies; a copy of its own in the tools folder.
+        $ffmpeg = Join-Path $toolsDir "ffmpeg\bin\ffmpeg.exe"
+        if (-not (Test-Path $ffmpeg)) {
+            $zip = Join-Path $toolsDir "ffmpeg.zip"
+            Write-Host "Downloading ffmpeg (about 200 MB), which converts the movies..."
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            try {
+                Invoke-WebRequest -UseBasicParsing "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile $zip
+            } catch { Fail "Couldn't download ffmpeg: $($_.Exception.Message)" }
+            $tmp = Join-Path $toolsDir "ffmpeg-unpack"
+            if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+            Expand-Archive $zip -DestinationPath $tmp
+            $ffDir = Join-Path $toolsDir "ffmpeg"
+            if (Test-Path $ffDir) { Remove-Item -Recurse -Force $ffDir }
+            Move-Item (Get-ChildItem $tmp | Select-Object -First 1).FullName $ffDir
+            Remove-Item -Recurse -Force $tmp, $zip
+            if (-not (Test-Path $ffmpeg)) { Fail "ffmpeg's download didn't have bin\ffmpeg.exe." }
+        }
+        $work = Join-Path $toolsDir "ps2work"
+        New-Item -ItemType Directory -Force -Path $work, (Join-Path $replaceDir "previews") | Out-Null
+        Write-Host "Taking the movies off $PS2Disc ..."
+        & $ps2m $PS2Disc $work | Out-Host
+        if ($LASTEXITCODE -ne 0) { Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue; Fail "Couldn't take the movies off the PS2 disc." }
+        $jobs = @(0..2 | ForEach-Object { @{ src = "intro$_.ea"; out = $ps2Outs[$_]; sound = $false } })
+        for ($i = 0; $i -lt $trailers.Count; $i++) { $jobs += @{ src = ("trailer{0:D2}.ea" -f $i); out = $ps2Outs[3 + $i]; sound = $true } }
+        $n = 0
+        foreach ($j in $jobs) {
+            $n++
+            Write-Host "Converting movie $n of $($jobs.Count): $(Split-Path $j.out -Leaf)"
+            $part = "$($j.out).part"
+            # (the intros: picture only, the game plays their sound; the trailers with theirs)
+            $audio = @("-an")
+            if ($j.sound) { $audio = @("-c:a", "mp2", "-b:a", "224k", "-ar", "44100") }
+            & $ffmpeg -v error -y -i (Join-Path $work $j.src) -fps_mode passthrough -c:v mpeg1video -q:v 2 @audio -f mpeg $part
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $part)) {
+                Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+                Fail "ffmpeg couldn't convert $($j.src)."
+            }
+            Move-Item -Force $part $j.out
+        }
+        Remove-Item -Recurse -Force $work
+        Write-Host "PS2 extras in $replaceDir : Previews is back in the Credits menu."
+    }
+}
+
+# 7. A desktop shortcut ---------------------------------------------------------
 $playArgs = if ($discDir -ne "C:\nfls2\disc") { "-Disc `"$discDir`"" } else { "" }
 if (-not $NoShortcut) {
     $lnk = Join-Path ([Environment]::GetFolderPath("Desktop")) "NFL Street 2 Recomp.lnk"

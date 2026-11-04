@@ -24,16 +24,17 @@ $No = [string][char]0x2717
 # Remembered choices --------------------------------------------------------------
 $iniDir = Join-Path $env:LOCALAPPDATA "nfls2-recomp"
 $ini = Join-Path $iniDir "launcher.ini"
-$cfg = @{ disc = ""; root = "C:\nfls2"; shortcut = "1" }
+$cfg = @{ disc = ""; ps2 = ""; root = "C:\nfls2"; shortcut = "1" }
 if (Test-Path $ini) {
     foreach ($line in Get-Content $ini) { if ($line -match '^(\w+)=(.*)$') { $cfg[$Matches[1]] = $Matches[2] } }
 }
 function Save-Config {
     New-Item -ItemType Directory -Force -Path $iniDir | Out-Null
     $cfg.disc = $discBox.Text.Trim().Trim('"')
+    $cfg.ps2 = $ps2Box.Text.Trim().Trim('"')
     $cfg.root = $rootBox.Text.Trim().Trim('"')
     $cfg.shortcut = if ($shortcutBox.Checked) { "1" } else { "0" }
-    @("disc=$($cfg.disc)", "root=$($cfg.root)", "shortcut=$($cfg.shortcut)") | Set-Content -Path $ini -Encoding ASCII
+    @("disc=$($cfg.disc)", "ps2=$($cfg.ps2)", "root=$($cfg.root)", "shortcut=$($cfg.shortcut)") | Set-Content -Path $ini -Encoding ASCII
 }
 
 # Checks --------------------------------------------------------------------------
@@ -59,6 +60,10 @@ function Test-Disc {
     if (Test-Path (Join-Path (Get-DiscFolder) "sys\main.dol")) { return $true }
     return ($d -ne "" -and (Test-Path $d -PathType Leaf))
 }
+function Test-PS2Extras {
+    $r = Join-Path (Get-Root) "replace"
+    (Test-Path (Join-Path $r "moviedat_1.mpg")) -and (Test-Path (Join-Path $r "previews\nfs_underground_2.mpg"))
+}
 function Test-Built {
     (Test-Path (Join-Path $PSScriptRoot "build\nfls2.exe")) -and
     (Test-Path (Join-Path (Get-Root) "recomp\dolrecomp\generated\generated.h")) -and
@@ -70,7 +75,7 @@ $form = New-Object System.Windows.Forms.Form
 $form.Text = "NFL Street 2 Recomp"
 $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
-$form.ClientSize = New-Object System.Drawing.Size(640, 560)
+$form.ClientSize = New-Object System.Drawing.Size(640, 642)
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
 $form.MaximizeBox = $false
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
@@ -130,14 +135,24 @@ $shortcutBox.Size = New-Object System.Drawing.Size(300, 22)
 $shortcutBox.Checked = $cfg.shortcut -ne "0"
 $form.Controls.Add($shortcutBox)
 
+# Optional: the PS2 disc
+Add-Label "Optional: your PS2 disc (.iso), for the Previews trailers and sharper intro movies" 16 298 608 20 $bold | Out-Null
+$ps2Box = New-Object System.Windows.Forms.TextBox
+$ps2Box.Location = New-Object System.Drawing.Point(34, 322)
+$ps2Box.Size = New-Object System.Drawing.Size(446, 24)
+$ps2Box.Text = $cfg.ps2
+$form.Controls.Add($ps2Box)
+$ps2Button = Add-Button "Browse..." 488 320 136
+$ps2Status = Add-Label "" 34 350 590 20 $null
+
 # 3. Set up / 4. Play
-Add-Label "3. Set up, then play" 16 298 300 20 $bold | Out-Null
-$setupButton = Add-Button "Set Up" 34 322 136
-$playButton = Add-Button "Play" 180 322 136
+Add-Label "3. Set up, then play" 16 380 300 20 $bold | Out-Null
+$setupButton = Add-Button "Set Up" 34 404 136
+$playButton = Add-Button "Play" 180 404 136
 $playButton.Font = $bold
-$step = Add-Label "" 330 328 294 20 $null
+$step = Add-Label "" 330 410 294 20 $null
 $progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Location = New-Object System.Drawing.Point(34, 360)
+$progress.Location = New-Object System.Drawing.Point(34, 442)
 $progress.Size = New-Object System.Drawing.Size(590, 10)
 $progress.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
 $progress.MarqueeAnimationSpeed = 30
@@ -150,7 +165,7 @@ $log.ReadOnly = $true
 $log.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
 $log.WordWrap = $false
 $log.Font = New-Object System.Drawing.Font("Consolas", 8.5)
-$log.Location = New-Object System.Drawing.Point(16, 380)
+$log.Location = New-Object System.Drawing.Point(16, 462)
 $log.Size = New-Object System.Drawing.Size(608, 166)
 $form.Controls.Add($log)
 
@@ -177,13 +192,20 @@ function Update-Status {
     $built = Test-Built
     $discStatus.Text = if ((Test-Path (Join-Path (Get-DiscFolder) "sys\main.dol"))) { "$Ok  Unpacked in $(Get-DiscFolder)." } elseif ($disc) { "$Ok  Set Up will unpack it." } else { "$No  Pick your disc image." }
     $discStatus.ForeColor = if ($disc) { [System.Drawing.Color]::DarkGreen } else { [System.Drawing.Color]::Firebrick }
+    $ps2 = $ps2Box.Text.Trim().Trim('"')
+    if (Test-PS2Extras) { $ps2Status.Text = "$Ok  Installed: Previews and the PS2 intro movies."; $ps2Status.ForeColor = [System.Drawing.Color]::DarkGreen }
+    elseif ($ps2 -ne "" -and (Test-Path $ps2 -PathType Leaf)) { $ps2Status.Text = "Set Up will add them (downloads ffmpeg, about 200 MB, to convert the movies)."; $ps2Status.ForeColor = [System.Drawing.Color]::DimGray }
+    elseif ($ps2 -ne "") { $ps2Status.Text = "$No  That file doesn't exist."; $ps2Status.ForeColor = [System.Drawing.Color]::Firebrick }
+    else { $ps2Status.Text = "Not added: without it, Previews is hidden and the intros are the GameCube's."; $ps2Status.ForeColor = [System.Drawing.Color]::DimGray }
+    $ps2Box.Enabled = -not $busy; $ps2Button.Enabled = -not $busy
     $setupButton.Enabled = -not $busy -and $tools -and $disc
-    $setupButton.Text = if ($built) { "Set Up Again" } else { "Set Up" }
+    $ps2Pending = $ps2 -ne "" -and (Test-Path $ps2 -PathType Leaf) -and -not (Test-PS2Extras)
+    $setupButton.Text = if ($built -and $ps2Pending) { "Add PS2 Extras" } elseif ($built) { "Set Up Again" } else { "Set Up" }
     $playButton.Enabled = -not $busy -and $built
     $discBox.Enabled = -not $busy; $discButton.Enabled = -not $busy
     $rootBox.Enabled = -not $busy; $rootButton.Enabled = -not $busy; $shortcutBox.Enabled = -not $busy
     if (-not $busy) {
-        $step.Text = if ($built) { "Ready to play." } elseif ($tools -and $disc) { "Ready to set up (several minutes)." } else { "" }
+        $step.Text = if ($built -and $ps2Pending) { "Ready to play, or add the PS2 extras." } elseif ($built) { "Ready to play." } elseif ($tools -and $disc) { "Ready to set up (several minutes)." } else { "" }
     }
 }
 
@@ -204,6 +226,7 @@ function Read-New($path, [ref]$pos) {
             foreach ($line in $text.Substring(0, $cut).Split("`n")) {
                 $line = $line.TrimEnd("`r")
                 if ($line -match '^== (.*)$') { $step.Text = $Matches[1] + "..." }
+                elseif ($line -match '^Converting movie (\d+) of (\d+)') { $step.Text = "Converting movie $($Matches[1]) of $($Matches[2])..." }
                 elseif ($line -match '^\[(\d+)/(\d+)\]') { $step.Text = "Building ($($Matches[1]) of $($Matches[2]))..." }
                 Write-Log $line
             }
@@ -288,6 +311,18 @@ $discButton.Add_Click({
 })
 $discBox.Add_Leave({ Save-Config; Update-Status })
 
+$ps2Button.Add_Click({
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = "Pick your NFL Street 2 (PS2) disc image"
+    $dlg.Filter = "PS2 disc images (*.iso)|*.iso|All files (*.*)|*.*"
+    if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+        $ps2Box.Text = $dlg.FileName
+        Save-Config
+        Update-Status
+    }
+})
+$ps2Box.Add_Leave({ Save-Config; Update-Status })
+
 $rootButton.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
     $dlg.Description = "Where to put the unpacked disc, the recompiled code, saves and settings"
@@ -307,6 +342,8 @@ $setupButton.Add_Click({
     $d = $discBox.Text.Trim().Trim('"')
     if ($d -ne "") { $a += @("-Disc", $d) }
     elseif (Test-Path (Join-Path (Get-DiscFolder) "sys\main.dol")) { $a += @("-Disc", (Get-DiscFolder)) }
+    $p2 = $ps2Box.Text.Trim().Trim('"')
+    if ($p2 -ne "" -and (Test-Path $p2 -PathType Leaf)) { $a += @("-PS2Disc", $p2) }
     if (-not $shortcutBox.Checked) { $a += "-NoShortcut" }
     Start-Job2 "setup" $a
     $step.Text = "Starting..."

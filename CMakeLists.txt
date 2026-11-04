@@ -61,6 +61,11 @@ add_executable(nfls2_discextract tools/discextract.c)
 if(MSVC)
     target_compile_definitions(nfls2_discextract PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
+# Takes the movies off the PS2 disc for the optional PS2 extras (setup.ps1 -PS2Disc).
+add_executable(nfls2_ps2movies tools/ps2movies.c)
+if(MSVC)
+    target_compile_definitions(nfls2_ps2movies PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
 # Makes the program's icon from the disc's banner (setup.ps1 runs it).
 add_executable(nfls2_makeicon tools/makeicon.c)
 if(MSVC)

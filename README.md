@@ -36,6 +36,12 @@ Double-click **`Launcher.bat`**. Its window takes you through it:
    **NFL Street 2 Recomp** shortcut on the desktop (untick the box to skip it).
 4. **Play**.
 
+**Optional, your PS2 disc too**: pick your NFL Street 2 PS2 disc image (`.iso`) in the launcher's
+PS2 row before Set Up (or press **Add PS2 Extras** afterwards). It brings back the **Previews**
+trailers (left out of the GameCube version; without the PS2 disc, Previews is hidden) and plays
+the intro movies at the PS2's sharper quality. Setup takes the movies off the disc and converts
+them with [ffmpeg](https://ffmpeg.org/) (downloaded for you, about 200 MB) into `C:\nfls2\replace`.
+
 The same set up without the window, in PowerShell in this folder (`setup.bat` also works):
 
 ```powershell
@@ -43,7 +49,7 @@ The same set up without the window, in PowerShell in this folder (`setup.bat` al
 ```
 
 Running it again only does what's missing. `-Root D:\nfls2` puts all of it somewhere else,
-`-NoShortcut` skips the shortcut.
+`-NoShortcut` skips the shortcut, `-PS2Disc "D:\Games\NFL Street 2 (PS2).iso"` adds the PS2 extras.
 
 ## Play
 
