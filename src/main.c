@@ -434,11 +434,27 @@ static int uis_retext(u8* ram, u32 size, const char* old, const char* rep) {
 
 /* The Credits list without Madden NFL 2005 (the PS2 demo, not in the
    GameCube game; uis_main_menu_edits brings in the other versions' list):
-   just Credits and Previews. The port's own credits are at the start of
+   just Credits and Previews (Previews only with the trailers). The port's own credits are at the start of
    the game's credits roll (credits.c). */
+/* The Previews trailers are there (replace\previews, made from the PS2 disc):
+   without them Previews is left out too, as its entries would play nothing. */
+static bool have_trailers(void) {
+    static int known = -1;
+    if (known < 0) {
+        const char* dir = disc_replace_dir();
+        char path[1200];
+        snprintf(path, sizeof(path), "%s/previews/madden_nfl_2005.mpg", dir ? dir : "");
+        FILE* f = dir && *dir ? fopen(path, "rb") : NULL;
+        known = f != NULL;
+        if (f) fclose(f);
+        if (!known) printf("uis: no trailers in replace\\previews (they come from the PS2 disc): Previews left out\n");
+    }
+    return known != 0;
+}
+
 static void uis_credits_list(CPUState* ctx) {
     if (!ctx->ram || ctx->ram_size < 0x01800000u) return;
-    if (uis_retext(ctx->ram, ctx->ram_size, "|Credits|Previews|Madden NFL 2005", "|Credits|Previews"))
+    if (uis_retext(ctx->ram, ctx->ram_size, "|Credits|Previews|Madden NFL 2005", have_trailers() ? "|Credits|Previews" : "|Credits"))
         printf("uis: Credits list: Madden NFL 2005 left out\n");
     /* Online hidden (g_online_menu): left off the end of the Game Modes list,
        so the entries before it keep their places and actions. (Comparing the
