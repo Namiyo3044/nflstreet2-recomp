@@ -945,6 +945,17 @@ static void toggle_custom_textures(void) {
     printf("window: custom textures %s\n", g_settings.custom_textures ? "on" : "off");
 }
 
+/* Shift+F5: the texture folder read again (files added, changed or removed),
+   custom textures staying on. */
+static void reload_custom_textures(void) {
+    if (!g_gpu || !hires_has_folder() || !g_settings.custom_textures) {
+        printf("window: custom textures are off (or no texture folder, or the software renderer): nothing to reload\n");
+        return;
+    }
+    gx_tex_reload_hires();
+    printf("window: custom textures reloaded\n");
+}
+
 static void open_menu_controls_setup(void) {
     static bool done;
     if (!done) {
@@ -1082,6 +1093,8 @@ static void poll_events(void) {
         case SDL_EVENT_KEY_DOWN:
             if (e.key.key == SDLK_F1 && !e.key.repeat) {
                 open_menu();
+            } else if (e.key.key == SDLK_F5 && !e.key.repeat && (e.key.mod & SDL_KMOD_SHIFT)) {
+                reload_custom_textures();
             } else if (e.key.key == SDLK_F5 && !e.key.repeat) {
                 toggle_custom_textures();
             } else if (e.key.key == SDLK_F6 && !e.key.repeat) {

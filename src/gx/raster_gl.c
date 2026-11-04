@@ -25,6 +25,7 @@ static int PX(u32 x) { return (int)((float)x * g_sx + 0.5f); }   /* native x to 
 static void (*g_make_current)(void);
 static bool g_ready;
 static GLuint g_prog, g_vao, g_vbo, g_ibo, g_ubo;
+static GLint g_u_solid;
 static GLuint g_fbo, g_color_tex, g_depth_tex;           /* the frame buffer at scale x native */
 static GLuint g_fbo_small, g_color_small, g_depth_small; /* native size, for read-back when scaled */
 static GLuint g_samplers[16];
@@ -83,6 +84,7 @@ static const char* k_fs =
     "};\n"
     "uniform sampler2D u_t0, u_t1, u_t2, u_t3, u_t4, u_t5, u_t6, u_t7,\n"
     "                  u_t8, u_t9, u_t10, u_t11, u_t12, u_t13, u_t14, u_t15;\n"
+    "uniform int u_solid;\n"
     "vec4 samp(int n, vec2 uv) {\n"
     "    switch (n) {\n"
     "    case 0: return texture(u_t0, uv);   case 1: return texture(u_t1, uv);\n"
@@ -157,6 +159,7 @@ static const char* k_fs =
     "        bool pass = g0.z == 0 ? (r0 && r1) : g0.z == 1 ? (r0 || r1) : g0.z == 2 ? (r0 != r1) : (r0 == r1);\n"
     "        if (!pass) discard;\n"
     "    }\n"
+    "    if (u_solid != 0 && o.a < 0.5) discard;\n"   /* (the depth pass of a solid_depth draw) */
     "    o_color = o;\n"
     "}\n";
 
@@ -210,6 +213,8 @@ static bool build_program(void) {
         snprintf(name, sizeof(name), "u_t%d", i);
         G(glUniform1i)(G(glGetUniformLocation)(g_prog, name), i);
     }
+    g_u_solid = G(glGetUniformLocation)(g_prog, "u_solid");
+    G(glUniform1i)(g_u_solid, 0);
     GLuint bi = G(glGetUniformBlockIndex)(g_prog, "State");
     if (bi == GL_INVALID_INDEX) {
         printf("gpu: shader has no State block\n");
@@ -981,9 +986,24 @@ void glr_run_list(const CmdList* l) {
                 apply_state(&l->states[cur]);
                 G(glBindBufferRange)(GL_UNIFORM_BUFFER, 0, g_ubo, (GLintptr)(ustride * cur), (GLsizeiptr)sizeof(GlState));
             }
+            const RenderState* rs = &l->states[cur];
+            bool solid = rs->solid_depth && rs->ztest && rs->zupdate;
+            if (solid) G(glDepthMask)(GL_FALSE);   /* the picture first, hiding nothing */
             G(glDrawElements)(GL_TRIANGLES, (GLsizei)run->count, GL_UNSIGNED_INT,
                               (const void*)(sizeof(u32) * (size_t)run->first));
             g_draw_calls++;
+            if (solid) {
+                /* then depth, from its mostly solid pixels only */
+                G(glDepthMask)(GL_TRUE);
+                G(glColorMask)(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                G(glUniform1i)(g_u_solid, 1);
+                G(glDrawElements)(GL_TRIANGLES, (GLsizei)run->count, GL_UNSIGNED_INT,
+                                  (const void*)(sizeof(u32) * (size_t)run->first));
+                g_draw_calls++;
+                G(glUniform1i)(g_u_solid, 0);
+                GLboolean c = rs->color_update ? GL_TRUE : GL_FALSE;
+                G(glColorMask)(c, c, c, rs->alpha_update ? GL_TRUE : GL_FALSE);
+            }
             continue;
         }
         const CopyCmd* cp = run->copy;

@@ -94,6 +94,7 @@ typedef struct {
     u32 zfunc, sfac, dfac, ntex;
     u32 cull;                          /* 0 none, 1 front (counter-clockwise on screen), 2 back, 3 all */
     bool spec_add;                     /* GPU: the second colour (a highlight) is added at the end */
+    bool solid_depth;                  /* only mostly solid pixels (alpha >= half) write depth (texture.c) */
 } RenderState;
 
 /* ----------------------------------------------------- command lists --- */
