@@ -78,6 +78,27 @@ param(
 $ErrorActionPreference = "Continue"
 Set-Location $PSScriptRoot
 
+# One game at a time: starting it again brings the running game's window to the
+# front instead. (Netplay tests run two copies on one PC: -NetHost, -Join and
+# -Online still start a second one.)
+$running = Get-Process nfls2 -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($running -and -not ($NetHost -or $Join -ne "" -or $Online)) {
+    Write-Host "The game is already running: switching to its window."
+    try {
+        Add-Type -Namespace Nfls2 -Name Win -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+'@
+        $h = $running.MainWindowHandle
+        if ($h -ne [IntPtr]::Zero) {
+            if ([Nfls2.Win]::IsIconic($h)) { [Nfls2.Win]::ShowWindow($h, 9) | Out-Null }   # (9: restore)
+            [Nfls2.Win]::SetForegroundWindow($h) | Out-Null
+        }
+    } catch { }
+    exit 0
+}
+
 # Build tools: a 64-bit Visual Studio environment (tools\vsenv.ps1).
 . (Join-Path $PSScriptRoot "tools\vsenv.ps1")
 
