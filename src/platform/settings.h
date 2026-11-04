@@ -34,7 +34,7 @@ typedef struct {
     int nintendo_labels;               /* 1: Nintendo-style controllers by their labels (A = A), 0: by position */
     int ps2_rain;                      /* The Alley's rain: 1 PS2 / Xbox (streaks, more drops, splashes), 0 as on GameCube, 2 off */
     int screen_filters;                /* 1: the game's colour filters over the picture in matches, 0: off */
-    int skip_intros;                   /* 1: boot straight to the title screen (intro movies fast-forwarded) */
+    int skip_intros;                   /* 0: every intro movie, 1: boot straight to the title screen (all skipped), 2: all but THX */
     int specular;                      /* highlights on lit models (graphics card only): 0 off (as on GameCube), 1 subtle, 2 accurate (PS2) */
     int net_delay;                     /* netplay: input delay in video fields (Online menu) */
     char net_address[64];              /* netplay: the last address joined */

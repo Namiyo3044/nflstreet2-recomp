@@ -97,7 +97,7 @@ static void movie_read_directory(void) {
 }
 #endif
 static u32 g_open_lines;
-static bool g_skip_intros;             /* --skip-thx: fast-forward through the THX intro movie */
+static bool g_skip_intros;             /* Skip Intro Videos: No THX Intro, or --skip-thx: fast-forward through the THX intro movie */
 static bool g_skip_all_intros;         /* Skip Intro Videos (settings): all of them, to the title screen */
 static u32 g_movie_opens;
 
@@ -1209,7 +1209,7 @@ static void usage(const char* argv0) {
             "         [--render-threads N (threads that draw frames; 0 = draw on the game thread)]\n"
             "         [--draw-log-at SECONDS (write two frames of draw calls and GPU state to drawlog.txt)]\n"
             "         [--window (play in a window at real-time speed)] [--scale N (window size, default 2)]\n"
-            "         [--skip-thx (window: skip the THX intro movie)]\n"
+            "         [--skip-thx | --show-thx (window: skip or keep the THX intro movie, whatever Skip Intro Videos says)]\n"
             "         [--replace DIR (files there are read instead of the disc's, e.g. DIR/moviedat.dat)]\n"
             "         [--memcard FILE (memory card image in slot A; created if missing)] [--memcard-readonly]\n"
             "         [--record-input FILE | --play-input FILE (controller answers, for repeatable runs)]\n"
@@ -1251,7 +1251,7 @@ static const char* net_fingerprint(void) {
     static char fp[512];
     int shape = g_net_aspect_arg >= 0 ? g_net_aspect_arg : g_settings.screen_shape;
     snprintf(fp, sizeof fp, "shape=%d rain=%d intros=%d thx=%d text=%08x colors=%08x idle=%d", shape,
-             g_settings.ps2_rain, g_settings.skip_intros ? 1 : 0, g_net_thx ? 1 : 0, file_hash(g_net_text),
+             g_settings.ps2_rain, g_settings.skip_intros, g_net_thx ? 1 : 0, file_hash(g_net_text),
              file_hash(g_net_colors), g_net_idle ? 1 : 0);
     return fp;
 }
@@ -1305,7 +1305,8 @@ int main(int argc, char** argv) {
             g_rain_style = g_settings.ps2_rain;
             g_screen_filters = g_settings.screen_filters;
             g_specular = g_settings.specular;
-            g_skip_all_intros = g_settings.skip_intros != 0;
+            g_skip_all_intros = g_settings.skip_intros == 1;
+            g_skip_intros = g_settings.skip_intros == 2;
             have_settings = true;
         }
     for (int i = 1; i < argc; i++) {
@@ -1363,6 +1364,8 @@ int main(int argc, char** argv) {
             sync_every = (unsigned)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--skip-thx") == 0) {
             g_skip_intros = true;
+        } else if (strcmp(argv[i], "--show-thx") == 0) {
+            g_skip_intros = false;
         } else if (strcmp(argv[i], "--no-idle-skip") == 0) {
             idle_skip = false;
         } else if (strcmp(argv[i], "--aspect") == 0 && i + 1 < argc) {

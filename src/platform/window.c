@@ -30,6 +30,7 @@
 #define TEX_H 576
 
 static SDL_Window* g_window;
+static void fit_window(int* w, int* h);
 static SDL_Renderer* g_renderer;
 static SDL_Texture* g_texture;
 /* Controllers, in the order they were connected: controller N plays as
@@ -334,7 +335,9 @@ static void update_aspect(bool announce) {
     if (changed && !g_fullscreen && !(SDL_GetWindowFlags(g_window) & SDL_WINDOW_MAXIMIZED)) {
         int w, h;
         SDL_GetWindowSize(g_window, &w, &h);
-        SDL_SetWindowSize(g_window, (int)((float)h * aspect + 0.5f), h);
+        w = (int)((float)h * aspect + 0.5f);
+        fit_window(&w, &h);
+        SDL_SetWindowSize(g_window, w, h);
     }
 }
 
@@ -402,6 +405,28 @@ static bool gpu_setup(void) {
     return true;
 }
 
+/* A window size that fits the screen: the size asked for, shrunk (same
+   shape) if it's bigger than the screen's free area less room for the
+   title bar. The setting itself is kept, e.g. 1080 lines on a 1080p
+   screen opens a little smaller. */
+static void fit_window(int* w, int* h) {
+    SDL_DisplayID d = g_window ? SDL_GetDisplayForWindow(g_window) : 0;
+    if (!d) d = SDL_GetPrimaryDisplay();
+    SDL_Rect r;
+    if (!d || !SDL_GetDisplayUsableBounds(d, &r) || r.w <= 0 || r.h <= 0) return;
+    int max_w = r.w - 16, max_h = r.h - 48;
+    if (max_w < 320 || max_h < 240) return;
+    float k = 1.0f;
+    if (*w > max_w) k = (float)max_w / (float)*w;
+    if (*h * k > max_h) k = (float)max_h / (float)*h;
+    if (k < 1.0f) {
+        printf("window: %dx%d doesn't fit the screen (%dx%d free): opening at %dx%d\n", *w, *h, r.w, r.h,
+               (int)(*w * k + 0.5f), (int)(*h * k + 0.5f));
+        *w = (int)(*w * k + 0.5f);
+        *h = (int)(*h * k + 0.5f);
+    }
+}
+
 static void bindings_resolve(void);
 
 bool window_open(int height) {
@@ -424,6 +449,7 @@ bool window_open(int height) {
     bool start_wide = g_aspect_mode >= 2 || (g_aspect_mode == 0 && g_saved_wide == 1);
     float start_aspect = g_aspect_mode == 4 ? 32.0f / 9.0f : g_aspect_mode == 3 ? 21.0f / 9.0f : start_wide ? 16.0f / 9.0f : 4.0f / 3.0f;
     int win_h = height, win_w = (int)((float)height * start_aspect + 0.5f);
+    fit_window(&win_w, &win_h);
     if (g_gpu_scale > 0) {
         g_window = SDL_CreateWindow("NFL Street 2 Recomp v" NFLS2_VERSION, win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_OPENGL);
         if (g_window && gpu_setup()) {
@@ -901,7 +927,9 @@ static void set_window_size(void) {
     if (g_fullscreen) return;
     if (SDL_GetWindowFlags(g_window) & SDL_WINDOW_MAXIMIZED) SDL_RestoreWindow(g_window);
     int h = settings_window_height(g_settings.window_size);
-    SDL_SetWindowSize(g_window, (int)((float)h * g_aspect + 0.5f), h);
+    int w = (int)((float)h * g_aspect + 0.5f);
+    fit_window(&w, &h);
+    SDL_SetWindowSize(g_window, w, h);
     SDL_SetWindowPosition(g_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 }
 

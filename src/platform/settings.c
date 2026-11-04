@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-Settings g_settings = {0, 4, 0, 0, 3, 1, {0}, {0}, 0, 1, 1, 1, 0, 0, 3, ""};
+Settings g_settings = {0, 3, 0, 0, 4, 1, {0}, {0}, 0, 1, 1, 1, 0, 0, 3, ""};
 
 const char* const k_gc_input_names[GCI_COUNT] = {
     "a", "b", "x", "y", "z", "start", "l", "r",
@@ -46,7 +46,7 @@ bool settings_load(const char* path) {
         else if (strcmp(key, "nintendo_labels") == 0) s->nintendo_labels = atoi(val) != 0;
         else if (strcmp(key, "ps2_rain") == 0) { int v = atoi(val); s->ps2_rain = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (strcmp(key, "screen_filters") == 0) s->screen_filters = atoi(val) != 0;
-        else if (strcmp(key, "skip_intros") == 0) s->skip_intros = atoi(val) != 0;
+        else if (strcmp(key, "skip_intros") == 0) { int v = atoi(val); s->skip_intros = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (strcmp(key, "specular") == 0) { int v = atoi(val); s->specular = v < 0 ? 0 : v > 2 ? 2 : v; }
         else if (strcmp(key, "discord") == 0) s->no_discord = atoi(val) == 0;
         else if (strcmp(key, "rumble") == 0) s->no_rumble = atoi(val) == 0;

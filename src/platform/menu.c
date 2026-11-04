@@ -690,7 +690,7 @@ const char* const k_recomp_label[MENU_RECOMP_ROWS] = {"The Alley Rain", "Screen 
                                                       "Specular Highlights", "Nintendo Buttons",
                                                       "Skip Intro Videos", "Discord Status"};
 
-int menu_recomp_row_count(int row) { return row == RR_SPECULAR || row == RR_RAIN ? 3 : 2; }
+int menu_recomp_row_count(int row) { return row == RR_SPECULAR || row == RR_RAIN || row == RR_INTROS ? 3 : 2; }
 
 /* The rain row shows Off, GameCube, PS2/Xbox; the setting keeps 0 GameCube,
    1 PS2/Xbox (its old meanings) and 2 off. */
@@ -701,7 +701,7 @@ int menu_recomp_row_get(int row) {
     case RR_RAIN: return g_settings.ps2_rain == 2 ? 0 : g_settings.ps2_rain == 1 ? 2 : 1;
     case RR_FILTERS: return g_settings.screen_filters ? 1 : 0;
     case RR_TEXTURES: return g_settings.custom_textures ? 1 : 0;
-    case RR_INTROS: return g_settings.skip_intros ? 1 : 0;
+    case RR_INTROS: return g_settings.skip_intros == 1 ? 2 : g_settings.skip_intros == 2 ? 1 : 0;   /* (Off, No THX Intro, On) */
     case RR_DISCORD: return g_settings.no_discord ? 0 : 1;
     case RR_SPECULAR: return g_settings.specular;
     default: return g_settings.nintendo_labels ? 0 : 1;
@@ -732,7 +732,7 @@ void menu_recomp_row_set(int row, int v) {
         g_settings.custom_textures = v != 0;
         g_changes |= 1u << MI_TEXTURES;
         break;
-    case RR_INTROS: g_settings.skip_intros = v != 0; g_changes |= 1u << MI_COUNT; break;
+    case RR_INTROS: g_settings.skip_intros = v >= 2 ? 1 : v == 1 ? 2 : 0; g_changes |= 1u << MI_COUNT; break;
     case RR_DISCORD:
         g_settings.no_discord = v == 0;
         discord_enable(v != 0);
@@ -760,7 +760,8 @@ const char* menu_recomp_row_name(int row, int v) {
     switch (row) {
     case RR_RAIN: return v == 2 ? "PS2/Xbox" : v == 1 ? "GameCube" : "Off";
     case RR_FILTERS: return v ? "On" : "Off (Unstable)";
-    case RR_INTROS: case RR_DISCORD: return v ? "On" : "Off";
+    case RR_INTROS: return v == 2 ? "On" : v == 1 ? "No THX Intro" : "Off";
+    case RR_DISCORD: return v ? "On" : "Off";
     case RR_SPECULAR: return v == 2 ? "Accurate" : v == 1 ? "Subtle" : "Off";
     case RR_TEXTURES: return !g_info.textures_found ? "None Found" : v ? "On" : "Off";
     default: return v ? "By Position" : "By Label";
@@ -772,9 +773,9 @@ const char* menu_recomp_row_help(int row) {
     case RR_RAIN: return "PS2/Xbox: more rain, with streaks and splashes.";
     case RR_FILTERS: return "Color tint in matches. Off is unstable: it may flash.";
     case RR_TEXTURES: return "Use the replacement textures folder.";
-    case RR_INTROS: return "Hides and skips the intro videos. Applies next start.";
+    case RR_INTROS: return "No THX Intro skips just THX; On skips all. Next start.";
     case RR_DISCORD: return "Shows what you're playing on your Discord profile.";
-    case RR_SPECULAR: return "Shiny highlights on players. Accurate: as on PS2.";
+    case RR_SPECULAR: return "Shiny highlights on players. Accurate: as on PS2/Xbox.";
     default: return "For Nintendo pads: A/B/X/Y by label or position.";
     }
 }
