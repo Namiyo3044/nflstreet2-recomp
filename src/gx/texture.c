@@ -566,9 +566,46 @@ static void index_rebuild(void) {
 
 /* Looks up a custom replacement for a freshly decoded texture (hashed the
    way Dolphin does: level 0 as it sits in RAM, or in TMEM when preloaded). */
+/* Textures whose see-through parts would hide what's drawn behind them:
+   the game draws them blended but writing depth wherever there's any
+   opacity at all, so the faint edges of a chain-link fence (and its whole
+   mesh once shrunk with distance) cut whatever comes later out of the
+   picture (on every console, too). The renderers let only their mostly
+   solid pixels write depth. By Dolphin texture name (all mipmapped CMPR,
+   all in The Cage). */
+static const struct { u32 w, h; u64 hash; } k_solid_depth[] = {
+    {256, 128, 0x28f70c0f458f47f2ull},   /* The Cage: the chain-link fence */
+    {32, 64, 0x5c9ba9d8cf9c6ad2ull},
+    {256, 128, 0x65acb4b60839d3d1ull},
+    {64, 32, 0x09c97428e2f341e1ull},
+    {128, 128, 0x6508d28814c12cbfull},
+};
+
+static void mark_solid_depth(CacheEntry* e, const u8* src, bool preloaded, u32 even, u32 mode0) {
+    e->tex.solid_depth = false;
+    if (e->fmt != FMT_CMPR || !src || !((mode0 >> 5) & 3u)) return;
+    u32 size0 = gx_tex_size(e->fmt, e->w, e->h);
+    if (preloaded && even + size0 > TMEM_SIZE) return;   /* (hashed from TMEM then, as Dolphin does) */
+    u64 h = 0;
+    static bool seen[sizeof k_solid_depth / sizeof *k_solid_depth];
+    for (size_t i = 0; i < sizeof k_solid_depth / sizeof *k_solid_depth; i++) {
+        if (k_solid_depth[i].w != e->w || k_solid_depth[i].h != e->h) continue;
+        if (!h) h = hires_xxh64(src, size0);
+        if (h == k_solid_depth[i].hash) {
+            e->tex.solid_depth = true;
+            if (!seen[i]) {
+                seen[i] = true;
+                printf("textures: see-through fix on tex1_%ux%u_m_%016llx_14\n", e->w, e->h, (unsigned long long)h);
+            }
+            return;
+        }
+    }
+}
+
 static void attach_hires(CacheEntry* e, const u8* src, bool preloaded, u32 even, u32 mode0) {
     e->tex.hires = NULL;
     e->tex.hires_entry = NULL;
+    mark_solid_depth(e, src, preloaded, even, mode0);
     if (!hires_active())
         return;
     u32 fmt = e->fmt, w = e->w, h = e->h;
@@ -711,6 +748,7 @@ static const GxTexture* tex_get(CPUState* cpu, u32 map) {
             e->full_hash = size > 16384u ? hash_bytes(src, size) : 0;
             e->tex.hires = NULL;           /* drawn by the GPU: never replaced */
             e->tex.hires_entry = NULL;
+            e->tex.solid_depth = false;
             g_decodes++;
             return &e->tex;
         } else {

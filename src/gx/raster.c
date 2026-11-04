@@ -1596,6 +1596,7 @@ static void snapshot_state(RenderState* ds) {
                 u32 mode1 = gx_bp[(texmap < 4 ? 0x84u : 0xA4u) + (texmap & 3u)];
                 s->texels = tex->texels;
                 s->hires = g_gpu && hires_enabled() ? tex->hires : NULL;
+                if (tex->solid_depth) ds->solid_depth = true;
                 s->tw = tex->width;
                 s->th = tex->height;
                 s->wrap_s = mode0 & 3u;
@@ -2020,7 +2021,7 @@ static void draw_triangle(const RenderState* ds, float (*rows)[4], const SVtx* a
             if (ds->alpha_update)
                 o = (o & 0x00FFFFFFu) | (to_u8(al) << 24);
             crow[x] = o;
-            if (ds->ztest && ds->zupdate)
+            if (ds->ztest && ds->zupdate && (!ds->solid_depth || out[3] >= 0.5f))
                 zrow[x] = z;
         }
     }

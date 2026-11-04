@@ -22,6 +22,7 @@ typedef struct {
     u32 off[GX_TEX_MAX_LEVELS];  /* texel offset of each level in texels */
     const GxHires* hires;  /* custom replacement, once loaded (GPU renderer only) */
     HiresEntry* hires_entry;
+    bool solid_depth;      /* only its mostly solid pixels should write depth (texture.c) */
 } GxTexture;
 
 /* Texture register mode 0 stores the minification filter as a mip mode
