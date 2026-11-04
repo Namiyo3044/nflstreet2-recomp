@@ -14,7 +14,7 @@ lives outside this repo and is ignored by `.gitignore`.
   (`.iso` / `.gcm`) or a folder from Dolphin's *Extract Entire Disc*. Compressed `.rvz` / `.ciso`
   images: convert them to `.iso` in Dolphin first (right-click the game, *Convert File*).
 - **Windows 10 or 11**, 64-bit.
-- **Build Tools for Visual Studio 2022** (free, from
+- **Build Tools for Visual Studio 2022** (the launcher installs it for you; or free, from
   [visualstudio.microsoft.com/downloads](https://visualstudio.microsoft.com/downloads/)), with the
   *Desktop development with C++* workload and, in its options, **C++ Clang tools for Windows**.
   (A full Visual Studio 2022 with the same pieces works too, as does a separate
@@ -23,24 +23,31 @@ lives outside this repo and is ignored by `.gitignore`.
 
 ## Setup (once)
 
-Double-click **`setup.bat`** and pick your disc image (`.iso`, `.gcm` or `.nkit.iso`) in the window
-that opens. Compressed `.rvz` / `.ciso` images need converting to `.iso` in Dolphin first
-(right-click the game, Convert File). Or, in PowerShell in this folder:
+Double-click **`Launcher.bat`**. Its window takes you through it:
+
+1. **Install Build Tools**, if they aren't there yet (Microsoft's free C++ compiler, which builds
+   the port on your PC; about 6 GB, installed for you with winget).
+2. **Browse...** for your disc image (`.iso`, `.gcm` or `.nkit.iso`). Compressed `.rvz` / `.ciso`
+   images need converting to `.iso` in Dolphin first (right-click the game, Convert File).
+3. **Set Up**. It unpacks the disc into `C:\nfls2\disc`, checks it's the right version, downloads
+   and builds [DolRecomp](https://github.com/expansionpak/dolrecomp), recompiles the game's code
+   from your own `main.dol` into `C:\nfls2\recomp`, and builds the port with an icon made from your
+   disc's own banner. The first set up takes several minutes. It also puts an
+   **NFL Street 2 Recomp** shortcut on the desktop (untick the box to skip it).
+4. **Play**.
+
+The same set up without the window, in PowerShell in this folder (`setup.bat` also works):
 
 ```powershell
 .\setup.ps1 -Disc "D:\Games\NFL Street 2.iso"
 ```
 
-It unpacks the disc into `C:\nfls2\disc`, checks it's the right version, downloads and builds
-[DolRecomp](https://github.com/expansionpak/dolrecomp), recompiles the game's code from your own
-`main.dol` into `C:\nfls2\recomp`, and builds the port with an icon made from your disc's own
-banner. The first build takes several minutes. At the end it puts an **NFL Street 2 Recomp**
-shortcut on the desktop (`-NoShortcut` to skip it).
-Running it again only does what's missing. `-Root D:\nfls2` puts all of it somewhere else.
+Running it again only does what's missing. `-Root D:\nfls2` puts all of it somewhere else,
+`-NoShortcut` skips the shortcut.
 
 ## Play
 
-Double-click the desktop shortcut or **`play.bat`**, or in PowerShell:
+Double-click the desktop shortcut, **Play** in the launcher or **`play.bat`**, or in PowerShell:
 
 ```powershell
 .\play.ps1
