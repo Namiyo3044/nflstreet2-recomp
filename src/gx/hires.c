@@ -22,6 +22,13 @@
 #define BCDEC_STATIC
 #include "third_party/bcdec.h"
 
+static char* dup_str(const char* s) {   /* (strdup, without Windows' deprecation warning) */
+    size_t n = strlen(s) + 1;
+    char* d = (char*)malloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+
 /* ------------------------------------------------------------- XXH64 --- */
 #define P1 0x9E3779B185EBCA87ull
 #define P2 0xC2B2AE3D27D4EB4Full
@@ -179,7 +186,7 @@ static HiresEntry* tab_get(const char* key, bool create) {
         s = tab_slot(key);
     }
     HiresEntry* e = (HiresEntry*)calloc(1, sizeof(*e));
-    e->key = strdup(key);
+    e->key = dup_str(key);
     *s = e;
     g_tab_n++;
     return e;
@@ -660,7 +667,7 @@ static bool dumped_add(const char* name) {
         if (strcmp(g_dumped_set[k], name) == 0) return false;
         k = (k + 1) & (g_dumped_cap - 1);
     }
-    g_dumped_set[k] = strdup(name);
+    g_dumped_set[k] = dup_str(name);
     g_dumped_n++;
     return true;
 }

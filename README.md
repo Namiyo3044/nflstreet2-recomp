@@ -23,8 +23,9 @@ lives outside this repo and is ignored by `.gitignore`.
 
 ## Setup (once)
 
-Double-click **`setup.bat`** and, when it asks, drag your disc image onto its window. Or, in
-PowerShell in this folder:
+Double-click **`setup.bat`** and pick your disc image (`.iso`, `.gcm` or `.nkit.iso`) in the window
+that opens. Compressed `.rvz` / `.ciso` images need converting to `.iso` in Dolphin first
+(right-click the game, Convert File). Or, in PowerShell in this folder:
 
 ```powershell
 .\setup.ps1 -Disc "D:\Games\NFL Street 2.iso"

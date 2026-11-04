@@ -2,7 +2,7 @@
 #
 #   .\setup.ps1 -Disc D:\Games\NFL Street 2.iso     (a .iso / .gcm image of the disc)
 #   .\setup.ps1 -Disc D:\nfls2-extracted             (or a folder from Dolphin's "Extract Entire Disc")
-#   .\setup.ps1                                      (the disc already unpacked in C:\nfls2\disc; otherwise it asks)
+#   .\setup.ps1                                      (the disc already unpacked in C:\nfls2\disc; otherwise a window asks for it)
 #   setup.bat                                        (the same, by double-clicking it)
 #
 # What it does, each step only if it isn't done yet:
@@ -28,6 +28,7 @@ Set-Location $PSScriptRoot
 
 # DolRecomp, at the version this port is built and tested against.
 $DolRecompCommit = "02e27aca1c408cfcb2a4079a3a5b5ab3ae39d340"
+$TomlCommit = "8d3766ddafa6515417f4885ae6878ef69fac401e"         # (DolRecomp's tomlc17 submodule at that version)
 $DolSha1 = "3561e946e9ff785b68692f87d2ba85d81fd2dcf4"   # NFL Street 2, GameCube, USA (GN7E69), rev 0
 
 function Step($text) { Write-Host ""; Write-Host "== $text" -ForegroundColor Cyan }
@@ -54,10 +55,24 @@ Write-Host "cmake, ninja, cl and clang-cl found."
 Step "Game disc"
 $extract = Join-Path $toolsDir "nfls2_discextract.exe"
 if ($Disc -eq "" -and -not (Test-Path (Join-Path $discDir "sys\main.dol"))) {
-    Write-Host "Where is your NFL Street 2 disc? Drag the .iso (or the extracted disc folder) onto this window, then press Enter."
-    $Disc = (Read-Host "Disc").Trim().Trim('"')
+    Write-Host "Pick your NFL Street 2 disc image (.iso / .gcm / .nkit.iso) in the window that opens..."
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Title = "Pick your NFL Street 2 (GameCube) disc image"
+        $dlg.Filter = "GameCube disc images (*.iso;*.gcm)|*.iso;*.gcm|All files (*.*)|*.*"
+        $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }   # (keeps the picker in front)
+        if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $Disc = $dlg.FileName }
+        $owner.Dispose()
+    } catch { }
+    if ($Disc -eq "") {
+        Write-Host "No file picked. Drag the .iso (or a folder from Dolphin's 'Extract Entire Disc') onto this window, then press Enter."
+        $Disc = (Read-Host "Disc").Trim().Trim('"')
+    }
     if ($Disc -eq "") { Fail "No disc given." }
+    Write-Host "Disc: $Disc"
 }
+if ($Disc -ne "" -and -not (Test-Path $Disc)) { Fail "$Disc doesn't exist: check the path (or leave out -Disc to pick the file in a window)." }
 if ($Disc -ne "" -and (Test-Path $Disc -PathType Leaf)) {
     if ($Disc -notmatch '\.(iso|gcm)$') { Fail "$Disc isn't a .iso / .gcm image (convert .rvz / .ciso to .iso in Dolphin: right-click the game, Convert File)." }
     if (-not (Test-Path $extract) -or (Get-Item $extract).LastWriteTime -lt (Get-Item "tools\discextract.c").LastWriteTime) {
@@ -107,6 +122,23 @@ if (-not (Test-Path (Join-Path $drDir "src\cpu\cpu.c"))) {
     Remove-Item -Recurse -Force $tmp, $zip
 } else {
     Write-Host "Using the DolRecomp already in $drDir."
+}
+# GitHub's zip downloads leave out submodules: fetch DolRecomp's one (tomlc17) the same way.
+$tomlDir = Join-Path $drDir "extern\tomlc17"
+if (-not (Test-Path (Join-Path $tomlDir "src\tomlc17.c"))) {
+    $zip = Join-Path $toolsDir "tomlc17.zip"
+    Write-Host "Downloading tomlc17 ($($TomlCommit.Substring(0, 7))), which DolRecomp uses..."
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        Invoke-WebRequest -UseBasicParsing "https://github.com/cktan/tomlc17/archive/$TomlCommit.zip" -OutFile $zip
+    } catch { Fail "Couldn't download tomlc17: $($_.Exception.Message)" }
+    $tmp = Join-Path $toolsDir "tomlc17-unpack"
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    Expand-Archive $zip -DestinationPath $tmp
+    if (Test-Path $tomlDir) { Remove-Item -Recurse -Force $tomlDir }   # (the empty submodule folder)
+    New-Item -ItemType Directory -Force -Path (Split-Path $tomlDir) | Out-Null
+    Move-Item (Get-ChildItem $tmp | Select-Object -First 1).FullName $tomlDir
+    Remove-Item -Recurse -Force $tmp, $zip
 }
 $drExe = Join-Path $drDir "build\dolrecomp.exe"
 $drRelease = Join-Path $drDir "build\Release\dolrecomp.exe"   # (a Visual Studio-generator build of your own)
