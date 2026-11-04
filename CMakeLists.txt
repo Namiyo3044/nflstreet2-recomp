@@ -46,10 +46,15 @@ if(NFLS2_DIRECT_CALLS)
         get_filename_component(n "${c}" NAME)
         list(APPEND NFLS2_DIRECT_CHUNKS "${NFLS2_DIRECT_DIR}/${n}")
     endforeach()
+    # The chunks' paths go to the tool in a list file: on the command line,
+    # 160-odd long paths (with spaces, in some install folders) broke it on Windows.
+    string(REPLACE ";" "\n" NFLS2_CHUNK_LINES "${NFLS2_CHUNKS}")
+    file(WRITE "${CMAKE_BINARY_DIR}/directcalls_inputs.tmp" "${NFLS2_CHUNK_LINES}\n")
+    configure_file("${CMAKE_BINARY_DIR}/directcalls_inputs.tmp" "${CMAKE_BINARY_DIR}/directcalls_inputs.txt" COPYONLY)
     add_custom_command(
         OUTPUT ${NFLS2_DIRECT_CHUNKS}
-        COMMAND nfls2_directcalls "${NFLS2_DIRECT_DIR}" ${NFLS2_CHUNKS}
-        DEPENDS nfls2_directcalls ${NFLS2_CHUNKS} "${CMAKE_CURRENT_SOURCE_DIR}/tools/directcalls.c"
+        COMMAND nfls2_directcalls "${NFLS2_DIRECT_DIR}" "@${CMAKE_BINARY_DIR}/directcalls_inputs.txt"
+        DEPENDS nfls2_directcalls ${NFLS2_CHUNKS} "${CMAKE_BINARY_DIR}/directcalls_inputs.txt" "${CMAKE_CURRENT_SOURCE_DIR}/tools/directcalls.c"
         COMMENT "Making the calls between chunks direct"
         VERBATIM)
     set(NFLS2_CHUNKS ${NFLS2_DIRECT_CHUNKS})

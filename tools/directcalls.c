@@ -325,11 +325,30 @@ int main(int argc, char** argv) {
         return 1;
     }
     const char* out_dir = argv[1];
-    g_nchunks = (size_t)(argc - 2);
+    /* The chunks: given one by one, or "@list" (a file of their paths, one a
+       line), which keeps the command short whatever the paths are: 160-odd
+       long paths with spaces broke the build command on Windows. */
+    char** paths = argv + 2;
+    size_t npaths = (size_t)(argc - 2);
+    if (argc == 3 && argv[2][0] == '@') {
+        size_t len = 0;
+        char* list = read_all(argv[2] + 1, &len);
+        if (!list) { fprintf(stderr, "directcalls: can't read the list %s\n", argv[2] + 1); return 1; }
+        size_t cap = 256;
+        paths = (char**)malloc(cap * sizeof(char*));
+        npaths = 0;
+        for (char* line = strtok(list, "\r\n"); line; line = strtok(NULL, "\r\n")) {
+            if (!*line) continue;
+            if (npaths == cap) { cap *= 2; paths = (char**)realloc(paths, cap * sizeof(char*)); }
+            paths[npaths++] = line;
+        }
+        if (!npaths) { fprintf(stderr, "directcalls: the list %s is empty\n", argv[2] + 1); return 1; }
+    }
+    g_nchunks = npaths;
     g_chunks = (Chunk*)calloc(g_nchunks, sizeof(Chunk));
     for (size_t i = 0; i < g_nchunks; i++) {
         Chunk* c = &g_chunks[i];
-        c->path = argv[i + 2];
+        c->path = paths[i];
         c->text = read_all(c->path, &c->len);
         if (!c->text) { fprintf(stderr, "directcalls: can't read %s\n", c->path); return 1; }
         if (!scan_chunk(c)) c->start = 0xFFFFFFFFu;   /* (no main function found: left as it is, never a target) */
