@@ -53,6 +53,8 @@ void window_online_request(void);
    files in `dir`: available once those are there (and the graphics card
    renderer is in use). The request shows them, the game standing still. */
 void window_set_ps2_dir(const char* dir);
+/* --perf-log: the per-second "perf:" lines every second, even at full speed (for measuring) */
+void window_set_perf_log(bool on);
 bool window_ps2_online_available(void);
 void window_ps2_online_request(void);
 /* After the window closed: true (once) if it closed to restart the game for

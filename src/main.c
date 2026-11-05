@@ -21,6 +21,7 @@
 #include "platform/settings.h"
 #include "audio/ax_hle.h"
 #include "runtime/mmio.h"
+#include "gx/front.h"
 #include "runtime/symbols.h"
 #include "runtime/prof.h"
 #include "runtime/interp.h"
@@ -875,7 +876,32 @@ static void direct_hook(u32 address) {
     g_nfls2_direct_off[w >> 3] |= (unsigned char)(1u << (w & 7u));
 }
 
+/* The game draws its rain a box at a time (16 x 16 x 8, tiled over the
+   camera's view, by 0x801A7880) but stops after 22 boxes in a frame (the
+   count at 0x803ECC2C, bumped by the box function 0x801A74BC after each box
+   and checked before the next), so with a wide view the far or high boxes
+   went missing and rain stopped in mid-air. With the PS2 / Xbox rain in a
+   match, the count is set back as each box draws its drops (0x801A6870 or
+   0x801A6924, called only from the box function, just before the count is
+   bumped; in another chunk, so the call comes through here, unlike a call
+   to the box function itself), so every box in view is drawn. How many of a box's 96 drops are drawn is worked out each frame
+   from the rain's strength (0x801A7784: strength x 96, at 0x803EB858), which
+   keeps The Alley at a handful; RAIN_DROPS of them are drawn instead (all
+   96 always move). (This was done as the renderer decoded each raindrop,
+   which with the graphics thread happens later than the game's check.) */
+#define RAIN_DROPS_FN_A 0x801A6870u
+#define RAIN_DROPS_FN_B 0x801A6924u
+static void rain_box_drops(CPUState* ctx) {
+    if (g_rain_style != 1 || !gx_raster_match() || ctx->ram_size <= 0x003ECC30u)
+        return;
+    u8* cnt = ctx->ram + 0x003ECC2Cu;
+    cnt[0] = cnt[1] = cnt[2] = cnt[3] = 0;
+    u8* num = ctx->ram + 0x003EB858u;
+    num[0] = num[1] = num[2] = 0; num[3] = RAIN_DROPS;
+}
+
 int dolrecomp_dispatch_replacement(CPUState* ctx, u32 address) {
+    if (address == RAIN_DROPS_FN_A || address == RAIN_DROPS_FN_B) rain_box_drops(ctx);
     if (g_watch_n) watch_check(ctx, address);
     if (address == UIS_NATIVE_DISPATCH && uis_native_hook(ctx)) return 1;
     if (address == LOD_AREA_FN && false && lod_area_hook(ctx)) return 1;   /* not reached for calls inside the engine; see lodfix.c */
@@ -1225,6 +1251,7 @@ static void usage(const char* argv0) {
             "         [--render-threads N (threads that draw frames; 0 = draw on the game thread)]\n"
             "         [--draw-log-at SECONDS (write two frames of draw calls and GPU state to drawlog.txt)]\n"
             "         [--window (play in a window at real-time speed)] [--scale N (window size, default 2)]\n"
+            "         [--no-gx-thread (graphics commands decoded on the game thread) | --perf-log (perf lines every second)]\n"
             "         [--skip-thx | --show-thx (window: skip or keep the THX intro movie, whatever Skip Intro Videos says)]\n"
             "         [--replace DIR (files there are read instead of the disc's, e.g. DIR/moviedat.dat)]\n"
             "         [--memcard FILE (memory card image in slot A; created if missing)] [--memcard-readonly]\n"
@@ -1294,6 +1321,7 @@ int main(int argc, char** argv) {
     int aspect_mode = 0;
     bool have_settings = false;
     bool idle_skip = true;
+    bool gx_thread = true;             /* --no-gx-thread: graphics decoding on the game thread */
     const char* memcard_path = NULL;
     const char* record_input = NULL;   /* netsync: repeatable runs */
     const char* play_input = NULL;
@@ -1382,6 +1410,12 @@ int main(int argc, char** argv) {
             g_skip_intros = true;
         } else if (strcmp(argv[i], "--show-thx") == 0) {
             g_skip_intros = false;
+        } else if (strcmp(argv[i], "--no-gx-thread") == 0) {
+            gx_thread = false;
+        } else if (strcmp(argv[i], "--perf-log") == 0) {
+#ifdef NFLS2_HAVE_WINDOW
+            window_set_perf_log(true);
+#endif
         } else if (strcmp(argv[i], "--no-idle-skip") == 0) {
             idle_skip = false;
         } else if (strcmp(argv[i], "--aspect") == 0 && i + 1 < argc) {
@@ -1480,6 +1514,8 @@ int main(int argc, char** argv) {
     direct_hook(g_dvd_path);
     direct_hook(g_dvd_read);
     direct_hook(g_dvd_close);
+    direct_hook(RAIN_DROPS_FN_A);
+    direct_hook(RAIN_DROPS_FN_B);
     g_direct_default = !(g_no_direct || g_debug || g_watch_n || g_lod_log || g_cardtrace || g_trace_at > 0);
     g_nfls2_direct_on = g_direct_default;
     printf("NFL Street 2 Recomp v" NFLS2_VERSION "\n");
@@ -1569,6 +1605,21 @@ int main(int argc, char** argv) {
     mmio_install(&cpu);
     if (memcard_path && !exi_insert_memcard(0, memcard_path))
         fprintf(stderr, "warning: running without a memory card\n");
+#ifdef NFLS2_HAVE_WINDOW
+    /* The graphics thread (gx/front.h): with the graphics card renderer, and
+       not where the timing must match exactly (netplay, recordings) or
+       every frame is logged. */
+    if (want_window && gpu_scale && gx_raster_gpu_name()[0]) {
+        const char* off = !gx_thread ? "--no-gx-thread"
+                        : (net_host || net_join || g_online_menu) ? "netplay"
+                        : (play_input || record_input || sync_log) ? "input recording"
+                        : (draw_log || dump_every || xfb_every || g_debug) ? "a debug option is on" : NULL;
+        if (off)
+            printf("graphics thread: off (%s)\n", off);
+        else if (!gx_front_start(&cpu))
+            printf("graphics thread: couldn't be started; decoding on the game thread\n");
+    }
+#endif
     if (play_input && !netsync_play(play_input))
         return 1;
     if (record_input && !play_input && !netsync_record(record_input))
@@ -1645,6 +1696,12 @@ int main(int argc, char** argv) {
            instead of spinning (the game sees exactly the same timing). */
         if (idle_skip && idle_lo && cpu.pc >= idle_lo && cpu.pc < idle_hi && (cpu.msr & 0x8000u) &&
             mem_read32(&cpu, 0x800000E4u) == 0 && !any_thread_ready(&cpu)) {
+            /* (the graphics thread still busy: wait for it first, the game
+               may be waiting for exactly that; then look again) */
+            if (gx_front_idle_sync()) {
+                interrupts_poll(&cpu);
+                continue;
+            }
             u64 next = interrupts_next_event();
             if (next > cpu.timebase && next != ~0ull) {
                 g_idle_ticks += next - cpu.timebase;
@@ -1748,6 +1805,7 @@ int main(int argc, char** argv) {
     netplay_report();
     netplay_close();
     gx_fifo_report();
+    gx_front_report();
     gx_raster_report();
     disc_report();
     ax_hle_report();

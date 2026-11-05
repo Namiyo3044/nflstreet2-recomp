@@ -1,3 +1,4 @@
+#include "gx/front.h"
 #include "version.h"
 #include "runtime/netplay.h"
 #include "runtime/prof.h"
@@ -30,6 +31,7 @@
 #define TEX_H 576
 
 static SDL_Window* g_window;
+static bool g_perf_log;               /* --perf-log: perf lines every second */
 static void fit_window(int* w, int* h);
 static SDL_Renderer* g_renderer;
 static SDL_Texture* g_texture;
@@ -953,6 +955,7 @@ static void apply_settings(unsigned ch) {
         update_players_text();
     }
     if (ch & (1u << MI_TEXTURES)) {
+        gx_front_sync();               /* (the graphics thread uses the texture cache) */
         /* Turning them on picks up files added, changed or removed since. */
         if (g_settings.custom_textures && !hires_enabled())
             gx_tex_reload_hires();
@@ -980,6 +983,7 @@ static void reload_custom_textures(void) {
         printf("window: custom textures are off (or no texture folder, or the software renderer): nothing to reload\n");
         return;
     }
+    gx_front_sync();                   /* (the graphics thread uses the texture cache) */
     gx_tex_reload_hires();
     printf("window: custom textures reloaded\n");
 }
@@ -1628,13 +1632,15 @@ static void pace_and_stats(void) {
         char busiest[256];
         prof_since(sec_mark, busiest, sizeof busiest);
         sec_mark = prof_mark();
-        if (speed < 95.0 || turbo()) {   /* (fast-forward too: how fast it goes, and what holds it back) */
+        if (speed < 95.0 || turbo() || g_perf_log) {   /* (fast-forward too: how fast it goes, and what holds it back) */
             double slept = (double)g_slept_ns * 1e-9, shown = (double)g_present_ns * 1e-9;
             double game = secs - slept - shown - wait;
             printf("perf: %5.1f s game time, %3.0f%% speed, %2.0f fps | per second: game code %3.0f ms, waiting for "
-                   "renderer %3.0f ms, showing %2.0f ms | frame draw avg %4.1f ms, worst %4.1f ms, %u triangles/frame\n",
+                   "renderer %3.0f ms, showing %2.0f ms | frame draw avg %4.1f ms, worst %4.1f ms, %u triangles/frame",
                    interrupts_game_seconds(), speed, fps, game / secs * 1000.0, wait / secs * 1000.0,
                    shown / secs * 1000.0, draw_avg * 1000.0, draw_max * 1000.0, tris);
+            if (g_gx_front_on) printf(" | graphics thread busy %3.0f ms", gx_front_take_busy() / secs * 1000.0);
+            printf("\n");
             if (total) {
                 printf("perf:   game thread:");
                 for (int c = 0; c < PROF_COUNT; c++)
@@ -1695,6 +1701,7 @@ void window_online_request(void) {
 
 static char g_ps2_dir[512];
 static bool g_ps2_req;
+void window_set_perf_log(bool on) { g_perf_log = on; }
 void window_set_ps2_dir(const char* dir) { snprintf(g_ps2_dir, sizeof g_ps2_dir, "%s", dir ? dir : ""); }
 bool window_ps2_online_available(void) {
     static int known = -1;             /* (looked for once: the files don't come and go during a run) */
