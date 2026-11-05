@@ -129,10 +129,11 @@ if(NFLS2_WINDOW)
         set(SDL_STATIC ON CACHE BOOL "" FORCE)
         set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
         set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+        # (the release's source zip, not a git clone: players needn't have git)
         FetchContent_Declare(SDL3
-            GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-            GIT_TAG release-3.2.20
-            GIT_SHALLOW TRUE)
+            URL https://github.com/libsdl-org/SDL/releases/download/release-3.2.20/SDL3-3.2.20.zip
+            URL_HASH SHA256=d76454913ea6f5f38856fbf00578d8e39daf842887f3396c95608414680250f7
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
         FetchContent_MakeAvailable(SDL3)
     endif()
 endif()
