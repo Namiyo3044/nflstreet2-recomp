@@ -21,19 +21,31 @@ enum {
     PROF_RENDER_WAIT,   /* waiting for the drawing threads */
     PROF_FILES,         /* reading the disc's files */
     PROF_CARD,          /* writing the memory card file */
+    PROF_GX_SYNC,       /* waiting for the graphics thread to catch up */
     PROF_COUNT
 };
 
 extern volatile int g_prof_cat;
 
+/* Only the game thread marks what it is doing; other threads that run the
+   same code (the graphics thread: commands, vertices, textures) set
+   t_prof_off and leave the mark alone. */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define NFLS2_TLS __declspec(thread)
+#else
+#define NFLS2_TLS _Thread_local
+#endif
+extern NFLS2_TLS int t_prof_off;
+
 static inline int prof_enter(int cat) {
+    if (t_prof_off) return -1;
     int prev = g_prof_cat;
     g_prof_cat = cat;
     return prev;
 }
 
 static inline void prof_leave(int prev) {
-    g_prof_cat = prev;
+    if (prev >= 0) g_prof_cat = prev;
 }
 
 /* Starts the sampler (once). */

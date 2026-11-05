@@ -311,20 +311,23 @@ static void run_display_list(CPUState* cpu, u32 addr, u32 size) {
 }
 
 void gx_fifo_write(CPUState* cpu, u32 value, u8 size) {
+    u32 be = value << (8u * (4u - size));
+    u8 b[4] = {(u8)(be >> 24), (u8)(be >> 16), (u8)(be >> 8), (u8)be};
+    gx_fifo_feed(cpu, b, size);
+}
+
+void gx_fifo_feed(CPUState* cpu, const u8* bytes, size_t size) {
     if (g_len + size > g_cap) {
-        g_cap = g_cap ? g_cap * 2 : 65536;
+        while (g_len + size > g_cap)
+            g_cap = g_cap ? g_cap * 2 : 65536;
         g_buf = (u8*)realloc(g_buf, g_cap);
         if (!g_buf) {
             fprintf(stderr, "gx: out of memory\n");
             exit(1);
         }
     }
-    {
-        u32 be = value << (8u * (4u - size));
-        u8 b[4] = {(u8)(be >> 24), (u8)(be >> 16), (u8)(be >> 8), (u8)be};
-        memcpy(g_buf + g_len, b, size);
-        g_len += size;
-    }
+    memcpy(g_buf + g_len, bytes, size);
+    g_len += size;
     g_stats.bytes += size;
     if (g_len < g_need)
         return;                        /* the command at the front is still incomplete */

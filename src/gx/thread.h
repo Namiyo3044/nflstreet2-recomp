@@ -49,6 +49,8 @@ static inline void gx_mutex_unlock(gx_mutex* m) { LeaveCriticalSection(m); }
 static inline void gx_cond_init(gx_cond* c) { InitializeConditionVariable(c); }
 static inline void gx_cond_wait(gx_cond* c, gx_mutex* m) { SleepConditionVariableCS(c, m, INFINITE); }
 static inline void gx_cond_broadcast(gx_cond* c) { WakeAllConditionVariable(c); }
+static inline void gx_cond_wait_ms(gx_cond* c, gx_mutex* m, unsigned ms) { SleepConditionVariableCS(c, m, ms); }
+static inline void gx_cpu_relax(void) { YieldProcessor(); }
 static inline int gx_cpu_count(void) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
@@ -58,6 +60,7 @@ static inline int gx_cpu_count(void) {
 #else
 #include <pthread.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef pthread_t gx_thread;
@@ -92,6 +95,19 @@ static inline void gx_mutex_unlock(gx_mutex* m) { pthread_mutex_unlock(m); }
 static inline void gx_cond_init(gx_cond* c) { pthread_cond_init(c, NULL); }
 static inline void gx_cond_wait(gx_cond* c, gx_mutex* m) { pthread_cond_wait(c, m); }
 static inline void gx_cond_broadcast(gx_cond* c) { pthread_cond_broadcast(c); }
+static inline void gx_cond_wait_ms(gx_cond* c, gx_mutex* m, unsigned ms) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);      /* (the clock pthread_cond_timedwait uses by default) */
+    ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+    ts.tv_sec += ms / 1000u + ts.tv_nsec / 1000000000L;
+    ts.tv_nsec %= 1000000000L;
+    pthread_cond_timedwait(c, m, &ts);
+}
+static inline void gx_cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
 static inline int gx_cpu_count(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (int)n : 1;

@@ -153,6 +153,7 @@ add_executable(nfls2
     src/platform/settings.c
     src/audio/ax_hle.c
     src/gx/fifo.c
+    src/gx/front.c
     src/gx/hires.c
     src/gx/raster.c
     src/gx/raster_gl.c

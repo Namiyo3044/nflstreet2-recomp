@@ -1,3 +1,4 @@
+#include "gx/front.h"
 #include "runtime/prof.h"
 #include "gx/raster.h"
 #include "gx/state.h"
@@ -753,6 +754,7 @@ static float g_band_cur = 9.0f, g_band_prev = 9.0f;   /* the stadium banner's lo
 #define HUD_POPUP_LOW 0.30f            /* and no lower than this (players' names are) */
 static volatile int g_hud_match;       /* a match is on (set from the game thread) */
 void gx_raster_set_match(bool on) { g_hud_match = on; }
+bool gx_raster_match(void) { return g_hud_match != 0; }
 
 static void lerp_vtx(const SVtx* a, const SVtx* b, float t, SVtx* out);
 
@@ -2491,6 +2493,7 @@ void gx_raster_set_threads(int n) {
 }
 
 void gx_raster_sync(void) {
+    gx_front_sync();                   /* (the graphics thread first) */
     wait_idle();
 }
 
@@ -2858,7 +2861,7 @@ static void emit_point(CmdList* l, u32 state, u32 a, u32 lp, u32 toffs) {
 #define RAIN_FLAG 0x80000000u
 #define RAIN_STRETCH 5.5f              /* streak length, in the game's drop lengths */
 #define RAIN_SPLASH_ALPHA 0.3f         /* the game's splashes, this opaque */
-#define RAIN_DROPS 36                  /* of each rain box's 96 drops, how many are drawn */
+/* RAIN_DROPS (raster.h): of each rain box's 96 drops, how many are drawn */
 #define RAIN_ALPHA 0.12f               /* a streak's opacity at its lower end */
 int g_rain_style = 1;                  /* The Alley's rain: 0 as on GameCube, 1 as on PS2 / Xbox, 2 off (settings) */
 
@@ -3260,22 +3263,8 @@ static void raster_draw(CPUState* cpu, u8 prim, u32 vat, u32 count, const u8* da
         return;                        /* rain off */
     bool rain = drop && g_rain_style == 1;
     if (rain) state = rain_state(l, state);
-    /* The game draws its rain a box at a time (16 x 16 x 8, tiled over the
-       camera's view, 0x801A7880) but stops after 22 boxes in a frame (the
-       count at 0x803ECC2C, bumped after each box drawn), so with a wide
-       view the far or high boxes went missing and rain stopped in mid-air.
-       While a box is being drawn the count is set back, so every box in
-       view is drawn. */
-    if (rain && cpu->ram_size > 0x003ECC30u) {
-        u8* cnt = cpu->ram + 0x003ECC2Cu;
-        cnt[0] = cnt[1] = cnt[2] = cnt[3] = 0;
-        /* How many of a box's 96 drops are drawn is worked out again each
-           frame from the rain's strength (0x801A7784: strength x 96, at
-           0x803EB858), which keeps The Alley at a handful; RAIN_DROPS of
-           them are drawn from here on (all 96 always move). */
-        u8* num = cpu->ram + 0x003EB858u;
-        num[0] = num[1] = num[2] = 0; num[3] = RAIN_DROPS;
-    }
+    /* (every rain box drawn, RAIN_DROPS drops in each: main.c, at the game's
+       box function, so it doesn't depend on when the stream is decoded) */
     /* each drop's splash is drawn straight after its line (a quad) */
     static bool prev_rain;
     bool splash = !rain && prev_rain && (prim & 0xF8) == 0x80;
@@ -3419,11 +3408,13 @@ static void note_xfb_copy(u32 dest, u32 stride, u32 lines) {
 }
 
 void gx_raster_note_ram_write(u32 addr) {
+    gx_front_lock();
     for (int i = 0; i < 4; i++) {
         XfbCopy* c = &g_xfb_copies[i];
         if (c->valid && addr >= c->dest && addr < c->dest + c->stride * 576u)
             c->valid = false;
     }
+    gx_front_unlock();
 }
 
 static u32 xfb_copied_lines(u32 addr) {
@@ -3657,7 +3648,16 @@ static u32 gpu_tex_copy_for(u32 map) {
     return 0;
 }
 
+static void raster_copy(u32 cmd);
+
+/* (the graphics thread: no frame is shown while this one is handed over) */
 void gx_raster_copy(u32 cmd) {
+    gx_front_lock();
+    raster_copy(cmd);
+    gx_front_unlock();
+}
+
+static void raster_copy(u32 cmd) {
     bool to_xfb = (cmd >> 14) & 1u;
     bool clear = (cmd >> 11) & 1u;
     bool active = gx_raster_active();
@@ -3867,8 +3867,18 @@ bool gx_raster_xfb_rgb(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, u32* o
 static u32 g_present_pixels[720 * 576];
 static bool g_present_from_gpu;
 
+static void present_gpu(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, int win_w, int win_h, float aspect,
+                        const char* shot_path);
+
 void gx_raster_present_gpu(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, int win_w, int win_h, float aspect,
                            const char* shot_path) {
+    gx_front_lock();                   /* (no new frame handed to the renderer meanwhile) */
+    present_gpu(cpu, tfbl, picture_cfg, vtr, win_w, win_h, aspect, shot_path);
+    gx_front_unlock();
+}
+
+static void present_gpu(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, int win_w, int win_h, float aspect,
+                        const char* shot_path) {
     wait_idle();
     GlrPicture pic;
     memset(&pic, 0, sizeof(pic));
@@ -3895,6 +3905,7 @@ void gx_raster_present_gpu(CPUState* cpu, u32 tfbl, u32 picture_cfg, u32 vtr, in
 /* A picture from elsewhere (a replacement movie frame) in place of the TV
    picture. Window thread, GPU mode only. */
 void gx_raster_present_pixels(const u32* px, u32 w, u32 h, int win_w, int win_h, float aspect) {
+    gx_front_lock();
     wait_idle();
     GlrPicture pic;
     memset(&pic, 0, sizeof(pic));
@@ -3903,6 +3914,7 @@ void gx_raster_present_pixels(const u32* px, u32 w, u32 h, int win_w, int win_h,
     pic.w = w;
     pic.h = h;
     glr_present(&pic, 0, win_w, win_h, aspect, NULL);
+    gx_front_unlock();
 }
 
 /* The window shows frames straight from the GPU, so TV-buffer copies needn't
@@ -3964,6 +3976,7 @@ u32 gx_raster_frames(void) {
 }
 
 void gx_raster_report(void) {
+    gx_front_sync();
     wait_idle();
     gx_tex_report();
     glr_report();

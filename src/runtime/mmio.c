@@ -3,6 +3,7 @@
 #include "runtime/exi.h"
 #include "mmio.h"
 #include "gx/fifo.h"
+#include "gx/front.h"
 #include "runtime/disc.h"
 #include "runtime/pad.h"
 #include "runtime/credits.h"
@@ -322,6 +323,7 @@ void mmio_set_frame_pacing(bool on) {
 }
 
 void mmio_pe_display_copy(void) {
+    if (gx_front_on_thread()) { gx_front_event(GXF_EV_DISPLAY_COPY, 0); return; }   /* (acted on by the game thread) */
     g_copied_this_field = true;
 }
 
@@ -334,6 +336,7 @@ void mmio_pe_field(void) {
 }
 
 void mmio_pe_finish(void) {
+    if (gx_front_on_thread()) { gx_front_event(GXF_EV_FINISH, 0); return; }
     if (g_pacing && g_copied_this_field) {
         g_finish_held = true;
         g_finish_held_count++;
@@ -344,6 +347,7 @@ void mmio_pe_finish(void) {
 }
 
 void mmio_pe_token(u16 token, bool interrupt) {
+    if (gx_front_on_thread()) { gx_front_event(interrupt ? GXF_EV_TOKEN_INT : GXF_EV_TOKEN, token); return; }
     set16(PE_TOKEN, token);
     if (interrupt) {
         g_pe_ctrl |= PE_TOKEN_INT;
@@ -861,7 +865,10 @@ static void pipe_write(CPUState* cpu, u32 value, u8 size) {
         }
     }
     if (gp_linked()) {
-        gx_fifo_write(cpu, value, size);
+        if (g_gx_front_on)
+            gx_front_push(value, size);    /* (the graphics thread decodes it) */
+        else
+            gx_fifo_write(cpu, value, size);
         g_pipe_to_gpu += size;
     } else {
         g_pipe_recorded += size;
@@ -900,6 +907,7 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         return v;
     }
     if ((ea & 0xFF000000u) == 0xC8000000u) {   /* the frame buffer, read directly (GXPeekARGB / GXPeekZ) */
+        gx_front_sync();                   /* (everything drawn so far) */
         u32 v = gx_raster_peek(ea & ~3u);
         if (!(ea & 0x00400000u)) {         /* colour: the alpha read mode (PE 0x1008, GXPokeAlphaRead) */
             u32 mode = reg16(0x1008u) & 3u;
@@ -916,6 +924,8 @@ static u64 external_read(CPUState* cpu, u32 ea, u8 size) {
         return 0;
     }
     u32 off = ea - MMIO_BASE;
+    if (off >= 0x1000u && off < 0x1100u)
+        gx_front_sync();                   /* pixel engine (tokens, done): as of everything sent so far */
     interrupts_dirty();                /* (reading status registers acknowledges things) */
     Device* d = device_for(ea);
     if (d)

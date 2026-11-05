@@ -7,6 +7,7 @@
 #include <string.h>
 
 volatile int g_prof_cat;
+NFLS2_TLS int t_prof_off;
 
 static CPUState* g_cpu;
 static u32* g_pc_hist;                 /* samples per guest word, (pc - 0x80000000) / 4 */
@@ -18,6 +19,7 @@ static bool g_started;
 static const char* const k_names[PROF_COUNT] = {
     "game code", "gpu commands", "vertices", "textures", "locked cache/vmem",
     "audio mixing", "showing", "pacing sleep", "renderer wait", "disc files", "memory card",
+    "waiting for graphics thread",
 };
 
 #define RING 4096                      /* about 4 s of samples */

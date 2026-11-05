@@ -2,6 +2,7 @@
 #define NFLS2_GX_FIFO_H
 
 #include "cpu/cpu.h"
+#include <stddef.h>
 
 /* The GameCube's graphics command stream ("GX FIFO").
  *
@@ -15,6 +16,8 @@
 
 /* Called for every write to the write-gather pipe (size 1, 2 or 4 bytes). */
 void gx_fifo_write(CPUState* cpu, u32 value, u8 size);
+/* The same for a run of bytes (the graphics thread, gx/front.c). */
+void gx_fifo_feed(CPUState* cpu, const u8* bytes, size_t size);
 
 void gx_fifo_report(void);
 

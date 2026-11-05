@@ -8,6 +8,7 @@
  * __OSDispatchInterrupt -> the VI/DSP/... handlers -> OSLoadContext) is the
  * game's own recompiled code.
  */
+#include "gx/front.h"
 #include "runtime/interrupts.h"
 #include "runtime/mmio.h"
 #include "runtime/exi.h"
@@ -101,6 +102,8 @@ static unsigned long long g_polls_full, g_polls_fast;
 void interrupts_dirty(void) { g_poll_at = 0; }
 
 void interrupts_poll(CPUState* cpu) {
+    if (g_gx_front_events)
+        gx_front_drain();                  /* the graphics thread's draw-done / tokens (they mark this dirty) */
     if (cpu->timebase < g_poll_at) {
         g_polls_fast++;
         if (!g_pending || !(cpu->msr & MSR_EE))
