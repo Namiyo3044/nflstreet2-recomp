@@ -3408,6 +3408,15 @@ static void note_xfb_copy(u32 dest, u32 stride, u32 lines) {
 }
 
 void gx_raster_note_ram_write(u32 addr) {
+    /* (called for every 32 bytes the game sends to memory through the
+       pipe: look without the lock first, almost always nothing to do) */
+    bool hit = false;
+    for (int i = 0; i < 4; i++) {
+        const XfbCopy* c = &g_xfb_copies[i];
+        if (c->valid && addr >= c->dest && addr < c->dest + c->stride * 576u) hit = true;
+    }
+    if (!hit)
+        return;
     gx_front_lock();
     for (int i = 0; i < 4; i++) {
         XfbCopy* c = &g_xfb_copies[i];

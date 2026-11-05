@@ -20,6 +20,8 @@ volatile int g_gx_front_events;
 #define RING_MASK (RING_SIZE - 1u)
 #define CHUNK (64u * 1024u)            /* handed to the parser at a time, so the tail moves on */
 #define SPIN 500                       /* checks for more before going to sleep (tens of us) */
+#define BATCH 8192u                    /* bytes worth starting on at once ... */
+#define BATCH_SPIN 1000                /* ... or after this many checks (tens of us), or at once when the game thread waits */
 
 static u8* g_ring;
 static size_t g_head;                  /* written by the game thread */
@@ -31,6 +33,7 @@ static gx_mutex g_mx;
 static gx_cond g_cv_work, g_cv_idle;
 static volatile int g_idle;            /* the thread is waiting for work */
 static volatile int g_wake_sent;       /* (game thread) woken since it went idle */
+static volatile int g_sync_req;        /* the game thread is waiting: no batching */
 static NFLS2_TLS int t_on_thread;
 
 static gx_mutex g_lock;                /* handing frames to the renderer / showing them */
@@ -89,6 +92,17 @@ static void front_main(void* arg) {
                     gx_cond_wait_ms(&g_cv_work, &g_mx, 2);
                 g_idle = 0;
                 gx_mutex_unlock(&g_mx);
+            }
+        }
+        /* A few bytes at a time cost more to hand over than to decode: wait a
+           moment for a batch (the game thread only needs the results when
+           it waits, and then it says so). */
+        if (h - t < BATCH && !g_sync_req) {
+            int spins = 0;
+            while (h - t < BATCH && spins < BATCH_SPIN && !g_sync_req) {
+                gx_cpu_relax();
+                h = LOAD(&g_head);
+                spins++;
             }
         }
         double t0 = now_s();
@@ -193,6 +207,7 @@ void gx_front_sync(void) {
     if (LOAD(&g_tail) != h || !g_idle) {
         int prev = prof_enter(PROF_GX_SYNC);
         double t0 = now_s();
+        STORE(&g_sync_req, 1);
         gx_mutex_lock(&g_mx);
         gx_cond_broadcast(&g_cv_work);
         while (!(g_idle && LOAD(&g_tail) == h)) {
@@ -200,6 +215,7 @@ void gx_front_sync(void) {
             gx_cond_wait_ms(&g_cv_idle, &g_mx, 1);
         }
         gx_mutex_unlock(&g_mx);
+        STORE(&g_sync_req, 0);
         g_st.sync_s += now_s() - t0;
         g_st.syncs++;
         prof_leave(prev);
