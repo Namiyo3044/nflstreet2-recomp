@@ -130,11 +130,21 @@ if(NFLS2_WINDOW)
         set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
         set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
         # (the release's source zip, not a git clone: players needn't have git)
+        # A build folder with SDL from before (a git clone, or the zip unpacked
+        # with its own old file times) gets a fresh SDL: mixing the two left
+        # SDL's precompiled header out of date and the build failed.
+        set(NFLS2_SDL_STAMP "${CMAKE_BINARY_DIR}/_deps/sdl3-zip-3.2.20.txt")
+        if(EXISTS "${CMAKE_BINARY_DIR}/_deps/sdl3-build" AND NOT EXISTS "${NFLS2_SDL_STAMP}")
+            message(STATUS "SDL3: replacing the SDL an earlier version downloaded")
+            file(REMOVE_RECURSE "${CMAKE_BINARY_DIR}/_deps/sdl3-src" "${CMAKE_BINARY_DIR}/_deps/sdl3-build"
+                 "${CMAKE_BINARY_DIR}/_deps/sdl3-subbuild")
+        endif()
         FetchContent_Declare(SDL3
             URL https://github.com/libsdl-org/SDL/releases/download/release-3.2.20/SDL3-3.2.20.zip
             URL_HASH SHA256=d76454913ea6f5f38856fbf00578d8e39daf842887f3396c95608414680250f7
-            DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+            DOWNLOAD_EXTRACT_TIMESTAMP FALSE)
         FetchContent_MakeAvailable(SDL3)
+        file(WRITE "${NFLS2_SDL_STAMP}" "SDL 3.2.20 from its release zip\n")
     endif()
 endif()
 
