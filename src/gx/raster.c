@@ -2271,7 +2271,8 @@ static double now_s(void) {
     return (double)ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 static double g_submit_at, g_perf_wait, g_perf_draw, g_perf_draw_max;
-static u32 g_perf_frames;
+static double g_perf_xf, g_perf_gl, g_perf_probe;   /* (GPU thread) a frame's time: transforming, GL, reading back */
+static u32 g_perf_frames, g_perf_lists;
 static unsigned long long g_perf_tris_at;
 
 void gx_raster_take_perf(double* wait_s, double* draw_avg_s, double* draw_max_s, u32* tris_per_frame) {
@@ -2288,6 +2289,17 @@ void gx_raster_take_perf(double* wait_s, double* draw_avg_s, double* draw_max_s,
     g_perf_wait = g_perf_draw = g_perf_draw_max = 0.0;
     g_perf_frames = 0;
     g_perf_tris_at = g_tris_recorded;
+    gx_mutex_unlock(&g_mx);
+}
+
+void gx_raster_take_draw_split(double* xf_s, double* gl_s, double* probe_s) {
+    gx_mutex_lock(&g_mx);
+    double n = g_perf_lists ? (double)g_perf_lists : 1.0;
+    *xf_s = g_perf_xf / n;
+    *gl_s = g_perf_gl / n;
+    *probe_s = g_perf_probe / n;
+    g_perf_xf = g_perf_gl = g_perf_probe = 0.0;
+    g_perf_lists = 0;
     gx_mutex_unlock(&g_mx);
 }
 
@@ -2319,8 +2331,19 @@ static void worker_main(void* arg) {
                 glr_tex_copy(g_job_copy);
             else {
                 g_probe_pending = g_probe_on && !l->skipped;   /* (a frame not drawn: the last values stand) */
-                glr_run_list(g_defer ? expand_list(l) : l);
+                double t0 = now_s();
+                const CmdList* e = g_defer ? expand_list(l) : l;
+                double t1 = now_s();
+                glr_run_list(e);
+                double t2 = now_s();
                 raster_probes_before_clear();   /* (no clearing copy in the list: read at its end) */
+                double t3 = now_s();
+                gx_mutex_lock(&g_mx);
+                g_perf_xf += t1 - t0;
+                g_perf_gl += t2 - t1;
+                g_perf_probe += t3 - t2;
+                g_perf_lists++;
+                gx_mutex_unlock(&g_mx);
             }
         } else {
             int y0, y1;

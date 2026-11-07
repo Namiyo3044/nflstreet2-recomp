@@ -1639,6 +1639,11 @@ static void pace_and_stats(void) {
                    "renderer %3.0f ms, showing %2.0f ms | frame draw avg %4.1f ms, worst %4.1f ms, %u triangles/frame",
                    interrupts_game_seconds(), speed, fps, game / secs * 1000.0, wait / secs * 1000.0,
                    shown / secs * 1000.0, draw_avg * 1000.0, draw_max * 1000.0, tris);
+            if (g_gpu) {
+                double xf, gl, rb;
+                gx_raster_take_draw_split(&xf, &gl, &rb);
+                printf(" (transforms %4.1f, GL %4.1f, read-backs %4.1f)", xf * 1000.0, gl * 1000.0, rb * 1000.0);
+            }
             if (g_gx_front_on) printf(" | graphics thread busy %3.0f ms", gx_front_take_busy() / secs * 1000.0);
             printf("\n");
             if (total) {
