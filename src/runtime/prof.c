@@ -116,6 +116,92 @@ unsigned prof_take(unsigned out[PROF_COUNT]) {
     return total;
 }
 
+/* What kind of instruction a guest word is (the game code's time by kind:
+   where a faster code generator would gain the most). */
+enum {
+    K_LOAD, K_STORE, K_MULTI, K_FPMEM, K_PSQ, K_PS, K_FPS, K_FPD, K_FCMP, K_CMP, K_ALU, K_ALU_RC, K_ROT,
+    K_MULDIV, K_BRANCH, K_SYS, K_OTHER, K_COUNT
+};
+static const char* const k_kind_names[K_COUNT] = {
+    "integer loads", "integer stores", "load/store multiple", "float loads/stores", "quantized loads/stores",
+    "paired-single maths", "single float maths", "double float maths / moves", "float compares",
+    "integer compares", "integer maths", "integer maths setting cr0 (.)", "rotates / masks",
+    "multiply / divide", "branches", "system / cache / special registers", "other",
+};
+
+static int insn_kind(u32 w) {
+    u32 op = w >> 26, xo = (w >> 1) & 0x3FFu;
+    switch (op) {
+    case 32: case 33: case 34: case 35: case 40: case 41: case 42: case 43: return K_LOAD;
+    case 36: case 37: case 38: case 39: case 44: case 45: return K_STORE;
+    case 46: case 47: return K_MULTI;
+    case 48: case 49: case 50: case 51: case 52: case 53: case 54: case 55: return K_FPMEM;
+    case 56: case 57: case 60: case 61: return K_PSQ;
+    case 4: return (xo & 0x3Fu) == 6 || (xo & 0x3Fu) == 7 || (xo & 0x3Fu) == 38 || (xo & 0x3Fu) == 39 ? K_PSQ : K_PS;
+    case 59: return K_FPS;
+    case 63: return xo == 0 || xo == 32 ? K_FCMP : K_FPD;
+    case 10: case 11: return K_CMP;
+    case 7: return K_MULDIV;
+    case 12: case 13: case 14: case 15: case 24: case 25: case 26: case 27: case 8: return K_ALU;
+    case 28: case 29: return K_ALU_RC;     /* andi. andis. */
+    case 20: case 21: case 23: return (w & 1u) ? K_ALU_RC : K_ROT;
+    case 16: case 18: case 19:
+        return op == 19 && (xo == 16 || xo == 528) ? K_BRANCH : op == 19 ? (xo == 150 || xo == 50 ? K_SYS : K_OTHER)
+                                                                          : K_BRANCH;
+    case 17: return K_SYS;
+    case 31:
+        if (xo == 0 || xo == 32) return K_CMP;
+        if (xo == 23 || xo == 55 || xo == 87 || xo == 119 || xo == 279 || xo == 311 || xo == 343 || xo == 375 ||
+            xo == 790 || xo == 534 || xo == 20)
+            return K_LOAD;
+        if (xo == 151 || xo == 183 || xo == 215 || xo == 247 || xo == 407 || xo == 439 || xo == 918 || xo == 662 ||
+            xo == 150)
+            return K_STORE;
+        if (xo == 535 || xo == 567 || xo == 599 || xo == 631 || xo == 663 || xo == 695 || xo == 727 || xo == 759 ||
+            xo == 983)
+            return K_FPMEM;
+        if ((xo & 0x1FFu) == 235 || (xo & 0x1FFu) == 75 || (xo & 0x1FFu) == 11 || (xo & 0x1FFu) == 491 ||
+            (xo & 0x1FFu) == 459)
+            return K_MULDIV;
+        if (xo == 339 || xo == 467 || xo == 371 || xo == 83 || xo == 146 || xo == 595 || xo == 210 || xo == 86 ||
+            xo == 54 || xo == 470 || xo == 278 || xo == 1014 || xo == 598 || xo == 854 || xo == 982 || xo == 144 ||
+            xo == 19)
+            return K_SYS;
+        return (w & 1u) ? K_ALU_RC : K_ALU;
+    }
+    return K_OTHER;
+}
+
+static void report_kinds(void) {
+    if (!g_cpu || !g_cpu->ram)
+        return;
+    unsigned long long kinds[K_COUNT] = {0}, all = 0;
+    u32 n = (24u << 20) / 4u;
+    for (u32 i = 0; i < n; i++) {
+        if (!g_pc_hist[i])
+            continue;
+        u32 off = i * 4u;
+        if (off + 4u > g_cpu->ram_size)
+            continue;
+        const u8* p = g_cpu->ram + off;
+        u32 w = (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3];
+        kinds[insn_kind(w)] += g_pc_hist[i];
+        all += g_pc_hist[i];
+    }
+    if (!all)
+        return;
+    printf("game code by kind of instruction (share of game-code time):\n");
+    for (int t = 0; t < K_COUNT; t++) {
+        int best = -1;
+        for (int k = 0; k < K_COUNT; k++)
+            if (kinds[k] && (best < 0 || kinds[k] > kinds[best])) best = k;
+        if (best < 0)
+            break;
+        printf("  %5.1f%%  %s\n", 100.0 * (double)kinds[best] / (double)all, k_kind_names[best]);
+        kinds[best] = 0;
+    }
+}
+
 void prof_report(void) {
     if (!g_started)
         return;
@@ -130,6 +216,7 @@ void prof_report(void) {
     printf("\n");
     if (!g_pc_hist || !g_total[PROF_GAME])
         return;
+    report_kinds();
     /* Fold samples into functions (symbol start), then list the top ones. */
     u32 n = (24u << 20) / 4u;
     for (u32 i = 0; i < n; i++) {
