@@ -56,6 +56,11 @@ static Device* device_for(u32 addr) {
 }
 
 static u32 reg_get(u32 off, u8 size) {
+    off &= MMIO_SIZE - 1;
+    if (size == 4 && off + 4u <= MMIO_SIZE)   /* (the usual cases, without the byte loop) */
+        return (u32)g_regs[off] << 24 | (u32)g_regs[off + 1] << 16 | (u32)g_regs[off + 2] << 8 | g_regs[off + 3];
+    if (size == 2 && off + 2u <= MMIO_SIZE)
+        return (u32)g_regs[off] << 8 | g_regs[off + 1];
     u32 v = 0;
     for (u8 i = 0; i < size; i++)
         v = (v << 8) | g_regs[(off + i) & (MMIO_SIZE - 1)];
@@ -814,8 +819,13 @@ static u32 g_burst_len;
 static bool g_cp_ctrl_written;
 static unsigned long long g_pipe_to_gpu, g_pipe_recorded, g_link_changes;
 
+/* (kept up to date where CP_CTRL is written: asked on every pipe write) */
+static bool g_linked = true;
+static void linked_update(void) {
+    g_linked = !g_cp_ctrl_written || (reg16(CP_CTRL) & CP_CTRL_LINK);
+}
 static bool gp_linked(void) {
-    return !g_cp_ctrl_written || (reg16(CP_CTRL) & CP_CTRL_LINK);
+    return g_linked;
 }
 
 static void pipe_flush_burst(CPUState* cpu) {
@@ -999,6 +1009,7 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
         bool was = gp_linked();
         g_cp_ctrl_written = true;
         reg_set(off, value, size);
+        linked_update();
         if (gp_linked() != was)
             g_link_changes++;
         return;
@@ -1025,6 +1036,8 @@ static void external_write(CPUState* cpu, u32 ea, u64 value64, u8 size) {
         return;
     }
     reg_set(off, value, size);
+    if (off < CP_CTRL + 2u && off + size > CP_CTRL)
+        linked_update();               /* (CP_CTRL written some other way) */
 }
 
 u64 mmio_next_event(void) {

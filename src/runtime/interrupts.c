@@ -111,6 +111,7 @@ void interrupts_poll(CPUState* cpu) {
         /* (an interrupt waiting for the game to enable them: the full check) */
     }
     g_polls_full++;
+    gx_front_flush();                  /* (the graphics thread gets the latest bytes now and then) */
     /* Video: one display interrupt per field, alternating the two that VIInit
        enables (DI1 at the top of the frame, DI0 at the field boundary). */
     while (cpu->timebase >= g_next_field) {

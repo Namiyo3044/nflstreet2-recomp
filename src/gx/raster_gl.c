@@ -25,6 +25,7 @@ static int PX(u32 x) { return (int)((float)x * g_sx + 0.5f); }   /* native x to 
 static void (*g_make_current)(void);
 static bool g_ready;
 static GLuint g_prog, g_vao, g_vbo, g_ibo, g_ubo;
+static u32 g_pack_k;                   /* texture coordinates per vertex the vertex layout is set up for (0: the full one) */
 static GLint g_u_solid;
 static GLuint g_fbo, g_color_tex, g_depth_tex;           /* the frame buffer at scale x native */
 static GLuint g_fbo_small, g_color_small, g_depth_small; /* native size, for read-back when scaled */
@@ -514,6 +515,7 @@ bool glr_init(GlrGetProc getproc, int scale, void (*make_current)(void)) {
                                  (const void*)(offsetof(SVtx, tc) + sizeof(float) * 3 * (size_t)i));
     for (GLuint i = 0; i < 11; i++)
         G(glEnableVertexAttribArray)(i);
+    g_pack_k = 0;
     G(glGenSamplers)(16, g_samplers);
     for (int i = 0; i < 16; i++)
         G(glBindSampler)((GLuint)i, g_samplers[i]);
@@ -903,6 +905,57 @@ static void apply_scale(void) {
     printf("gpu: now drawing at %dx%d (%dx the GameCube's resolution)\n", g_efb_w, g_efb_h, g_scale);
 }
 
+/* The vertices as sent to the graphics card: position, the two colours as
+   bytes, and only as many texture coordinates as the frame uses (a frame
+   rarely uses more than two of the eight). The full transformed vertex is
+   ~180 bytes; this is ~50, which matters on integrated graphics, where
+   handing the driver a frame's vertices took longer than drawing them. */
+static u8* g_pack;
+static size_t g_pack_cap;
+
+static inline u8 unorm8(float c) {
+    c = c < 0.0f ? 0.0f : c > 1.0f ? 1.0f : c;
+    return (u8)(c * 255.0f + 0.5f);
+}
+
+static void upload_vertices(const CmdList* l) {
+    u32 k = 1;
+    for (u32 s = 0; s < l->ns; s++)
+        if (l->states[s].ntex > k) k = l->states[s].ntex;
+    if (k > MAX_TC) k = MAX_TC;
+    size_t stride = 16u + 8u + 12u * k;
+    size_t bytes = stride * (l->nv ? l->nv : 1);
+    if (bytes > g_pack_cap) {
+        g_pack_cap = bytes * 2;
+        g_pack = (u8*)realloc(g_pack, g_pack_cap);
+        if (!g_pack) { g_pack_cap = 0; return; }
+    }
+    u8* o = g_pack;
+    for (u32 i = 0; i < l->nv; i++, o += stride) {
+        const SVtx* v = &l->verts[i];
+        float p[4] = {v->x, v->y, v->z, v->inv_w};
+        memcpy(o, p, 16);
+        for (int c = 0; c < 4; c++) {
+            o[16 + c] = unorm8(v->col[0][c]);
+            o[20 + c] = unorm8(v->col[1][c]);
+        }
+        memcpy(o + 24, v->tc, 12u * k);
+    }
+    G(glBufferData)(GL_ARRAY_BUFFER, (GLsizeiptr)bytes, g_pack, GL_STREAM_DRAW);
+    if (k != g_pack_k) {
+        /* (the VAO and buffer are bound) the layout for k coordinates; the
+           ones beyond point at the first (no state reads them) */
+        GLsizei st = (GLsizei)stride;
+        G(glVertexAttribPointer)(0, 4, GL_FLOAT, GL_FALSE, st, (const void*)0);
+        G(glVertexAttribPointer)(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, st, (const void*)16);
+        G(glVertexAttribPointer)(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, st, (const void*)20);
+        for (u32 t = 0; t < 8; t++)
+            G(glVertexAttribPointer)((GLuint)(3 + t), 3, GL_FLOAT, GL_FALSE, st,
+                                     (const void*)(24u + 12u * (t < k ? t : 0u)));
+        g_pack_k = k;
+    }
+}
+
 void glr_run_list(const CmdList* l) {
     if (!g_ready)
         return;
@@ -971,7 +1024,7 @@ void glr_run_list(const CmdList* l) {
     G(glUseProgram)(g_prog);
     G(glBindVertexArray)(g_vao);
     G(glBindBuffer)(GL_ARRAY_BUFFER, g_vbo);
-    G(glBufferData)(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(SVtx) * l->nv), l->verts, GL_STREAM_DRAW);
+    upload_vertices(l);
     G(glBindBuffer)(GL_ELEMENT_ARRAY_BUFFER, g_ibo);
     G(glBufferData)(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)(sizeof(u32) * ni), g_idx, GL_STREAM_DRAW);
     G(glBindBuffer)(GL_UNIFORM_BUFFER, g_ubo);

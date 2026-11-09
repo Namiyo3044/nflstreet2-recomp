@@ -35,6 +35,10 @@ bool gx_front_start(CPUState* cpu);
 /* Game thread: bytes the game wrote to the pipe (1, 2 or 4, big-endian value). */
 void gx_front_push(u32 value, u8 size);
 
+/* Game thread: makes the bytes written so far visible to the thread (they
+   go in blocks; the waits below do this too). */
+void gx_front_flush(void);
+
 /* Game thread: waits until the thread has handled everything written so
    far, then acts on its events. */
 void gx_front_sync(void);
