@@ -79,6 +79,10 @@ void gx_raster_take_perf(double* wait_s, double* draw_avg_s, double* draw_max_s,
 /* (GPU renderer) a drawn frame's average time on its thread, split: vertex
    transforms, GL calls, frame-buffer read-backs; since the last call. */
 void gx_raster_take_draw_split(double* xf_s, double* gl_s, double* probe_s);
+/* GPU renderer with the graphics thread: each list is transformed by that
+   thread when it is finished, while the GPU thread draws the one before
+   (not by the GPU thread before it draws it). main.c, before the game runs. */
+void gx_raster_transform_when_recorded(void);
 
 /* Draw with the graphics card from now on (OpenGL 3.3). The context must be
    current on this thread for the call, and released afterwards: drawing

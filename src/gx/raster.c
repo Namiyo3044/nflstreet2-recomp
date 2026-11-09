@@ -132,6 +132,26 @@ bool gx_raster_use_gpu(void* (*getproc)(const char*), int scale, void (*make_cur
     return true;
 }
 
+/* With the graphics thread (gx/front.c) recording the lists, each list is
+   transformed there when it is finished (submit), rather than by the GPU
+   thread before it draws it: the two threads then work on different frames
+   side by side instead of one doing both (on a Ryzen 5 4600G the GPU thread
+   took 6-11 ms transforming plus 12-17 ms of GL per frame). (Transforming
+   each draw as it was decoded did the same work but changed how The Alley's
+   rain streaks came out; this is the same code as before, on another thread.)
+   Called before the game starts. */
+static bool g_expand_early;             /* deferred lists expanded by the recording thread, at submit */
+static CmdList g_expanded[2];          /* (two: with g_expand_early, one is drawn while the next is made) */
+static u32 g_expand_i;
+void gx_raster_transform_when_recorded(void) {
+    if (!g_gpu || !g_defer)
+        return;
+    /* (still deferred, the way the rain's held streaks and the HUD are
+       worked out; only done by the thread that recorded the list, into a
+       second buffer, while the GPU thread draws the one before) */
+    g_expand_early = true;
+}
+
 /* The software frame buffer must hold the picture (a copy reads it).
    With the GPU, the read-back runs on the GPU thread (it owns the GL
    context); defined with the threads below. */
@@ -2272,6 +2292,7 @@ static double now_s(void) {
 }
 static double g_submit_at, g_perf_wait, g_perf_draw, g_perf_draw_max;
 static double g_perf_xf, g_perf_gl, g_perf_probe;   /* (GPU thread) a frame's time: transforming, GL, reading back */
+static double g_perf_xf_early;                      /* (recording thread) transforming, with g_expand_early */
 static u32 g_perf_frames, g_perf_lists;
 static unsigned long long g_perf_tris_at;
 
@@ -2295,7 +2316,8 @@ void gx_raster_take_perf(double* wait_s, double* draw_avg_s, double* draw_max_s,
 void gx_raster_take_draw_split(double* xf_s, double* gl_s, double* probe_s) {
     gx_mutex_lock(&g_mx);
     double n = g_perf_lists ? (double)g_perf_lists : 1.0;
-    *xf_s = g_perf_xf / n;
+    *xf_s = (g_perf_xf + g_perf_xf_early) / n;
+    g_perf_xf_early = 0.0;
     *gl_s = g_perf_gl / n;
     *probe_s = g_perf_probe / n;
     g_perf_xf = g_perf_gl = g_perf_probe = 0.0;
@@ -2332,7 +2354,7 @@ static void worker_main(void* arg) {
             else {
                 g_probe_pending = g_probe_on && !l->skipped;   /* (a frame not drawn: the last values stand) */
                 double t0 = now_s();
-                const CmdList* e = g_defer ? expand_list(l) : l;
+                const CmdList* e = g_defer && !g_expand_early ? expand_list(l) : l;
                 double t1 = now_s();
                 glr_run_list(e);
                 double t2 = now_s();
@@ -2445,9 +2467,19 @@ static void submit(void) {
     g_frame_ea_over = false;
     g_probe_on = g_gpu && g_workers && g_probe_streak >= PROBE_STREAK;
     start_workers();
+    CmdList* l = &g_lists[g_rec];
+    /* (with g_expand_early: the list transformed here, into the expanded
+       buffer the GPU thread isn't drawing, while it may still be drawing
+       the one before) */
+    const CmdList* run = l;
+    if (g_expand_early && g_gpu && g_workers) {
+        g_expand_i ^= 1u;
+        double t0 = now_s();
+        run = expand_list(l);
+        g_perf_xf_early += now_s() - t0;
+    }
     wait_idle();                       /* the other list is free again */
     gx_tex_collect_garbage();          /* texture memory the finished frame used */
-    CmdList* l = &g_lists[g_rec];
     if (!g_defer) rain_flush(l);       /* held rain streaks (deferred: when the list is expanded) */
     if (g_gpu && !g_workers) {         /* no thread could be started: draw here */
         glr_run_list(g_defer ? expand_list(l) : l);
@@ -2456,7 +2488,7 @@ static void submit(void) {
     } else {
         gx_mutex_lock(&g_mx);
         g_job = JOB_LIST;
-        g_drawing = l;
+        g_drawing = run;
         g_busy = g_workers;
         g_submit_at = now_s();
         g_generation++;
@@ -3226,15 +3258,14 @@ void gx_raster_xf_write(u32 addr, const u32* values, u32 n) {
 /* GPU thread: turns a deferred list into one of triangles, replaying the
    transform unit writes into its own copy of the registers and transforming,
    lighting and clipping each draw with them. */
-static CmdList g_expanded;
-
 static const CmdList* expand_list(const CmdList* l) {
-    CmdList* e = &g_expanded;
+    CmdList* e = &g_expanded[g_expand_i];
     take_free_camera();
     e->n = 0;
     e->nv = 0;
     e->states = l->states;
     e->ns = l->ns;
+    e->skipped = l->skipped;
     for (u32 i = 0; i < l->n; i++) {
         const Cmd* c = &l->cmds[i];
         if (c->type == CMD_XF) {

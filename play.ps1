@@ -51,6 +51,7 @@ param(
     [switch]$NoIdleSkip,
     [switch]$PerfLog,
     [switch]$NoGxThread,
+    [switch]$GpuThreadTransforms,
     [switch]$NoDirectCalls,
     [switch]$ShowTHX,
     [string]$MemCard = "C:\nfls2\saves\MemoryCardA.raw",
@@ -140,6 +141,7 @@ foreach ($p in $Press) { $gameArgs += @("--press", $p) }
 if ($NoIdleSkip) { $gameArgs += "--no-idle-skip" }
 if ($PerfLog) { $gameArgs += "--perf-log" }
 if ($NoGxThread) { $gameArgs += "--no-gx-thread" }
+if ($GpuThreadTransforms) { $gameArgs += "--gpu-thread-transforms" }
 if ($NoDirectCalls) { $gameArgs += "--no-direct-calls" }
 if ($ShowTHX) { $gameArgs += "--show-thx" }
 if ($NoText) { $gameArgs += @("--no-text") }
