@@ -741,29 +741,56 @@ static int g_card_cur, g_card_prev;    /* play-card-sized panels this / last fra
 static int g_bar_cur, g_bar_prev;      /* plain bars below the panel row, wholly on one side, this / last frame */
 static int g_cbar_cur, g_cbar_prev;    /* and across the middle (the pause menu's rows) */
 static int g_banner_cur, g_banner_prev;   /* a stadium-name banner seen this / last frame (its side) */
-/* HUD log (with the draw log, F12): every match HUD piece of a few frames
-   and what was done with it, to hudlog.txt. */
-static volatile int g_hudlog_frames;
-static FILE* g_hudlog;
-static u32 g_hudlog_frame;
+/* The HUD log (F12, and with the draw log): every match HUD piece and what
+   was done with it, to hudlog.txt. It keeps the last few seconds of the match HUD (pieces that
+   show) in memory all the time, so F12 can write out what just happened:
+   a brief glitch is seen first and logged after. */
+typedef struct {
+    const char* what;
+    u32 frame;
+    u8 n, mtx, textured, side;         /* side: 0 none, 1 0.30, 2 0.50 */
+    s16 cards, cards_prev, bars, bars_prev, banner, banner_prev;
+    float alpha, mn, mx, ylo, yhi, ou0, oy0, ou, oy;
+} HudHist;
+#define HUD_HIST (1u << 18)            /* pieces kept (about 8 seconds of a match) */
+static HudHist* g_hh;
+static u32 g_hh_pos;
+static volatile int g_hh_dump;         /* F12: write it out (done where the HUD is placed) */
 static void hudlog_piece(const char* what, u32 n, u32 mtx, bool textured, float alpha, float mn, float mx, float ylo,
                          float yhi, float ou0, float oy0, float ou, float oy, float side) {
-    if (g_hudlog_frames <= 0) return;
-    if (!g_hudlog) {
-        g_hudlog = fopen("hudlog.txt", "w");
-        if (!g_hudlog) { g_hudlog_frames = 0; return; }
-        g_hudlog_frame = g_frames;
-        fprintf(g_hudlog, "HUD pieces (x across 16:9 -1..1, y -1 bottom..1 top; origin as placed / as used)\n");
+    if (alpha <= 0.0f) return;         /* (unseen pieces left out) */
+    if (!g_hh) {
+        g_hh = (HudHist*)calloc(HUD_HIST, sizeof(HudHist));
+        if (!g_hh) return;
     }
-    if (g_frames != g_hudlog_frame) {
-        g_hudlog_frame = g_frames;
-        if (--g_hudlog_frames <= 0) { fclose(g_hudlog); g_hudlog = NULL; return; }
-        fprintf(g_hudlog, "-- next frame %u\n", g_frames);
+    HudHist* h = &g_hh[g_hh_pos++ & (HUD_HIST - 1u)];
+    h->what = what; h->frame = g_frames; h->n = (u8)n; h->mtx = (u8)mtx; h->textured = textured;
+    h->side = side > 100.0f ? 0 : side > 0.4f ? 2 : 1;
+    h->cards = (s16)g_card_cur; h->cards_prev = (s16)g_card_prev; h->bars = (s16)g_bar_cur; h->bars_prev = (s16)g_bar_prev;
+    h->banner = (s16)g_banner_cur; h->banner_prev = (s16)g_banner_prev;
+    h->alpha = alpha; h->mn = mn; h->mx = mx; h->ylo = ylo; h->yhi = yhi; h->ou0 = ou0; h->oy0 = oy0; h->ou = ou; h->oy = oy;
+}
+static void hudlog_dump(void) {
+    g_hh_dump = 0;
+    if (!g_hh || !g_hh_pos) return;
+    FILE* f = fopen("hudlog.txt", "w");
+    if (!f) return;
+    fprintf(f, "HUD pieces (x across 16:9 -1..1, y -1 bottom..1 top; origin as placed / as used), the last %u frames\n",
+            g_hh_pos > HUD_HIST ? g_frames - g_hh[g_hh_pos & (HUD_HIST - 1u)].frame : g_frames - g_hh[0].frame);
+    u32 start = g_hh_pos > HUD_HIST ? g_hh_pos - HUD_HIST : 0, frame = ~0u;
+    static const char* const sides[3] = {"none", "0.30", "0.50"};
+    for (u32 i = start; i < g_hh_pos; i++) {
+        const HudHist* h = &g_hh[i & (HUD_HIST - 1u)];
+        if (h->frame != frame) {
+            frame = h->frame;
+            fprintf(f, "-- next frame %u\n", frame);
+        }
+        fprintf(f, "%-7s n %2u mtx %2u %s a %.2f  x %6.3f..%6.3f y %6.3f..%6.3f  origin %6.3f,%6.3f used %6.3f,%6.3f  side %s  cards %d/%d bars %d/%d banner %d/%d\n",
+                h->what, h->n, h->mtx, h->textured ? "tex " : "flat", h->alpha, h->mn, h->mx, h->ylo, h->yhi, h->ou0, h->oy0,
+                h->ou, h->oy, sides[h->side], h->cards, h->cards_prev, h->bars, h->bars_prev, h->banner, h->banner_prev);
     }
-    fprintf(g_hudlog, "%-7s n %2u mtx %2u %s a %.2f  x %6.3f..%6.3f y %6.3f..%6.3f  origin %6.3f,%6.3f used %6.3f,%6.3f  side %s  cards %d/%d bars %d/%d banner %d/%d\n",
-            what, n, mtx, textured ? "tex " : "flat", alpha, mn, mx, ylo, yhi, ou0, oy0, ou, oy,
-            side > 100.0f ? "none" : side > 0.4f ? "0.50" : "0.30", g_card_cur, g_card_prev, g_bar_cur, g_bar_prev,
-            g_banner_cur, g_banner_prev);
+    fclose(f);
+    printf("window: the match HUD's last few seconds written to hudlog.txt\n");
 }
 #define HUD_BARS 3                     /* that many: a menu is up (the Audible menu: thin boxes, no cards) */
 #define HUD_MENU_TOP 0.65f             /* with a menu up, what is placed below this stays (the team panels are above;
@@ -771,7 +798,7 @@ static void hudlog_piece(const char* what, u32 n, u32 mtx, bool textured, float 
 static float g_band_cur = 9.0f, g_band_prev = 9.0f;   /* the stadium banner's lowest edge this / last frame */
 #define HUD_CARDS 2                    /* that many: a play screen is up (Convert has two cards) */
 #define HUD_SIDE_LOW 0.50f             /* below it, this far to one side (style point popups) */
-#define HUD_POPUP_LOW 0.30f            /* and no lower than this (players' names are) */
+#define HUD_POPUP_LOW 0.30f            /* and no lower than this (players' names are), unless a popup sliding down as it fades */
 static volatile int g_hud_match;       /* a match is on (set from the game thread) */
 void gx_raster_set_match(bool on) { g_hud_match = on; }
 bool gx_raster_match(void) { return g_hud_match != 0; }
@@ -979,6 +1006,62 @@ static bool hud_centred_text(int k) {
     return count >= 2 && r->ou0 > lo + 0.005f && r->ou0 < hi - 0.005f && r->oy0 < 0.22f;
 }
 
+/* Where last frame's moved popups were (their words' origins, as placed)
+   and which side they went to; this frame's are gathered as it is decided. */
+#define POPUP_KEEP 64
+typedef struct { float u, y, home; int side; } PopupAt;   /* home: where it stood across before it slid down */
+static PopupAt g_pop_prev[POPUP_KEEP], g_pop_cur[POPUP_KEEP];
+static int g_npop_prev, g_npop_cur;
+#define POPUP_STEP 0.04f               /* how far a fading popup's origin can go in a frame (it slides 0.01 or so) */
+static const PopupAt* popup_prev(float u, float y) {
+    for (int i = 0; i < g_npop_prev; i++)
+        if (fabsf(g_pop_prev[i].u - u) < POPUP_STEP && fabsf(g_pop_prev[i].y - y) < POPUP_STEP) return &g_pop_prev[i];
+    return NULL;
+}
+static void popup_note(float u, float y, int side, float home) {
+    for (int i = 0; i < g_npop_cur; i++)
+        if (g_pop_cur[i].u == u && g_pop_cur[i].y == y) return;
+    if (g_npop_cur < POPUP_KEEP) g_pop_cur[g_npop_cur++] = (PopupAt){u, y, home, side};
+}
+static void popup_next_frame(void) {
+    memcpy(g_pop_prev, g_pop_cur, sizeof g_pop_cur);
+    g_npop_prev = g_npop_cur;
+    g_npop_cur = 0;
+}
+
+/* The pieces sharing piece k's origin (the letters of one word): does the
+   word start or end at that origin (a style point popup's words, lined up
+   at its side), rather than being centred on it? */
+static bool hud_origin_at_end(int k) {
+    const HudRec* r = &g_hud[k];
+    float lo = 1e9f, hi = -1e9f;
+    for (int j = 0; j < g_nhud; j++) {
+        const HudRec* q = &g_hud[j];
+        if (q->ou0 != r->ou0 || q->oy0 != r->oy0 || !q->textured) continue;
+        lo = fminf(lo, q->mn); hi = fmaxf(hi, q->mx);
+    }
+    return lo <= hi && (r->ou0 <= lo + 0.03f || r->ou0 >= hi - 0.03f);
+}
+
+/* How many letters the word sharing piece k's origin has (pieces drawn
+   twice, as a shadow and the letter, counted once). A popup's words have
+   several; the big messages that bounce in a letter at a time ("2 Pt.
+   Conversion") have one per origin, and passed from one to the next
+   across the screen they were taken for a popup sliding along. */
+static int hud_word_letters(int k) {
+    const HudRec* r = &g_hud[k];
+    float seen[16];
+    int count = 0;
+    for (int j = 0; j < g_nhud && count < 16; j++) {
+        const HudRec* q = &g_hud[j];
+        if (q->ou0 != r->ou0 || q->oy0 != r->oy0 || !q->textured) continue;
+        bool dup = false;
+        for (int i = 0; i < count; i++) dup |= fabsf(seen[i] - q->mn) < 0.002f;
+        if (!dup) seen[count++] = q->mn;
+    }
+    return count;
+}
+
 static void hud_flush(void) {
     int target = g_target_shape;
     bool menu_cards = g_card_cur >= HUD_CARDS || g_card_prev >= HUD_CARDS || g_cbar_cur >= HUD_BARS ||
@@ -1078,8 +1161,12 @@ static void hud_flush(void) {
            across the middle stays where the game puts it. */
         if (oy < HUD_PANELS && (!textured || (mn < 0.0f && mx > 0.0f))) side = 1e9f;
         /* The popups stack down from 0.57 (0.55, 0.45, ...); a player's name,
-           placed by the player and lower down, goes with the player. */
-        if (oy < HUD_POPUP_LOW) side = 1e9f;
+           placed by the player and lower down, goes with the player. A popup
+           fading out (red) slides on down past that, to 0.19 and lower: still
+           placed out at its side (a popup's place there varies: 0.57 to
+           0.83 out), its words starting (left) or ending (right) at their
+           origin, where a name is centred on its own. */
+        if (oy < HUD_POPUP_LOW && !hud_origin_at_end(k)) side = 1e9f;
         bool modal = g_modal_at >= 0 && k >= g_modal_at;
         bool menu_side = false;            /* moved with its side as a menu piece (below) */
         if (oy < HUD_MENU_TOP && menu_cards) {
@@ -1133,15 +1220,40 @@ static void hud_flush(void) {
             ou = mid < 0.0f ? -1.0f : 1.0f;
         if (modal) side = 1e9f;
         bool move = oy >= HUD_LOW && (ou < -side || ou > side);
+        /* A style point popup that was moved out last frame keeps going with
+           its side however the game slides it as it fades (down, or down
+           and in towards the middle, past where the rules above would let it
+           go): its words' origin is found again close to where it was. */
+        /* (not with a play screen or menu up: its words, flying in from the
+           side, were taken for a popup and then kept out there) */
+        bool menu_up = oy < HUD_MENU_TOP && (menu_cards || menu_bars);
+        const PopupAt* pp = !modal && !menu_up && textured && oy < HUD_PANELS ? popup_prev(r->ou0, r->oy0) : NULL;
+        if (!move && pp && oy >= HUD_LOW && hud_origin_at_end(k) && hud_word_letters(k) >= 2) {
+            move = true;
+            ou = (float)pp->side;
+        }
+        /* A popup losing its points turns red and drops straight down (as
+           in 16:9). With the game's wider camera the game also slides it in
+           towards the middle as it drops (from 0.83 out to 0.57): held where
+           it stood across. (Banked points fly up and in to the team's
+           panel: going up, it goes as the game moves it.) */
+        float hold = 0.0f, home = r->ou0;
+        if (move && pp) {
+            home = pp->home;
+            if (r->oy0 < pp->y - 0.0005f) hold = home - r->ou0;
+            else if (r->oy0 > pp->y + 0.0005f) home = r->ou0;   /* (going up: from here) */
+        }
+        if (move && textured && oy < HUD_PANELS && !menu_side && !menu_up)
+            popup_note(r->ou0, r->oy0, ou < 0.0f ? -1 : 1, home);
         hudlog_piece(move ? "MOVED" : modal ? "screen" : "kept", n, (u32)v[0].mtx, textured, r->avg_a, mn, mx, ylo, r->yhi,
-                     r->ou0, r->oy0, ou, oy, side);
+                     r->ou0, r->oy0, hold != 0.0f ? r->ou0 + hold : ou, oy, side);
         if (move) {
             float rr = fminf(ultrawide_aspect(target), 21.0f / 9.0f) / (16.0f / 9.0f);
             float shift = (ou < 0.0f ? -1.0f : 1.0f) * (rr - 1.0f), edge = 1.0f / frame;
             bool across = mn < 1.0f && mx > -1.0f;   /* partly on the 16:9 picture */
             for (u32 i = 0; i < n; i++) {
                 float u = v[i].clip[0] / (v[i].clip[3] * frame);
-                float nu = across && u < -1.0f ? -edge : across && u > 1.0f ? edge : u + shift;   /* off the side: to the edge */
+                float nu = across && u < -1.0f ? -edge : across && u > 1.0f ? edge : u + shift + hold;   /* off the side: to the edge */
                 v[i].clip[0] = nu * v[i].clip[3] * frame;
                 project(&v[i]);
             }
@@ -1165,6 +1277,8 @@ static void hud_flush(void) {
     g_cbar_prev = g_cbar_cur; g_cbar_cur = 0;
     g_banner_prev = g_banner_cur;
     g_band_prev = g_band_cur;
+    popup_next_frame();
+    if (g_hh_dump) hudlog_dump();
 }
 
 static const RenderState* g_wstate;    /* the state of the draw being widened */
@@ -2564,12 +2678,12 @@ static u32 g_dlog_cullall;            /* draws dropped as "cull all" this logged
 
 /* The HUD log alone (works with either renderer: the HUD is placed here
    for both). */
-void gx_raster_hud_log(void) { g_hudlog_frames = 120; }
+void gx_raster_hud_log(void) { g_hh_dump = 1; }
 
 void gx_raster_draw_log(double at_seconds, int frames) {
     g_dlog_at = at_seconds;
     g_dlog_frames = frames;
-    g_hudlog_frames = 120;             /* two seconds: long enough to catch a brief jump */
+    g_hh_dump = 1;                     /* (and the HUD's last few seconds) */
 }
 
 static const char* const k_csel[16] = {"PREV.rgb", "PREV.a", "REG0.rgb", "REG0.a", "REG1.rgb", "REG1.a",

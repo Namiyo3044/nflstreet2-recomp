@@ -1145,7 +1145,7 @@ static void poll_events(void) {
             } else if (e.key.key == SDLK_F12 && !e.key.repeat) {
                 if (g_gpu) {
                     gx_raster_hud_log();
-                    printf("window: logging two seconds of the match HUD to hudlog.txt (the full draw log needs the software renderer)\n");
+                    printf("window: writing the match HUD's last few seconds to hudlog.txt (the full draw log needs the software renderer)\n");
                 } else {
                     gx_raster_draw_log(interrupts_game_seconds(), 2);
                     printf("window: logging the next two frames to drawlog.txt and drawlog-short.txt\n");
