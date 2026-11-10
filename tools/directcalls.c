@@ -34,6 +34,10 @@
  * calls it hooks (and every call, while a debug trace is on) going through
  * the dispatcher.
  *
+ * A direct call to one of the functions in k_hle (below) first asks the
+ * port to do it natively (src/runtime/hle_mtx.c); only if that declines does
+ * the call go on as above.
+ *
  * Usage: directcalls <output dir> <chunk.c>...
  * Each chunk is written to the output directory under its own name (only if
  * it changed, so an unchanged chunk isn't rebuilt), with its
@@ -207,7 +211,21 @@ static size_t match_indirect(const char* p, uint32_t* ret, int* indent) {
     return (size_t)(s + 1 - p);
 }
 
-static size_t g_rewritten, g_kept, g_fallbacks, g_indirect;
+static size_t g_rewritten, g_kept, g_fallbacks, g_indirect, g_hle;
+
+/* Functions the port does natively when called directly (src/runtime/hle_mtx.c,
+   whose nfls2_hle() runs the whole function or declines; the call then goes
+   on as usual): the direct calls to them try that first. */
+static const uint32_t k_hle[] = {
+    0x8024AA18u,                       /* PSMTXConcat */
+    0x8024AAE4u,                       /* PSMTXMultVec */
+    0x8024AB38u,                       /* PSMTXMultVecSR */
+};
+static int is_hle(uint32_t target) {
+    for (size_t i = 0; i < sizeof k_hle / sizeof k_hle[0]; i++)
+        if (k_hle[i] == target) return 1;
+    return 0;
+}
 
 static void rewrite(const Chunk* c) {
     g_out_len = 0;
@@ -285,9 +303,24 @@ static void rewrite(const Chunk* c) {
                 int n = indent < 60 ? indent : 60;
                 memset(pad, ' ', (size_t)n);
                 pad[n] = 0;
+                snprintf(buf, sizeof buf, "%sctx->lr = 0x%08Xu;\n%sctx->pc = 0x%08Xu;\n", pad, ret, pad, target);
+                puts_(buf);
+                if (is_hle(target)) {
+                    /* (natively, if it can: ctx->pc is then the return address; declared
+                       here rather than in fastmem.h, which every chunk includes, so only the
+                       chunks with such a call are rebuilt) */
+                    snprintf(buf, sizeof buf,
+                             "%sint nfls2_hle(CPUState* cpu, u32 target);\n"
+                             "%sif (NFLS2_DIRECT_OK(0x%08Xu) && nfls2_hle(ctx, 0x%08Xu)) {\n"
+                             "%s    if (ctx->downcount > -(s64)DOLRECOMP_C_LOOP_CYCLE_BUDGET)\n"
+                             "%s        goto label_%08X;\n"
+                             "%s    return;\n"
+                             "%s}\n",
+                             pad, pad, target, target, pad, pad, ret, pad, pad);
+                    puts_(buf);
+                    g_hle++;
+                }
                 snprintf(buf, sizeof buf,
-                         "%sctx->lr = 0x%08Xu;\n"
-                         "%sctx->pc = 0x%08Xu;\n"
                          "%sif (NFLS2_DIRECT_OK(0x%08Xu) && nfls2_direct_enter()) {\n"
                          "%s    func_%08X(ctx);\n"
                          "%s    nfls2_direct_leave();\n"
@@ -295,7 +328,7 @@ static void rewrite(const Chunk* c) {
                          "%s        goto label_%08X;\n"
                          "%s}\n"
                          "%sreturn;\n",
-                         pad, ret, pad, target, pad, target, pad, tc->start, pad, pad, ret, pad, ret, pad, pad);
+                         pad, target, pad, tc->start, pad, pad, ret, pad, ret, pad, pad);
                 puts_(buf);
                 g_rewritten++;
                 p += m;
@@ -368,8 +401,9 @@ int main(int argc, char** argv) {
         write_if_changed(path);
     }
     printf("directcalls: %zu chunks (%zu with a main function), %zu calls into other chunks made direct, %zu left to the dispatcher, "
-           "%zu calls through a register looked up directly, %zu cache / special-register instructions carried on inline\n",
-           g_nchunks, g_nvalid, g_rewritten, g_kept, g_indirect, g_fallbacks);
+           "%zu calls through a register looked up directly, %zu cache / special-register instructions carried on inline, "
+           "%zu calls to functions done natively\n",
+           g_nchunks, g_nvalid, g_rewritten, g_kept, g_indirect, g_fallbacks, g_hle);
     if (g_nvalid > 1 && !g_rewritten) {
         fprintf(stderr, "directcalls: no calls matched; the generated code's layout isn't the one this tool knows\n");
         return 1;

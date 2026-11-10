@@ -790,6 +790,13 @@ static void warn_unmapped(const char* what, u32 ea, u8 size, u32 pc) {
 static u8 g_l1[L1_MASK + 1];
 static unsigned long long g_l1_reads, g_l1_writes, g_l1_dma_in, g_l1_dma_out;
 
+/* n bytes of the locked cache at ea (0xExxxxxxx) as plain memory, or NULL
+   if they'd wrap around its end (runtime/hle_mtx.c). */
+u8* mmio_l1_at(u32 ea, u32 n) {
+    u32 o = ea & L1_MASK;
+    return o + n <= L1_MASK + 1u ? g_l1 + o : NULL;
+}
+
 void mmio_locked_cache_dma(CPUState* cpu, u32 mem_addr, u32 cache_addr, u32 bytes, bool load) {
     u32 m = mem_addr & 0x01FFFFE0u;
     for (u32 i = 0; i < bytes; i += 32) {

@@ -163,6 +163,7 @@ add_executable(nfls2
     src/runtime/exi.c
     src/runtime/hle_cpu.c
     src/runtime/hle_exceptions.c
+    src/runtime/hle_mtx.c
     src/runtime/interp.c
     src/runtime/textscan.c
     src/runtime/textpatch.c
@@ -180,6 +181,13 @@ add_executable(nfls2
     src/runtime/sha1.c
     src/runtime/symbols.c)
 target_link_libraries(nfls2 PRIVATE nfls2_game)
+
+# Checks src/runtime/hle_mtx.c against the game's own functions (not built
+# by default: cmake --build build --target nfls2_hle_mtx_test).
+add_executable(nfls2_hle_mtx_test EXCLUDE_FROM_ALL tests/hle_mtx_test.c src/runtime/hle_mtx.c)
+target_include_directories(nfls2_hle_mtx_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src" "${NFLS2_GENERATED_DIR}")
+target_compile_definitions(nfls2_hle_mtx_test PRIVATE "DOLRECOMP_CPU_HEADER=\"runtime/fastmem.h\"")
+target_link_libraries(nfls2_hle_mtx_test PRIVATE nfls2_game)
 if(NFLS2_WINDOW)
     target_sources(nfls2 PRIVATE src/platform/window.c src/platform/menu.c src/platform/movie.c src/platform/discord.c
         src/apt/terf.c src/apt/aptfile.c src/apt/avm.c src/apt/aptdraw.c src/apt/ps2online.c)

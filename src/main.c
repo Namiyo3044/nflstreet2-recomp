@@ -30,6 +30,7 @@
 #include "runtime/exi.h"
 #include "runtime/uismenu.h"
 #include "runtime/uicolors.h"
+#include "runtime/hle_mtx.h"
 #ifdef NFLS2_HAVE_WINDOW
 #include "platform/window.h"
 #endif
@@ -69,6 +70,8 @@ static unsigned long long g_idle_skips, g_idle_ticks;
 /* File-open calls (path in r3) logged with the game time. */
 static u32 g_dvd_open, g_dvd_path, g_dvd_read, g_dvd_close;
 
+static u32 rd_be32(const u8* p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
+
 #ifdef NFLS2_HAVE_WINDOW
 /* Replacement movies: which part of MOVIEDAT.DAT the game is reading tells
    which movie it is playing (the file's own directory gives each movie's
@@ -78,7 +81,6 @@ static int g_movie_count = -1;         /* -1: directory not read yet */
 static u32 g_movie_off[16], g_movie_len[16];
 static int g_movie_cur = -1;
 
-static u32 rd_be32(const u8* p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
 
 static void movie_read_directory(void) {
     g_movie_count = 0;
@@ -1322,6 +1324,7 @@ int main(int argc, char** argv) {
     bool have_settings = false;
     bool idle_skip = true;
     bool gx_thread = true;             /* --no-gx-thread: graphics decoding on the game thread */
+    bool no_front_xf = false;          /* --gpu-thread-transforms: with the graphics thread, still transform on the GPU thread */
     const char* memcard_path = NULL;
     const char* record_input = NULL;   /* netsync: repeatable runs */
     const char* play_input = NULL;
@@ -1412,6 +1415,8 @@ int main(int argc, char** argv) {
             g_skip_intros = false;
         } else if (strcmp(argv[i], "--no-gx-thread") == 0) {
             gx_thread = false;
+        } else if (strcmp(argv[i], "--gpu-thread-transforms") == 0) {
+            no_front_xf = true;
         } else if (strcmp(argv[i], "--perf-log") == 0) {
 #ifdef NFLS2_HAVE_WINDOW
             window_set_perf_log(true);
@@ -1431,6 +1436,8 @@ int main(int argc, char** argv) {
             window_height = 480 * atoi(argv[++i]);
         } else if (strcmp(argv[i], "--no-direct-calls") == 0) {
             g_no_direct = true;
+        } else if (strcmp(argv[i], "--no-native-matrix") == 0) {
+            g_nfls2_hle_on = 0;
         } else if (strcmp(argv[i], "--debug") == 0) {
             g_debug = true;
         } else if (strcmp(argv[i], "--quiet") == 0) {
@@ -1520,6 +1527,8 @@ int main(int argc, char** argv) {
     g_nfls2_direct_on = g_direct_default;
     printf("NFL Street 2 Recomp v" NFLS2_VERSION "\n");
     printf("direct calls between chunks: %s\n", g_direct_default ? "on" : "off (a debug option is on)");
+    if (!g_nfls2_hle_on)
+        printf("native matrix functions: off\n");
     if (textures_dir) {
         if (gpu_scale) {
             hires_init(textures_dir);
@@ -1618,6 +1627,8 @@ int main(int argc, char** argv) {
             printf("graphics thread: off (%s)\n", off);
         else if (!gx_front_start(&cpu))
             printf("graphics thread: couldn't be started; decoding on the game thread\n");
+        else if (!no_front_xf)
+            gx_raster_transform_when_recorded();   /* (the vertices transformed there too) */
     }
 #endif
     if (play_input && !netsync_play(play_input))
@@ -1806,6 +1817,7 @@ int main(int argc, char** argv) {
     netplay_close();
     gx_fifo_report();
     gx_front_report();
+    nfls2_hle_report();
     gx_raster_report();
     disc_report();
     ax_hle_report();

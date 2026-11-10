@@ -20,6 +20,7 @@
 #   .\play.ps1 -NoMemCard      (no memory card; by default C:\nfls2\saves\MemoryCardA.raw, made if missing)
 #   .\play.ps1 -PerfLog        (log how each second went, even at full speed: for measuring speed-ups)
 #   .\play.ps1 -NoGxThread     (graphics commands decoded on the game thread, as before 1.1; for comparing)
+#   .\play.ps1 -NoNativeMatrix (the game's own matrix functions instead of the port's native ones; for comparing)
 #   .\play.ps1 -ShowTHX        (show the THX intro even if Skip Intro Videos is No THX Intro)
 #   .\play.ps1 -Aspect 16:9    (screen shape for this run: 4:3 or 16:9)
 #   .\play.ps1 -Disc D:\nfls2.iso  (the game's disc: an extracted folder, default C:\nfls2\disc, or a .iso / .gcm
@@ -51,6 +52,7 @@ param(
     [switch]$NoIdleSkip,
     [switch]$PerfLog,
     [switch]$NoGxThread,
+    [switch]$NoNativeMatrix,
     [switch]$GpuThreadTransforms,
     [switch]$NoDirectCalls,
     [switch]$ShowTHX,
@@ -141,6 +143,7 @@ foreach ($p in $Press) { $gameArgs += @("--press", $p) }
 if ($NoIdleSkip) { $gameArgs += "--no-idle-skip" }
 if ($PerfLog) { $gameArgs += "--perf-log" }
 if ($NoGxThread) { $gameArgs += "--no-gx-thread" }
+if ($NoNativeMatrix) { $gameArgs += "--no-native-matrix" }
 if ($GpuThreadTransforms) { $gameArgs += "--gpu-thread-transforms" }
 if ($NoDirectCalls) { $gameArgs += "--no-direct-calls" }
 if ($ShowTHX) { $gameArgs += "--show-thx" }
